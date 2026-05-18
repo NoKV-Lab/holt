@@ -217,10 +217,7 @@ fn torn_tail_is_recovered_gracefully() {
     // CRC/body of the last record for any of the variants in
     // `sample_ops`.
     {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let len = file.metadata().unwrap().len();
         file.set_len(len - 8).unwrap();
     }
@@ -264,12 +261,15 @@ fn mid_file_corruption_propagates_with_offset() {
     let first_body_len =
         u32::from_le_bytes(bytes[len_pos..len_pos + 4].try_into().unwrap()) as usize;
     let first_record_end = FILE_HEADER_SIZE + 17 + first_body_len + 4; // header(17) + body + CRC(4)
-    // Flip a bit deep inside the second record's body.
+                                                                       // Flip a bit deep inside the second record's body.
     bytes[first_record_end + 20] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
 
     match replay(&path, |_, _, _| Ok(())) {
-        Err(Error::ReplaySanityFailed { context, record_offset }) => {
+        Err(Error::ReplaySanityFailed {
+            context,
+            record_offset,
+        }) => {
             assert!(record_offset > 0, "offset should be patched in");
             assert!(record_offset >= first_record_end as u64);
             // CRC was the most likely catch — but any "byte
@@ -536,10 +536,7 @@ fn appending_after_external_truncate_grows_file_again() {
     w.flush().unwrap();
 
     // Out-of-band truncate the file back to just the header.
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(FILE_HEADER_SIZE as u64).unwrap();
     // Touch the no-longer-relevant variables so clippy doesn't
     // squawk about unused.

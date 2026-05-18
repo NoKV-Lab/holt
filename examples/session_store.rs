@@ -22,10 +22,7 @@ fn session_key(user_id: u64, session_id: &str) -> Vec<u8> {
 fn main() {
     println!("=== artisan session_store example ===\n");
 
-    let tree = TreeBuilder::new("scratch")
-        .memory()
-        .open()
-        .expect("open");
+    let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 
     // Three users, two sessions each.
     let rows: &[(u64, &str, &str)] = &[
@@ -57,10 +54,7 @@ fn main() {
         .get(&session_key(2, "ghi789"))
         .unwrap()
         .expect("present");
-    println!(
-        "lookup 2/ghi789 -> {:?}",
-        std::str::from_utf8(&s).unwrap(),
-    );
+    println!("lookup 2/ghi789 -> {:?}", std::str::from_utf8(&s).unwrap(),);
 
     // Revoke a session.
     let prev = tree.delete(&session_key(1, "abc123")).unwrap();

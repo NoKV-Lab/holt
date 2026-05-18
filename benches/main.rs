@@ -48,7 +48,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tempfile::TempDir;
 
 use artisan::{Tree, TreeConfig};
-use rocksdb::{DB, Options, WriteOptions};
+use rocksdb::{Options, WriteOptions, DB};
 
 // ---------------------------------------------------------------
 // Workload configuration
@@ -249,7 +249,8 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+                let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                black_box(());
             });
         });
 
@@ -289,7 +290,8 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
                 if r & 1 == 0 {
                     black_box(db.get(black_box(k)).unwrap());
                 } else {
-                    black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+                    let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                    black_box(());
                 }
             });
         });
@@ -364,7 +366,8 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+                let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                black_box(());
             });
         });
 
@@ -406,7 +409,8 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                 if r & 1 == 0 {
                     black_box(db.get(black_box(k)).unwrap());
                 } else {
-                    black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+                    let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                    black_box(());
                 }
             });
         });

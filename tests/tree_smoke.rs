@@ -75,7 +75,12 @@ fn put_returns_previous_value_on_update() {
 fn many_keys_all_readable_via_public_api() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
-        .map(|i| (format!("img/{i:04}.jpg").into_bytes(), format!("blob#{i}").into_bytes()))
+        .map(|i| {
+            (
+                format!("img/{i:04}.jpg").into_bytes(),
+                format!("blob#{i}").into_bytes(),
+            )
+        })
         .collect();
     for (k, v) in &pairs {
         tree.put(k, v).unwrap();
@@ -132,9 +137,7 @@ fn deeply_nested_strict_prefix_chain() {
     // The classic "filesystem path" workload: each level of the
     // path is a key.
     let tree = Tree::open(TreeConfig::memory()).unwrap();
-    let paths: &[&[u8]] = &[
-        b"/", b"/a", b"/a/b", b"/a/b/c", b"/a/b/c/d", b"/a/b/c/d/e",
-    ];
+    let paths: &[&[u8]] = &[b"/", b"/a", b"/a/b", b"/a/b/c", b"/a/b/c/d", b"/a/b/c/d/e"];
     for (i, p) in paths.iter().enumerate() {
         tree.put(p, format!("level{i}").as_bytes()).unwrap();
     }
@@ -152,9 +155,15 @@ fn deeply_nested_strict_prefix_chain() {
 fn empty_key_round_trips() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"", b"empty-key-value").unwrap();
-    assert_eq!(tree.get(b"").unwrap().as_deref(), Some(&b"empty-key-value"[..]));
+    assert_eq!(
+        tree.get(b"").unwrap().as_deref(),
+        Some(&b"empty-key-value"[..])
+    );
     tree.put(b"a", b"other").unwrap();
-    assert_eq!(tree.get(b"").unwrap().as_deref(), Some(&b"empty-key-value"[..]));
+    assert_eq!(
+        tree.get(b"").unwrap().as_deref(),
+        Some(&b"empty-key-value"[..])
+    );
     assert_eq!(tree.get(b"a").unwrap().as_deref(), Some(&b"other"[..]));
 }
 
@@ -189,7 +198,12 @@ fn delete_then_reinsert_round_trips() {
 fn delete_all_keys_then_reinsert_works() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
-        .map(|i| (format!("img/{i:03}").into_bytes(), format!("v{i}").into_bytes()))
+        .map(|i| {
+            (
+                format!("img/{i:03}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            )
+        })
         .collect();
     for (k, v) in &pairs {
         tree.put(k, v).unwrap();
@@ -210,7 +224,10 @@ fn delete_keeps_siblings_under_shared_prefix() {
     tree.put(b"img/01.jpg", b"a").unwrap();
     tree.put(b"img/02.jpg", b"b").unwrap();
     tree.put(b"img/03.jpg", b"c").unwrap();
-    assert_eq!(tree.delete(b"img/02.jpg").unwrap().as_deref(), Some(&b"b"[..]));
+    assert_eq!(
+        tree.delete(b"img/02.jpg").unwrap().as_deref(),
+        Some(&b"b"[..])
+    );
     assert_eq!(tree.get(b"img/01.jpg").unwrap().as_deref(), Some(&b"a"[..]));
     assert!(tree.get(b"img/02.jpg").unwrap().is_none());
     assert_eq!(tree.get(b"img/03.jpg").unwrap().as_deref(), Some(&b"c"[..]));
@@ -272,7 +289,8 @@ fn rename_through_shared_prefix() {
     tree.put(b"img/01.jpg", b"a").unwrap();
     tree.put(b"img/02.jpg", b"b").unwrap();
     tree.put(b"img/03.jpg", b"c").unwrap();
-    tree.rename(b"img/02.jpg", b"img/02-renamed.jpg", false).unwrap();
+    tree.rename(b"img/02.jpg", b"img/02-renamed.jpg", false)
+        .unwrap();
     assert_eq!(tree.get(b"img/01.jpg").unwrap().as_deref(), Some(&b"a"[..]));
     assert!(tree.get(b"img/02.jpg").unwrap().is_none());
     assert_eq!(
@@ -464,7 +482,11 @@ fn multi_blob_delete_round_trip() {
         }
         let k = format!("k{i:08}").into_bytes();
         let prev = tree.delete(&k).unwrap();
-        assert_eq!(prev.as_deref(), Some(&value[..]), "delete returned wrong prev for {k:?}");
+        assert_eq!(
+            prev.as_deref(),
+            Some(&value[..]),
+            "delete returned wrong prev for {k:?}"
+        );
         deleted += 1;
     }
 
@@ -475,7 +497,11 @@ fn multi_blob_delete_round_trip() {
         if i % 5 == 0 {
             assert!(got.is_none(), "deleted key {k:?} still present");
         } else {
-            assert_eq!(got.as_deref(), Some(&value[..]), "survivor key {k:?} missing");
+            assert_eq!(
+                got.as_deref(),
+                Some(&value[..]),
+                "survivor key {k:?} missing"
+            );
         }
     }
     let _ = deleted;
@@ -519,7 +545,10 @@ fn multi_blob_rename_round_trip() {
     let src = format!("k{:08}", 6).into_bytes();
     let dst = format!("k{:08}", 7).into_bytes();
     tree.rename(&src, &dst, /*force=*/ true).unwrap();
-    assert!(tree.get(&src).unwrap().is_none(), "src should be gone post-rename");
+    assert!(
+        tree.get(&src).unwrap().is_none(),
+        "src should be gone post-rename"
+    );
     assert_eq!(
         tree.get(&dst).unwrap().as_deref(),
         Some(&value_a[..]),
@@ -551,7 +580,8 @@ fn auto_spillover_preserves_data_across_reopen() {
             .open_with_backend(backend.clone())
             .unwrap();
         for i in 0..2000u32 {
-            tree.put(format!("k{i:08}").as_bytes(), &vec![0xCD; 192]).unwrap();
+            tree.put(format!("k{i:08}").as_bytes(), &[0xCD; 192])
+                .unwrap();
         }
         tree.checkpoint().unwrap();
     }
@@ -687,9 +717,7 @@ fn optimistic_readers_dont_block_writers() {
                         Some(v) if v == stable_value => {}
                         other => {
                             wrong.fetch_add(1, AOrdering::Relaxed);
-                            panic!(
-                                "reader saw torn / wrong value for {k:?}: {other:?}"
-                            );
+                            panic!("reader saw torn / wrong value for {k:?}: {other:?}");
                         }
                     }
                 }

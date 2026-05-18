@@ -2,8 +2,8 @@
 //!
 //! This module is what users will write `use artisan::{...}` for.
 
-pub mod tree;
 pub mod builder;
-pub mod txn;
-pub mod errors;
 pub mod config;
+pub mod errors;
+pub mod tree;
+pub mod txn;

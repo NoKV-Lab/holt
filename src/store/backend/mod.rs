@@ -53,7 +53,7 @@ pub trait Backend: Send + Sync {
     /// Write `src` as blob `guid`. `src.len() == PAGE_SIZE`.
     ///
     /// Returns once the write has been *submitted* to the medium.
-    /// Call [`flush`] to wait for it to be *durable*.
+    /// Call [`Backend::flush`] to wait for it to be *durable*.
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()>;
 
     /// Delete blob `guid`. No-op if it doesn't exist.

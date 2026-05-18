@@ -9,17 +9,13 @@
 //!   [`super::migrate`])
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{
-    BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix,
-};
+use crate::layout::{BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix};
 use crate::store::backend::Backend;
 use crate::store::{BlobFrame, BufferManager};
 
 use super::cast;
 use super::migrate::make_blob_from_node;
-use super::readers::{
-    ntype_of, read_node16, read_node256, read_node4, read_node48, read_prefix,
-};
+use super::readers::{ntype_of, read_node16, read_node256, read_node4, read_node48, read_prefix};
 use super::types::{Victim, VictimEdgeKind};
 use super::writers::{inner_update_child, set_prefix_child, write_struct_to_slot};
 
@@ -40,10 +36,7 @@ pub(super) use super::migrate::compact_blob;
 /// Returns the BlobNode slot installed in `frame` so callers /
 /// tests can verify. The new blob is **already written to the
 /// backend** at the time of return.
-pub(super) fn spillover_blob(
-    bm: &BufferManager,
-    frame: &mut BlobFrame<'_>,
-) -> Result<u16> {
+pub(super) fn spillover_blob(bm: &BufferManager, frame: &mut BlobFrame<'_>) -> Result<u16> {
     let root_slot = frame.header().root_slot;
     let victim = pick_victim_subtree(frame, root_slot)?;
 
@@ -125,7 +118,7 @@ pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u3
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
-            for c in n.children.iter() {
+            for c in &n.children {
                 if *c != 0 {
                     count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
                 }
@@ -133,7 +126,7 @@ pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u3
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
-            for c in n.children.iter() {
+            for c in &n.children {
                 if *c != 0 {
                     count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
                 }
@@ -153,10 +146,8 @@ pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u3
 ///   wrapper blobs without freeing any actual data).
 /// - Picking the *largest* child (by node count) maximises space
 ///   freed per spillover iteration.
-fn pick_victim_subtree(
-    frame: &BlobFrame<'_>,
-    start_slot: u16,
-) -> Result<Victim> {
+#[allow(clippy::too_many_lines)] // intentional — one match over NodeType arms
+fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim> {
     let mut current = start_slot;
     loop {
         let ntype = ntype_of(frame.as_ref(), current)?;
@@ -253,7 +244,6 @@ fn pick_victim_subtree(
                     | NodeType::Node256
                     | NodeType::Prefix => {
                         current = child_slot;
-                        continue;
                     }
                     NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
                         return Ok(Victim {
@@ -359,7 +349,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(&body_copy);
-            for c in n.children.iter() {
+            for c in &n.children {
                 if *c != 0 {
                     free_subtree(frame, *c as u16)?;
                 }
@@ -367,7 +357,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(&body_copy);
-            for c in n.children.iter() {
+            for c in &n.children {
                 if *c != 0 {
                     free_subtree(frame, *c as u16)?;
                 }

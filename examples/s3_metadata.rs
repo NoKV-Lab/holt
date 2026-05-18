@@ -12,10 +12,7 @@ use artisan::TreeBuilder;
 fn main() {
     println!("=== artisan s3_metadata example ===\n");
 
-    let tree = TreeBuilder::new("scratch")
-        .memory()
-        .open()
-        .expect("open");
+    let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 
     // Three buckets; small clusters of objects per bucket.
     let rows: &[(&[u8], &[u8])] = &[

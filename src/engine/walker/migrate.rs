@@ -52,9 +52,10 @@ pub fn make_blob_from_node(
 /// Repack `buf` in place, discarding all unreachable bytes.
 ///
 /// Builds a fresh `BlobFrame` image in a scratch `AlignedBlobBuf`,
-/// deep-clones the live subtree from `buf` into it (via
-/// [`clone_subtree`], shared with [`make_blob_from_node`]), then
-/// memcpys the scratch image back over `buf`. This guarantees the
+/// deep-clones the live subtree from `buf` into it (via the
+/// internal `clone_subtree` helper, shared with
+/// [`make_blob_from_node`]), then memcpys the scratch image back
+/// over `buf`. This guarantees the
 /// resulting blob has:
 ///
 /// - A contiguous packed data area (every byte in
@@ -111,11 +112,7 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
 /// Every NodeType is handled. BlobNode bodies copy verbatim — their
 /// `child_blob_guid` / `child_entry_ptr` still reference the same
 /// external blob, which is not migrated by this primitive.
-fn clone_subtree(
-    src: &BlobFrame<'_>,
-    dst: &mut BlobFrame<'_>,
-    src_slot: u16,
-) -> Result<u16> {
+fn clone_subtree(src: &BlobFrame<'_>, dst: &mut BlobFrame<'_>, src_slot: u16) -> Result<u16> {
     let entry = src.slot_entry(src_slot).ok_or(Error::NodeCorrupt {
         context: "clone_subtree: invalid src slot",
     })?;
@@ -144,11 +141,7 @@ fn clone_subtree(
     }
 }
 
-fn clone_leaf(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_leaf(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let src_leaf = *cast::<Leaf>(src_body);
     let hdr = src
         .bytes_at(src_leaf.key_offset, 2)
@@ -177,11 +170,7 @@ fn clone_leaf(
     Ok(leaf_out.slot)
 }
 
-fn clone_prefix(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_prefix(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let p = *cast::<Prefix>(src_body);
     let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
     let new_child = clone_subtree(src, dst, p.child as u16)?;
@@ -191,17 +180,13 @@ fn clone_prefix(
     Ok(out.slot)
 }
 
-fn clone_node4(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_node4(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let src_n = *cast::<Node4>(src_body);
     let count = (src_n.count as usize).min(4);
     let mut new_children = [0u32; 4];
-    for i in 0..count {
+    for (i, slot) in new_children.iter_mut().enumerate().take(count) {
         let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
-        new_children[i] = u32::from(cloned);
+        *slot = u32::from(cloned);
     }
     let out = dst.alloc_node(NodeType::Node4)?;
     let mut new_n = Node4::empty();
@@ -212,17 +197,13 @@ fn clone_node4(
     Ok(out.slot)
 }
 
-fn clone_node16(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_node16(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let src_n = *cast::<Node16>(src_body);
     let count = (src_n.count as usize).min(16);
     let mut new_children = [0u32; 16];
-    for i in 0..count {
+    for (i, slot) in new_children.iter_mut().enumerate().take(count) {
         let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
-        new_children[i] = u32::from(cloned);
+        *slot = u32::from(cloned);
     }
     let out = dst.alloc_node(NodeType::Node16)?;
     let mut new_n = Node16::empty();
@@ -233,17 +214,13 @@ fn clone_node16(
     Ok(out.slot)
 }
 
-fn clone_node48(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_node48(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let src_n = *cast::<Node48>(src_body);
     let mut new_children = [0u32; 48];
-    for i in 0..48usize {
+    for (i, slot) in new_children.iter_mut().enumerate() {
         if src_n.children[i] != 0 {
             let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
-            new_children[i] = u32::from(cloned);
+            *slot = u32::from(cloned);
         }
     }
     let out = dst.alloc_node(NodeType::Node48)?;
@@ -255,17 +232,13 @@ fn clone_node48(
     Ok(out.slot)
 }
 
-fn clone_node256(
-    src: &BlobFrame<'_>,
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-) -> Result<u16> {
+fn clone_node256(src: &BlobFrame<'_>, src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     let src_n = *cast::<Node256>(src_body);
     let mut new_children = [0u32; 256];
-    for i in 0..256usize {
+    for (i, slot) in new_children.iter_mut().enumerate() {
         if src_n.children[i] != 0 {
             let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
-            new_children[i] = u32::from(cloned);
+            *slot = u32::from(cloned);
         }
     }
     let out = dst.alloc_node(NodeType::Node256)?;

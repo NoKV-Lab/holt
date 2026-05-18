@@ -91,9 +91,15 @@ mod tests {
     #[test]
     fn ntype_round_trip_via_raw() {
         let all = [
-            NodeType::Invalid, NodeType::Leaf, NodeType::Prefix,
-            NodeType::Blob, NodeType::Node4, NodeType::Node16,
-            NodeType::Node48, NodeType::Node256, NodeType::EmptyRoot,
+            NodeType::Invalid,
+            NodeType::Leaf,
+            NodeType::Prefix,
+            NodeType::Blob,
+            NodeType::Node4,
+            NodeType::Node16,
+            NodeType::Node48,
+            NodeType::Node256,
+            NodeType::EmptyRoot,
         ];
         for t in all {
             assert_eq!(NodeType::from_raw(t.as_u8()), Some(t));

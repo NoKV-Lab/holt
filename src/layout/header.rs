@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn constants_consistent() {
-        assert_eq!(PAGE_SIZE, 524288);
+        assert_eq!(PAGE_SIZE, 524_288);
         assert_eq!(HEADER_SIZE, 4096);
-        assert_eq!(MAX_SLOTS, 10240);
+        assert_eq!(MAX_SLOTS, 10_240);
         assert_eq!(DATA_AREA_START, 0xB000);
         assert_eq!(DATA_AREA_CAPACITY + DATA_AREA_START, PAGE_SIZE);
     }

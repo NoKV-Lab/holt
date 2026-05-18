@@ -3,9 +3,7 @@
 //! + `erase_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{
-    BlobGuid, BlobNode, NodeType, BLOB_MAX_INLINE,
-};
+use crate::layout::{BlobGuid, BlobNode, NodeType, BLOB_MAX_INLINE};
 use crate::store::backend::Backend;
 use crate::store::{BlobFrame, BufferManager};
 
@@ -30,11 +28,7 @@ use super::writers::{
 /// Returns the new root slot (caller updates `header.root_slot`)
 /// and the prior value if the key was present. If `key` was not in
 /// the tree, `previous` is `None` and `new_root_slot == root_slot`.
-pub fn erase(
-    frame: &mut BlobFrame<'_>,
-    root_slot: u16,
-    key: &[u8],
-) -> Result<EraseOutcome> {
+pub fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
     let r = erase_at(None, frame, root_slot, key, 0)?;
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     Ok(EraseOutcome {
@@ -48,11 +42,7 @@ pub fn erase(
 /// becomes empty (signal = `SubtreeGone`) the parent's `BlobNode`
 /// is freed and the orphaned child blob is dropped from the BM
 /// cache + the inner backend in the same step — no GC pass needed.
-pub fn erase_multi(
-    bm: &BufferManager,
-    root_guid: BlobGuid,
-    key: &[u8],
-) -> Result<EraseOutcome> {
+pub fn erase_multi(bm: &BufferManager, root_guid: BlobGuid, key: &[u8]) -> Result<EraseOutcome> {
     let root_pin = bm.pin(root_guid)?;
     // One continuous exclusive critical section — see
     // `insert_multi` for why per-phase guard drops would race.
@@ -128,11 +118,7 @@ pub(super) fn erase_at(
     }
 }
 
-fn erase_at_leaf(
-    frame: &mut BlobFrame<'_>,
-    leaf_slot: u16,
-    key: &[u8],
-) -> Result<EraseReturn> {
+fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Result<EraseReturn> {
     let (existing_key, existing_value) = read_leaf_kv(frame.as_ref(), leaf_slot)?;
     if existing_key != key {
         return Ok(EraseReturn {
@@ -204,14 +190,11 @@ fn erase_at_inner(
         });
     }
     let byte = key[depth];
-    let child = match inner_find_child(frame, inner_slot, ntype, byte)? {
-        Some(c) => c,
-        None => {
-            return Ok(EraseReturn {
-                signal: EraseSignal::Unchanged,
-                previous: None,
-            });
-        }
+    let Some(child) = inner_find_child(frame, inner_slot, ntype, byte)? else {
+        return Ok(EraseReturn {
+            signal: EraseSignal::Unchanged,
+            previous: None,
+        });
     };
 
     let r = erase_at(bm, frame, child, key, depth + 1)?;
@@ -254,6 +237,7 @@ fn erase_at_inner(
 /// inner-node child sits one byte deeper in the descent than its
 /// parent, so dropping the inner node without re-inserting its
 /// pointing-byte breaks every leaf below it.
+#[allow(clippy::too_many_lines)] // intentional — one match over 4 NodeTypes
 fn inner_remove_child_and_collapse(
     frame: &mut BlobFrame<'_>,
     slot: u16,
@@ -342,11 +326,8 @@ fn inner_remove_child_and_collapse(
                     found
                 };
                 frame.free_node(slot)?;
-                let new_slot = write_prefix_chain(
-                    frame,
-                    &[surviving_byte],
-                    surviving_child as u16,
-                )?;
+                let new_slot =
+                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
                 return Ok(EraseSignal::Replaced(new_slot));
             }
             if n.count <= SHRINK_NODE48_TO_NODE16_AT {
@@ -382,11 +363,8 @@ fn inner_remove_child_and_collapse(
                     found
                 };
                 frame.free_node(slot)?;
-                let new_slot = write_prefix_chain(
-                    frame,
-                    &[surviving_byte],
-                    surviving_child as u16,
-                )?;
+                let new_slot =
+                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
                 return Ok(EraseSignal::Replaced(new_slot));
             }
             if n.count <= SHRINK_NODE256_TO_NODE48_AT {

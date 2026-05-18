@@ -12,8 +12,8 @@
 //! alignment, MAX_SLOTS cap, and slot-entry bit-packing.
 
 use crate::layout::{
-    size_of_node, BlobGuid, BlobHeader, NodeType, SlotEntry, SlotEntryRaw,
-    DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
+    size_of_node, BlobGuid, BlobHeader, NodeType, SlotEntry, SlotEntryRaw, DATA_AREA_START,
+    HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
 };
 
 /// Bytes the bump allocator reserves for spillover's
@@ -46,9 +46,12 @@ pub enum AllocError {
 impl std::fmt::Display for AllocError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OutOfSlots => write!(f, "blob slot table exhausted ({} slots)", MAX_SLOTS),
+            Self::OutOfSlots => write!(f, "blob slot table exhausted ({MAX_SLOTS} slots)"),
             Self::OutOfSpace { need, avail } => {
-                write!(f, "blob data area exhausted (need {need} bytes, {avail} available)")
+                write!(
+                    f,
+                    "blob data area exhausted (need {need} bytes, {avail} available)"
+                )
             }
             Self::InvalidRequest => write!(f, "invalid allocation request"),
         }
@@ -123,7 +126,11 @@ impl<'a> BlobFrameRef<'a> {
     /// Wrap an existing `PAGE_SIZE`-byte buffer.
     #[must_use]
     pub fn wrap(buf: &'a [u8]) -> Self {
-        assert_eq!(buf.len(), PAGE_SIZE as usize, "BlobFrameRef requires PAGE_SIZE buffer");
+        assert_eq!(
+            buf.len(),
+            PAGE_SIZE as usize,
+            "BlobFrameRef requires PAGE_SIZE buffer"
+        );
         Self { buf }
     }
 
@@ -139,7 +146,7 @@ impl<'a> BlobFrameRef<'a> {
         // SAFETY: buffer is PAGE_SIZE bytes, starts with a
         // properly-aligned BlobHeader (4096 B; alignment satisfied
         // by AlignedBlobBuf's 4 KB-aligned heap allocation).
-        unsafe { &*(self.buf.as_ptr() as *const BlobHeader) }
+        unsafe { &*self.buf.as_ptr().cast::<BlobHeader>() }
     }
 
     /// Read a 1-based slot table entry. `None` if out of range.
@@ -205,7 +212,11 @@ impl<'a> BlobFrame<'a> {
     /// validation is done — use `wrap_validated` to also run a
     /// sanity check on the header.
     pub fn wrap(buf: &'a mut [u8]) -> Self {
-        assert_eq!(buf.len(), PAGE_SIZE as usize, "BlobFrame requires PAGE_SIZE buffer");
+        assert_eq!(
+            buf.len(),
+            PAGE_SIZE as usize,
+            "BlobFrame requires PAGE_SIZE buffer"
+        );
         Self { buf }
     }
 
@@ -255,14 +266,14 @@ impl<'a> BlobFrame<'a> {
         // with natural u64 alignment requirements satisfied by
         // PAGE_SIZE-aligned allocations; callers must provide an
         // 8-byte aligned buffer).
-        unsafe { &*(self.buf.as_ptr() as *const BlobHeader) }
+        unsafe { &*self.buf.as_ptr().cast::<BlobHeader>() }
     }
 
     /// Mutable reference to the header.
     #[must_use]
     pub fn header_mut(&mut self) -> &mut BlobHeader {
         // SAFETY: see `header`.
-        unsafe { &mut *(self.buf.as_mut_ptr() as *mut BlobHeader) }
+        unsafe { &mut *self.buf.as_mut_ptr().cast::<BlobHeader>() }
     }
 
     /// Read the slot table entry for a 1-based slot index.
@@ -345,14 +356,20 @@ impl<'a> BlobFrame<'a> {
         // Try same-type free list first.
         let free_head = self.header().free_list_head[ntype_idx];
         if free_head != 0 {
-            let e = self.slot_entry(free_head).ok_or(AllocError::InvalidRequest)?;
+            let e = self
+                .slot_entry(free_head)
+                .ok_or(AllocError::InvalidRequest)?;
             let next_free = e.next_free();
             self.header_mut().free_list_head[ntype_idx] = next_free;
 
             let off = e.byte_offset();
             self.write_slot_entry(free_head, SlotEntry::live(ntype, off));
             self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
-            return Ok(AllocOutcome { slot: free_head, byte_offset: off, size });
+            return Ok(AllocOutcome {
+                slot: free_head,
+                byte_offset: off,
+                size,
+            });
         }
 
         // Same-size cross-type fallback for the 128-byte pair
@@ -374,7 +391,11 @@ impl<'a> BlobFrame<'a> {
                 let off = e.byte_offset();
                 self.write_slot_entry(sibling_head, SlotEntry::live(ntype, off));
                 self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
-                return Ok(AllocOutcome { slot: sibling_head, byte_offset: off, size });
+                return Ok(AllocOutcome {
+                    slot: sibling_head,
+                    byte_offset: off,
+                    size,
+                });
             }
         }
 
@@ -400,18 +421,22 @@ impl<'a> BlobFrame<'a> {
         debug_assert!(body_off + size <= PAGE_SIZE);
 
         let new_slot = h.num_slots + 1; // 1-based
-        // Write the slot table entry BEFORE bumping num_slots so
-        // the slot is visible at slot[new_slot] when we then bump
-        // num_slots in the header.
-        // (The `write_slot_entry` debug_assert checks
-        // `slot <= num_slots + 1` for exactly this case.)
+                                        // Write the slot table entry BEFORE bumping num_slots so
+                                        // the slot is visible at slot[new_slot] when we then bump
+                                        // num_slots in the header.
+                                        // (The `write_slot_entry` debug_assert checks
+                                        // `slot <= num_slots + 1` for exactly this case.)
         self.write_slot_entry(new_slot, SlotEntry::live(ntype, body_off));
         let h = self.header_mut();
         h.num_slots += 1;
         h.space_used += size;
         h.gap_space = h.gap_space.wrapping_add(size);
 
-        Ok(AllocOutcome { slot: new_slot, byte_offset: body_off, size })
+        Ok(AllocOutcome {
+            slot: new_slot,
+            byte_offset: body_off,
+            size,
+        })
     }
 
     /// Push a slot onto its NodeType's free list. The body bytes
@@ -424,7 +449,10 @@ impl<'a> BlobFrame<'a> {
             tag: e.ntype_or_next_free,
         })?;
         if ntype == NodeType::Invalid {
-            return Err(FreeError::TypeMismatch { slot, tag: e.ntype_or_next_free });
+            return Err(FreeError::TypeMismatch {
+                slot,
+                tag: e.ntype_or_next_free,
+            });
         }
         let ntype_idx = (ntype.as_u8() - 1) as usize;
         let old_head = self.header().free_list_head[ntype_idx];
@@ -451,11 +479,17 @@ impl<'a> BlobFrame<'a> {
             .saturating_sub(h.space_used)
             .saturating_sub(SPILLOVER_RESERVATION);
         if avail < aligned {
-            return Err(AllocError::OutOfSpace { need: aligned, avail });
+            return Err(AllocError::OutOfSpace {
+                need: aligned,
+                avail,
+            });
         }
         let off = h.space_used;
         self.header_mut().space_used += aligned;
-        Ok(ExtentAllocOutcome { byte_offset: off, aligned_size: aligned })
+        Ok(ExtentAllocOutcome {
+            byte_offset: off,
+            aligned_size: aligned,
+        })
     }
 
     /// View of the buffer's raw bytes.

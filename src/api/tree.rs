@@ -152,15 +152,8 @@ impl Tree {
         Self::open_inner(cfg, backend, /*attach_wal=*/ false)
     }
 
-    fn open_inner(
-        cfg: TreeConfig,
-        backend: Arc<dyn Backend>,
-        attach_wal: bool,
-    ) -> Result<Self> {
-        let bm: Arc<BufferManager> = Arc::new(BufferManager::new(
-            backend,
-            cfg.buffer_pool_size,
-        ));
+    fn open_inner(cfg: TreeConfig, backend: Arc<dyn Backend>, attach_wal: bool) -> Result<Self> {
+        let bm: Arc<BufferManager> = Arc::new(BufferManager::new(backend, cfg.buffer_pool_size));
         let root_guid = ROOT_BLOB_GUID;
         if !bm.has_blob(root_guid)? {
             // Seed an empty root blob and write it through.
@@ -244,13 +237,7 @@ impl Tree {
         // Concurrent writers are serialised by the per-blob
         // `HybridLatch` (root blob always taken exclusive); no
         // Tree-wide writer mutex needed.
-        let outcome = engine::insert_multi(
-            &self.backend,
-            self.root_guid,
-            &padded,
-            value,
-            seq,
-        )?;
+        let outcome = engine::insert_multi(&self.backend, self.root_guid, &padded, value, seq)?;
 
         // Durability model: the WAL flush is the **per-op
         // boundary**. The BM-cached blob image stays in memory
@@ -337,9 +324,8 @@ impl Tree {
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
-        let value = match engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? {
-            Some(v) => v,
-            None => return Err(Error::NotFound),
+        let Some(value) = engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? else {
+            return Err(Error::NotFound);
         };
 
         // Same key? No-op (seq is already bumped).
@@ -348,22 +334,14 @@ impl Tree {
         }
 
         // Probe dst across all blobs unless overwrite is allowed.
-        if !force
-            && engine::lookup_multi(&self.backend, self.root_guid, &dst_padded)?.is_some()
-        {
+        if !force && engine::lookup_multi(&self.backend, self.root_guid, &dst_padded)?.is_some() {
             return Err(Error::DstExists);
         }
 
         // erase(src) + insert(dst, value). Both walk through
         // `BlobNode` crossings and commit any touched child blobs.
         engine::erase_multi(&self.backend, self.root_guid, &src_padded)?;
-        engine::insert_multi(
-            &self.backend,
-            self.root_guid,
-            &dst_padded,
-            &value,
-            seq,
-        )?;
+        engine::insert_multi(&self.backend, self.root_guid, &dst_padded, &value, seq)?;
 
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
@@ -446,7 +424,10 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 engine::erase_multi(bm, root_guid, &padded)?;
             }
             TxnOp::RenameObject {
-                src_key, dst_key, force, ..
+                src_key,
+                dst_key,
+                force,
+                ..
             } => {
                 let src_padded = pad_key(src_key);
                 let dst_padded = pad_key(dst_key);
@@ -458,8 +439,7 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 if !force && engine::lookup_multi(bm, root_guid, &dst_padded)?.is_some() {
                     return Ok(());
                 }
-                let value =
-                    engine::lookup_multi(bm, root_guid, &src_padded)?.unwrap_or_default();
+                let value = engine::lookup_multi(bm, root_guid, &src_padded)?.unwrap_or_default();
                 engine::erase_multi(bm, root_guid, &src_padded)?;
                 engine::insert_multi(bm, root_guid, &dst_padded, &value, seq)?;
             }

@@ -5,9 +5,7 @@
 use super::cast;
 use super::readers::read_prefix;
 use super::writers::write_struct_to_slot;
-use super::{
-    compact_blob, erase, insert, lookup, lookup_at, make_blob_from_node, LookupResult,
-};
+use super::{compact_blob, erase, insert, lookup, lookup_at, make_blob_from_node, LookupResult};
 use crate::api::errors::Error;
 use crate::layout::{BlobGuid, NodeType, PAGE_SIZE};
 use crate::store::backend::AlignedBlobBuf;
@@ -26,7 +24,7 @@ fn put(frame: &mut BlobFrame<'_>, k: &[u8], v: &[u8], seq: u64) {
     frame.header_mut().root_slot = r.new_root_slot;
 }
 
-fn get<'a>(frame: &'a BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
+fn get(frame: &BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
     let root = frame.header().root_slot;
     match lookup(frame.as_ref(), root, k).unwrap() {
         LookupResult::Found(v) => Some(v.to_vec()),
@@ -296,7 +294,7 @@ fn erase_collapses_node256_lone_child() {
         del(&mut frame, &k);
     }
     let k_last = [b'q', 59];
-    let v_last = [59u8, 59u8 ^ 0xFF];
+    let v_last = [59u8, 0x3B ^ 0xFFu8];
     assert_eq!(get(&frame, &k_last).as_deref(), Some(&v_last[..]));
 }
 
@@ -333,7 +331,7 @@ fn shrink_node16_to_node4_at_three_remaining() {
         Some(NodeType::Node16),
     );
     // Erase two so 3 children remain.
-    del(&mut frame, &[b'k', b'0' + 0]);
+    del(&mut frame, b"k0");
     del(&mut frame, &[b'k', b'0' + 1]);
     assert_eq!(
         frame
@@ -498,7 +496,7 @@ fn erase_all_returns_to_empty_root() {
     for (i, (k, v)) in pairs.iter().enumerate() {
         put(&mut frame, k, v, i as u64 + 1);
     }
-    for (k, v) in pairs.iter() {
+    for (k, v) in &pairs {
         assert_eq!(del(&mut frame, k).as_deref(), Some(*v));
     }
     let root_slot = frame.header().root_slot;
@@ -536,7 +534,12 @@ fn churn_100_keys_inserted_then_all_erased() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
-        .map(|i| (format!("k{i:04}").into_bytes(), format!("v{i}").into_bytes()))
+        .map(|i| {
+            (
+                format!("k{i:04}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            )
+        })
         .collect();
     for (i, (k, v)) in pairs.iter().enumerate() {
         put(&mut frame, k, v, i as u64 + 1);
@@ -737,7 +740,12 @@ fn make_blob_from_node_then_lookup_yields_crossing_when_root_is_blob_node() {
     let src_frame = BlobFrame::wrap(&mut src_buf);
     let mut outcome = make_blob_from_node(&src_frame, bn_slot, [0x44; 16]).unwrap();
     let new_frame = BlobFrame::wrap(outcome.buf.as_mut_slice());
-    let r = lookup(new_frame.as_ref(), new_frame.header().root_slot, b"whatever").unwrap();
+    let r = lookup(
+        new_frame.as_ref(),
+        new_frame.header().root_slot,
+        b"whatever",
+    )
+    .unwrap();
     match r {
         LookupResult::Crossing(c) => {
             assert_eq!(c.child_guid, [0x99; 16]);

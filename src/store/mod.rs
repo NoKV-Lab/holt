@@ -7,11 +7,13 @@
 //! - [`BufferManager`] — LRU-bounded cache wrapping any `Backend`,
 //!   itself implementing `Backend` so it's transparent.
 
+pub mod backend;
 mod blob_frame;
 mod buffer_manager;
-pub mod backend;
 
 pub use blob_frame::{
     AllocError, AllocOutcome, BlobFrame, BlobFrameRef, ExtentAllocOutcome, FreeError,
 };
-pub use buffer_manager::{BufferManager, CachedBlob};
+pub use buffer_manager::{
+    BlobReadGuard, BlobWriteGuard, BufferManager, CachedBlob, OptimisticGuard,
+};

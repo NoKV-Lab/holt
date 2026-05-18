@@ -15,18 +15,16 @@ use crate::store::BlobFrame;
 
 use super::readers::{read_node16, read_node256, read_node4, read_node48, read_prefix};
 
-pub(super) fn write_struct_to_slot<T>(
-    frame: &mut BlobFrame<'_>,
-    slot: u16,
-    v: &T,
-) -> Result<()> {
+pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &T) -> Result<()> {
     let body = frame.body_of_slot_mut(slot).ok_or(Error::NodeCorrupt {
         context: "write_struct_to_slot: body",
     })?;
     debug_assert_eq!(body.len(), size_of::<T>());
     // SAFETY: layout types are #[repr(C)] POD; body sized and
     // aligned per BlobFrame invariants.
-    let bytes = unsafe { std::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(std::ptr::from_ref::<T>(v).cast::<u8>(), size_of::<T>())
+    };
     body.copy_from_slice(bytes);
     Ok(())
 }
@@ -83,10 +81,7 @@ pub(super) fn write_prefix_chain(
 
 /// Build a fresh Node4 with the given `(byte, child_slot)` pairs.
 /// Keys are sorted ascending inside the Node4.
-pub(super) fn write_node4_with(
-    frame: &mut BlobFrame<'_>,
-    children: &[(u8, u32)],
-) -> Result<u16> {
+pub(super) fn write_node4_with(frame: &mut BlobFrame<'_>, children: &[(u8, u32)]) -> Result<u16> {
     debug_assert!(!children.is_empty() && children.len() <= 4);
     let out = frame.alloc_node(NodeType::Node4)?;
     let mut n = Node4::empty();
@@ -276,9 +271,11 @@ pub(super) fn inner_add_child(
                 });
             }
             n.children[byte as usize] = new_child;
-            if (n.count as u32) < 256 {
-                n.count += 1;
-            }
+            // Node256 capacity is 256 but `count` is u8 (max 255).
+            // Saturate at 255 — the bit-set in `children[]` is the
+            // authoritative population check; `count` is a stat
+            // used by spillover / shrink heuristics.
+            n.count = n.count.saturating_add(1);
             write_struct_to_slot(frame, slot, &n)?;
             Ok(slot)
         }
@@ -351,11 +348,7 @@ fn node48_insert(n: &mut Node48, byte: u8, child: u32) -> Result<()> {
 
 // ---------- node growth ----------
 
-fn grow_node4_to_node16(
-    frame: &mut BlobFrame<'_>,
-    old_slot: u16,
-    old: Node4,
-) -> Result<u16> {
+fn grow_node4_to_node16(frame: &mut BlobFrame<'_>, old_slot: u16, old: Node4) -> Result<u16> {
     let out = frame.alloc_node(NodeType::Node16)?;
     let mut n = Node16::empty();
     n.count = old.count;
@@ -368,11 +361,7 @@ fn grow_node4_to_node16(
     Ok(out.slot)
 }
 
-fn grow_node16_to_node48(
-    frame: &mut BlobFrame<'_>,
-    old_slot: u16,
-    old: Node16,
-) -> Result<u16> {
+fn grow_node16_to_node48(frame: &mut BlobFrame<'_>, old_slot: u16, old: Node16) -> Result<u16> {
     let out = frame.alloc_node(NodeType::Node48)?;
     let mut n = Node48::empty();
     n.count = old.count;
@@ -385,11 +374,7 @@ fn grow_node16_to_node48(
     Ok(out.slot)
 }
 
-fn grow_node48_to_node256(
-    frame: &mut BlobFrame<'_>,
-    old_slot: u16,
-    old: Node48,
-) -> Result<u16> {
+fn grow_node48_to_node256(frame: &mut BlobFrame<'_>, old_slot: u16, old: Node48) -> Result<u16> {
     let out = frame.alloc_node(NodeType::Node256)?;
     let mut n = Node256::empty();
     let mut count = 0u16;
@@ -516,8 +501,7 @@ pub(super) fn finish_inner_with_sorted<T>(
     }
     if new_count == 1 {
         frame.free_node(slot)?;
-        let new_slot =
-            write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
+        let new_slot = write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
         return Ok(EraseSignal::Replaced(new_slot));
     }
     write_struct_to_slot(frame, slot, body)?;

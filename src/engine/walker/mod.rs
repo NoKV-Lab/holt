@@ -1,31 +1,28 @@
 //! Recursive ART walker — descent / insert / erase / spillover /
-//! migrate. Split into focused submodules:
+//! migrate. Split into focused submodules (all `pub(super)` —
+//! internal to the walker, re-exported as the public surface from
+//! this `mod.rs`):
 //!
-//! - [`types`] — public outcomes (`LookupResult`, `InsertOutcome`,
+//! - `types` — public outcomes ([`LookupResult`], [`InsertOutcome`],
 //!   …) + internal signals (`EraseSignal`, `Victim`, …).
-//! - [`readers`] — decode slot bodies + leaf extents off a
-//!   [`BlobFrameRef`].
-//! - [`writers`] — allocate fresh slots / extents and populate them.
-//! - [`lookup`] — `lookup` / `lookup_at` / `lookup_multi` and
+//! - `readers` — decode slot bodies + leaf extents off a
+//!   `BlobFrameRef`.
+//! - `writers` — allocate fresh slots / extents and populate them.
+//! - `lookup` — [`lookup`] / [`lookup_at`] / [`lookup_multi`] and
 //!   single-blob descent arms. Zero-copy: walks against
-//!   [`BlobFrameRef`] (so it's safe to run under a `BufferManager`
-//!   shared read-guard).
-//! - [`insert`] — `insert` / `insert_multi` + `insert_at` dispatch
-//!   + `insert_at_blob_node` cross-blob arm.
-//! - [`erase`] — `erase` / `erase_multi` + `erase_at` dispatch +
+//!   `BlobFrameRef` so it's safe to run under a `BufferManager`
+//!   shared read-guard.
+//! - `insert` — [`insert`] / [`insert_multi`] + `insert_at`
+//!   dispatch + `insert_at_blob_node` cross-blob arm.
+//! - `erase` — [`erase`] / [`erase_multi`] + `erase_at` dispatch +
 //!   `erase_at_blob_node` cross-blob arm + lone-child collapse
 //!   rewiring.
-//! - [`spillover`] — when a blob fills, pick a victim subtree,
-//!   migrate it via [`migrate::make_blob_from_node`], free the
-//!   source slots, install a `BlobNode` placeholder.
-//! - [`migrate`] — deep-clone primitives: `make_blob_from_node`
-//!   (spillover) + `compact_blob` (in-place repack). Share the
-//!   `clone_subtree` machinery.
-//!
-//! Public entry points are re-exported here. Anything `pub(super)`
-//! is internal to the walker.
-//!
-//! [`BlobFrameRef`]: crate::store::BlobFrameRef
+//! - `spillover` — when a blob fills, pick a victim subtree,
+//!   migrate it via [`make_blob_from_node`], free the source slots,
+//!   install a `BlobNode` placeholder.
+//! - `migrate` — deep-clone primitives: [`make_blob_from_node`]
+//!   (spillover) + [`compact_blob`] (in-place repack). Share the
+//!   internal `clone_subtree` machinery.
 
 use std::mem::size_of;
 
@@ -71,5 +68,5 @@ pub(super) const MAX_SPILLOVER_ATTEMPTS: u32 = 64;
 pub(super) fn cast<T>(body: &[u8]) -> &T {
     debug_assert_eq!(body.len(), size_of::<T>());
     debug_assert_eq!(body.as_ptr() as usize % std::mem::align_of::<T>(), 0);
-    unsafe { &*(body.as_ptr() as *const T) }
+    unsafe { &*body.as_ptr().cast::<T>() }
 }

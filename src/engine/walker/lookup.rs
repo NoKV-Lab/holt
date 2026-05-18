@@ -43,7 +43,7 @@ pub fn lookup_at<'a>(
 
 /// Multi-blob lookup — wait-free in the common case.
 ///
-/// Walks every blob via [`CachedBlob::read_optimistic`]: snapshot
+/// Walks every blob via [`crate::store::CachedBlob::read_optimistic`]: snapshot
 /// the latch version, read raw bytes, then `validate()` after the
 /// hop. If a writer lapped the snapshot mid-walk the hop is
 /// discarded and the entire lookup restarts from the root.

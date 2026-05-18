@@ -62,17 +62,25 @@ impl std::fmt::Display for Error {
             Self::Alloc(e) => write!(f, "alloc: {e}"),
             Self::Free(e) => write!(f, "free: {e}"),
             Self::KeyTooLong { len } => write!(f, "key too long ({len} bytes; max {})", u16::MAX),
-            Self::ValueTooLong { len } => write!(f, "value too long ({len} bytes; max {})", u16::MAX),
+            Self::ValueTooLong { len } => {
+                write!(f, "value too long ({len} bytes; max {})", u16::MAX)
+            }
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
             Self::NodeCorrupt { context } => write!(f, "node corrupt at {context}"),
-            Self::ReplaySanityFailed { context, record_offset } => {
+            Self::ReplaySanityFailed {
+                context,
+                record_offset,
+            } => {
                 write!(
                     f,
                     "WAL replay sanity-check failed at offset {record_offset}: {context}"
                 )
             }
             Self::NotFound => write!(f, "key not found"),
-            Self::DstExists => write!(f, "destination key already exists (use force=true to overwrite)"),
+            Self::DstExists => write!(
+                f,
+                "destination key already exists (use force=true to overwrite)"
+            ),
         }
     }
 }

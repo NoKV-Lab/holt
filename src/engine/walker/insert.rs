@@ -3,9 +3,7 @@
 //! `insert_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{
-    leaf_extent_size, BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE,
-};
+use crate::layout::{leaf_extent_size, BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use crate::store::{BlobFrame, BufferManager};
 
 use super::cast;
@@ -13,8 +11,8 @@ use super::readers::{longest_common, ntype_of, read_leaf_kv, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertOutcome, InsertReturn};
 use super::writers::{
-    inner_add_child, inner_find_child, inner_update_child, set_prefix_child,
-    write_leaf, write_node4_with, write_prefix_chain, write_struct_to_slot,
+    inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
+    write_node4_with, write_prefix_chain, write_struct_to_slot,
 };
 use super::MAX_SPILLOVER_ATTEMPTS;
 
@@ -195,20 +193,20 @@ fn insert_into_leaf(
             cast::<Leaf>(body).key_offset
         };
         let key_len_u32 = new_key.len() as u32;
-        let old_extent_size =
-            leaf_extent_size(key_len_u32, u32::from(existing_value.len() as u16));
+        let old_extent_size = leaf_extent_size(key_len_u32, u32::from(existing_value.len() as u16));
         let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
 
         if new_extent_size <= old_extent_size {
             let value_offset = key_off + 2 + key_len_u32;
             let value_room = old_extent_size - 2 - key_len_u32;
-            let region = frame
-                .bytes_at_mut(value_offset, value_room)
-                .ok_or(Error::NodeCorrupt {
-                    context: "insert_into_leaf: extent value range out of bounds",
-                })?;
+            let region =
+                frame
+                    .bytes_at_mut(value_offset, value_room)
+                    .ok_or(Error::NodeCorrupt {
+                        context: "insert_into_leaf: extent value range out of bounds",
+                    })?;
             region[..new_value.len()].copy_from_slice(new_value);
-            for b in region[new_value.len()..].iter_mut() {
+            for b in &mut region[new_value.len()..] {
                 *b = 0;
             }
             let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
@@ -331,6 +329,7 @@ fn insert_into_prefix(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // 8 args mirror insert_at's call shape
 fn insert_into_inner(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,

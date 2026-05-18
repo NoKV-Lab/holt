@@ -1,14 +1,14 @@
 //! `Leaf` body (16 bytes) + key/value extent helper.
 //!
 //! Layout (`#[repr(C)]`):
-//!   - `value_size: u16 @ +0`
-//!   - `tombstone:  u8  @ +2`
-//!   - `_pad:       u8  @ +3`
-//!   - `key_offset: u32 @ +4`  — byte offset within the blob to a
-//!                              separately bump-allocated extent
-//!                              holding `(u16 key_len, key bytes,
-//!                              value bytes)`.
-//!   - `seq:        u64 @ +8`
+//!
+//! - `value_size: u16 @ +0`
+//! - `tombstone:  u8  @ +2`
+//! - `_pad:       u8  @ +3`
+//! - `key_offset: u32 @ +4` — byte offset within the blob to a
+//!   separately bump-allocated extent holding
+//!   `(u16 key_len, key bytes, value bytes)`.
+//! - `seq:        u64 @ +8`
 //!
 //! The 16-byte body is allocated as a node (registered in the
 //! slot table); the extent is allocated separately via
@@ -74,10 +74,10 @@ mod tests {
     #[test]
     fn extent_size_alignment() {
         assert_eq!(leaf_extent_size(0, 0), 8);
-        assert_eq!(leaf_extent_size(3, 3), 8);     // 2+3+3=8
-        assert_eq!(leaf_extent_size(4, 4), 16);    // 2+4+4=10 → 16
-        assert_eq!(leaf_extent_size(10, 4), 16);   // 2+10+4=16
-        assert_eq!(leaf_extent_size(10, 5), 24);   // 2+10+5=17 → 24
+        assert_eq!(leaf_extent_size(3, 3), 8); // 2+3+3=8
+        assert_eq!(leaf_extent_size(4, 4), 16); // 2+4+4=10 → 16
+        assert_eq!(leaf_extent_size(10, 4), 16); // 2+10+4=16
+        assert_eq!(leaf_extent_size(10, 5), 24); // 2+10+5=17 → 24
         assert_eq!(leaf_extent_size(100, 200), (2 + 100 + 200 + 7) & !7);
     }
 }

@@ -283,10 +283,7 @@ impl Manifest {
         hdr[..8].copy_from_slice(&MANIFEST_MAGIC);
         hdr[8..10].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
         let count = u32::try_from(self.slots.len()).map_err(|_| {
-            Error::BackendIo(io::Error::new(
-                io::ErrorKind::Other,
-                "manifest slot count exceeds u32::MAX",
-            ))
+            Error::BackendIo(io::Error::other("manifest slot count exceeds u32::MAX"))
         })?;
         hdr[10..14].copy_from_slice(&count.to_le_bytes());
         // Bytes 14..16 reserved (zero).

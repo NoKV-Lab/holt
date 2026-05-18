@@ -11,13 +11,13 @@
 //! - `checkpoint()` flushes everything and truncates the WAL.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
 use artisan::{Tree, TreeConfig};
 
-fn wal_path(dir: &PathBuf) -> PathBuf {
+fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
 }
 
@@ -48,9 +48,7 @@ fn persistent_put_then_reopen_via_wal_replay() {
     } // tree dropped — no explicit checkpoint.
 
     // The WAL file exists and has bytes past the header.
-    let wal_size_after_drop = fs::metadata(wal_path(&dir.path().to_path_buf()))
-        .unwrap()
-        .len();
+    let wal_size_after_drop = fs::metadata(wal_path(dir.path())).unwrap().len();
     assert!(wal_size_after_drop > 32, "WAL should hold records");
 
     // Round 2: reopen. Replay rebuilds every key from the log.
@@ -78,20 +76,13 @@ fn checkpoint_truncates_wal_and_keys_survive_reopen() {
     {
         let tree = Tree::open(cfg.clone()).unwrap();
         for i in 0..20u32 {
-            tree.put(
-                format!("k{i:02}").as_bytes(),
-                format!("v{i}").as_bytes(),
-            )
-            .unwrap();
+            tree.put(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
         }
-        let wal_size_before = fs::metadata(wal_path(&dir.path().to_path_buf()))
-            .unwrap()
-            .len();
+        let wal_size_before = fs::metadata(wal_path(dir.path())).unwrap().len();
         assert!(wal_size_before > 32);
         tree.checkpoint().unwrap();
-        let wal_size_after = fs::metadata(wal_path(&dir.path().to_path_buf()))
-            .unwrap()
-            .len();
+        let wal_size_after = fs::metadata(wal_path(dir.path())).unwrap().len();
         assert_eq!(
             wal_size_after, 32,
             "checkpoint should truncate WAL to header-only",
@@ -121,11 +112,8 @@ fn delete_through_wal_replays_correctly() {
     {
         let tree = Tree::open(cfg.clone()).unwrap();
         for i in 0..10u32 {
-            tree.put(
-                format!("k{i}").as_bytes(),
-                format!("v{i}").as_bytes(),
-            )
-            .unwrap();
+            tree.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
         }
         // Delete every even key.
         for i in 0..10u32 {
@@ -188,9 +176,7 @@ fn default_mode_loses_writes_without_checkpoint_or_fsync() {
         // well below the 64 KB auto-flush threshold, so the WAL
         // file on disk is still header-only.
     }
-    let wal_size = fs::metadata(wal_path(&dir.path().to_path_buf()))
-        .unwrap()
-        .len();
+    let wal_size = fs::metadata(wal_path(dir.path())).unwrap().len();
     assert_eq!(wal_size, 32);
 
     let tree = Tree::open(cfg).unwrap();
@@ -286,7 +272,10 @@ fn next_seq_resumes_past_replayed_records() {
         // The exact seq isn't exposed, but the round-trip
         // semantics imply: after a put, the value is readable.
         tree.put(b"after-replay", b"v").unwrap();
-        assert_eq!(tree.get(b"after-replay").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            tree.get(b"after-replay").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
         // And every earlier key still readable too.
         for i in 0..5u32 {
             assert_eq!(
@@ -299,8 +288,8 @@ fn next_seq_resumes_past_replayed_records() {
 
 #[test]
 fn open_with_backend_attaches_no_wal() {
-    use std::sync::Arc;
     use artisan::{Backend, MemoryBackend, TreeBuilder};
+    use std::sync::Arc;
 
     let dir = tempdir().unwrap();
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -315,7 +304,7 @@ fn open_with_backend_attaches_no_wal() {
     }
 
     // No WAL file should have been created.
-    assert!(!wal_path(&dir.path().to_path_buf()).exists());
+    assert!(!wal_path(dir.path()).exists());
 }
 
 #[test]

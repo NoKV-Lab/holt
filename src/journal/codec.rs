@@ -96,7 +96,10 @@ impl FileHeader {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        Self { tree_id, created_at }
+        Self {
+            tree_id,
+            created_at,
+        }
     }
 }
 
@@ -129,7 +132,10 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeader> {
     let tree_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let created_at = u64::from_le_bytes(buf[16..24].try_into().unwrap());
     // bytes 24..32 reserved; ignore for forward-compatibility.
-    Ok(FileHeader { tree_id, created_at })
+    Ok(FileHeader {
+        tree_id,
+        created_at,
+    })
 }
 
 // On-disk variant tags. Stable; only ever add new tags, never
@@ -262,13 +268,7 @@ pub fn encode_insert_record(
 }
 
 /// Encode an `Erase` record directly from refs.
-pub fn encode_erase_record(
-    out: &mut Vec<u8>,
-    seq: u64,
-    tree_id: u64,
-    key: &[u8],
-    value: &[u8],
-) {
+pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) {
     write_record(out, seq, TY_ERASE, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
@@ -310,24 +310,44 @@ fn variant_tag(op: &TxnOp) -> u8 {
 
 fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
     match op {
-        TxnOp::Insert { tree_id, seq: _, key, value, prev_value } => {
+        TxnOp::Insert {
+            tree_id,
+            seq: _,
+            key,
+            value,
+            prev_value,
+        } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
             write_bytes(out, value);
             write_optional_bytes(out, prev_value.as_deref());
         }
-        TxnOp::Erase { tree_id, seq: _, key, value } => {
+        TxnOp::Erase {
+            tree_id,
+            seq: _,
+            key,
+            value,
+        } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
             write_bytes(out, value);
         }
-        TxnOp::Split { parent_blob, pre_split_node, new_child_blob, new_child_entry } => {
+        TxnOp::Split {
+            parent_blob,
+            pre_split_node,
+            new_child_blob,
+            new_child_entry,
+        } => {
             out.extend_from_slice(parent_blob);
             out.extend_from_slice(&pre_split_node.to_le_bytes());
             out.extend_from_slice(new_child_blob);
             out.extend_from_slice(&new_child_entry.to_le_bytes());
         }
-        TxnOp::Merge { parent_blob, pre_merge_node, child_blob } => {
+        TxnOp::Merge {
+            parent_blob,
+            pre_merge_node,
+            child_blob,
+        } => {
             out.extend_from_slice(parent_blob);
             out.extend_from_slice(&pre_merge_node.to_le_bytes());
             out.extend_from_slice(child_blob);
@@ -336,7 +356,13 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
             out.extend_from_slice(blob);
             out.push(encode_reason(*reason));
         }
-        TxnOp::RenameObject { tree_id, seq: _, src_key, dst_key, force } => {
+        TxnOp::RenameObject {
+            tree_id,
+            seq: _,
+            src_key,
+            dst_key,
+            force,
+        } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, src_key);
             write_bytes(out, dst_key);
@@ -557,31 +583,31 @@ fn decode_reason(t: u8) -> Result<CompactReason> {
 }
 
 fn read_u8(body: &mut &[u8]) -> Result<u8> {
-    let (front, rest) = take(*body, 1)?;
+    let (front, rest) = take(body, 1)?;
     *body = rest;
     Ok(front[0])
 }
 
 fn read_u16(body: &mut &[u8]) -> Result<u16> {
-    let (front, rest) = take(*body, 2)?;
+    let (front, rest) = take(body, 2)?;
     *body = rest;
     Ok(u16::from_le_bytes(front.try_into().unwrap()))
 }
 
 fn read_u32(body: &mut &[u8]) -> Result<u32> {
-    let (front, rest) = take(*body, 4)?;
+    let (front, rest) = take(body, 4)?;
     *body = rest;
     Ok(u32::from_le_bytes(front.try_into().unwrap()))
 }
 
 fn read_u64(body: &mut &[u8]) -> Result<u64> {
-    let (front, rest) = take(*body, 8)?;
+    let (front, rest) = take(body, 8)?;
     *body = rest;
     Ok(u64::from_le_bytes(front.try_into().unwrap()))
 }
 
 fn read_guid(body: &mut &[u8]) -> Result<BlobGuid> {
-    let (front, rest) = take(*body, 16)?;
+    let (front, rest) = take(body, 16)?;
     *body = rest;
     let mut g = [0u8; 16];
     g.copy_from_slice(front);
@@ -590,7 +616,7 @@ fn read_guid(body: &mut &[u8]) -> Result<BlobGuid> {
 
 fn read_bytes(body: &mut &[u8]) -> Result<Vec<u8>> {
     let len = read_u32(body)? as usize;
-    let (front, rest) = take(*body, len)?;
+    let (front, rest) = take(body, len)?;
     *body = rest;
     Ok(front.to_vec())
 }
@@ -851,7 +877,7 @@ mod tests {
         buf[16] = 0xFF;
         // Recompute the CRC so the corruption looks plausible
         // — confirms the "unknown tag" path triggers (and not "CRC").
-        let body_end = RECORD_HEADER_SIZE + 0; // MemMarker has empty body
+        let body_end = RECORD_HEADER_SIZE; // MemMarker has empty body
         let crc = crc32(&buf[..body_end]);
         buf[body_end..body_end + 4].copy_from_slice(&crc.to_le_bytes());
 

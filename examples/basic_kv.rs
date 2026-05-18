@@ -21,9 +21,18 @@ fn main() {
     tree.put(b"img/02.jpg", b"\xFF\xD8\xFF...").unwrap();
     tree.put(b"meta/owner", b"alice").unwrap();
 
-    for key in [b"img/01.jpg".as_ref(), b"img/02.jpg", b"meta/owner", b"missing"] {
+    for key in [
+        b"img/01.jpg".as_ref(),
+        b"img/02.jpg",
+        b"meta/owner",
+        b"missing",
+    ] {
         match tree.get(key).unwrap() {
-            Some(v) => println!("get {:?} -> {} bytes", String::from_utf8_lossy(key), v.len()),
+            Some(v) => println!(
+                "get {:?} -> {} bytes",
+                String::from_utf8_lossy(key),
+                v.len()
+            ),
             None => println!("get {:?} -> (none)", String::from_utf8_lossy(key)),
         }
     }

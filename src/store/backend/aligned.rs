@@ -55,7 +55,7 @@ impl AlignedBlobBuf {
         self.ptr.as_ptr()
     }
 
-    /// Mutable raw pointer. Same invariants as [`as_ptr`].
+    /// Mutable raw pointer. Same invariants as [`Self::as_ptr`].
     #[must_use]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
@@ -113,7 +113,12 @@ impl Clone for AlignedBlobBuf {
 
 impl std::fmt::Debug for AlignedBlobBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AlignedBlobBuf({:p}, {} B)", self.ptr.as_ptr(), PAGE_SIZE)
+        write!(
+            f,
+            "AlignedBlobBuf({:p}, {} B)",
+            self.ptr.as_ptr(),
+            PAGE_SIZE
+        )
     }
 }
 

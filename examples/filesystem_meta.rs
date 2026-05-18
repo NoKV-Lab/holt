@@ -41,10 +41,7 @@ fn main() {
     println!("=== artisan filesystem_meta example ===\n");
 
     // In-memory for the example so it doesn't litter cwd.
-    let tree = TreeBuilder::new("scratch")
-        .memory()
-        .open()
-        .expect("open");
+    let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 
     // Populate a small directory tree.
     let now: u64 = 1_715_817_600;
@@ -120,7 +117,10 @@ fn main() {
         false,
     )
     .unwrap();
-    assert!(tree.get(b"/home/alice/photos/sunset.jpg").unwrap().is_none());
+    assert!(tree
+        .get(b"/home/alice/photos/sunset.jpg")
+        .unwrap()
+        .is_none());
     assert!(tree
         .get(b"/home/alice/photos/sunset-archived.jpg")
         .unwrap()

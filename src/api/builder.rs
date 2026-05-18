@@ -32,7 +32,9 @@ impl TreeBuilder {
     /// (the default).
     #[must_use]
     pub fn new<P: Into<PathBuf>>(data_dir: P) -> Self {
-        Self { cfg: TreeConfig::new(data_dir) }
+        Self {
+            cfg: TreeConfig::new(data_dir),
+        }
     }
 
     /// Flip the builder to **in-memory** mode. The supplied

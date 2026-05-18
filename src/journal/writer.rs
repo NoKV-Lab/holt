@@ -68,10 +68,7 @@ impl WalWriter {
     /// Returns an error if `path` already exists — use
     /// [`WalWriter::open_existing`] to append to an existing log.
     pub fn create(path: &Path, tree_id: u64) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let header = FileHeader::now(tree_id);
         let mut buf = Vec::with_capacity(FILE_HEADER_SIZE);
         encode_file_header(&header, &mut buf);
@@ -180,13 +177,7 @@ impl WalWriter {
     }
 
     /// Fast-path: append an `Erase` record directly from refs.
-    pub fn append_erase(
-        &mut self,
-        seq: u64,
-        tree_id: u64,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<()> {
+    pub fn append_erase(&mut self, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) -> Result<()> {
         encode_erase_record(&mut self.pending, seq, tree_id, key, value);
         self.maybe_drain()
     }
@@ -201,14 +192,7 @@ impl WalWriter {
         dst_key: &[u8],
         force: bool,
     ) -> Result<()> {
-        encode_rename_object_record(
-            &mut self.pending,
-            seq,
-            tree_id,
-            src_key,
-            dst_key,
-            force,
-        );
+        encode_rename_object_record(&mut self.pending, seq, tree_id, src_key, dst_key, force);
         self.maybe_drain()
     }
 

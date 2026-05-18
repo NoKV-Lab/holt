@@ -46,7 +46,10 @@ fn size_of_node_matches_per_type_struct() {
     assert_eq!(size_of_node(NodeType::Node4) as usize, size_of::<Node4>());
     assert_eq!(size_of_node(NodeType::Node16) as usize, size_of::<Node16>());
     assert_eq!(size_of_node(NodeType::Node48) as usize, size_of::<Node48>());
-    assert_eq!(size_of_node(NodeType::Node256) as usize, size_of::<Node256>());
+    assert_eq!(
+        size_of_node(NodeType::Node256) as usize,
+        size_of::<Node256>()
+    );
     assert_eq!(size_of_node(NodeType::EmptyRoot), 8);
 }
 

@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # The `rocksdb` dev-dep pulls a C++ build that takes long enough
+  # to make caching worth it across the matrix runs.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # --------------------------------------------------------------
+  # Build + test the library + examples + integration tests on
+  # the two Tier-1 Unix targets artisan supports today.
+  # --------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test (lib + integration)
+        run: cargo test --workspace --all-targets --locked
+
+      - name: cargo test (doctests)
+        run: cargo test --workspace --doc --locked
+
+      - name: cargo run --example basic_kv
+        run: cargo run --example basic_kv --locked
+
+      - name: cargo run --example filesystem_meta
+        run: cargo run --example filesystem_meta --locked
+
+      - name: cargo run --example session_store
+        run: cargo run --example session_store --locked
+
+      - name: cargo run --example s3_metadata
+        run: cargo run --example s3_metadata --locked
+
+  # --------------------------------------------------------------
+  # Lint pass — formatting + clippy with deny(warnings) on top of
+  # the crate's pedantic lints.
+  # --------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # Clippy on tests + examples too, not just the library. The
+      # crate opts into `clippy::pedantic` and has a vetted set of
+      # `#![allow]`s in `src/lib.rs` for the unhelpful ones; any
+      # new warning fails the build.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # --------------------------------------------------------------
+  # `cargo doc` — fails on broken intra-doc links / missing docs
+  # so the rendered docs.rs page stays clean.
+  # --------------------------------------------------------------
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc (no deps)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --locked
+
+  # --------------------------------------------------------------
+  # MSRV — pin to the rust-version field in Cargo.toml. Keeps us
+  # honest about the floor we promise downstream users.
+  # --------------------------------------------------------------
+  msrv:
+    name: msrv (rust 1.79)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.79
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (msrv)
+        # Test code uses the latest stable's diagnostic features;
+        # build alone is the contract for MSRV.
+        run: cargo build --workspace --all-targets --locked

@@ -43,10 +43,7 @@ pub fn node16_find_byte(keys: &[u8; 16], count: u8, byte: u8) -> Option<u8> {
 /// Reference scalar implementation — exposed only inside the crate
 /// so the SSE2 / NEON paths can be cross-checked in tests and the
 /// `cfg(not(...))` fallback path can call into it directly.
-#[cfg(any(
-    test,
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[inline]
 pub(crate) fn node16_find_byte_scalar(keys: &[u8; 16], count: u8, byte: u8) -> Option<u8> {
     let n = (count as usize).min(16);
@@ -145,7 +142,10 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
-    use std::arch::aarch64::*;
+    use std::arch::aarch64::{
+        uint8x16_t, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8,
+        vreinterpretq_u16_u8, vshrn_n_u16,
+    };
 
     /// Pack a `uint8x16_t` byte-mask (each byte = 0xFF or 0x00)
     /// into a `u64` nibble-mask: byte i → nibble at bits
@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn find_byte_middle() {
         let mut keys = [0u8; 16];
-        for i in 0..10 {
-            keys[i] = (b'a' + i as u8) as u8;
+        for (i, slot) in keys.iter_mut().enumerate().take(10) {
+            *slot = b'a' + i as u8;
         }
         assert_eq!(node16_find_byte(&keys, 10, b'f'), Some(5));
     }
@@ -227,8 +227,8 @@ mod tests {
     #[test]
     fn find_byte_absent_returns_none() {
         let mut keys = [0u8; 16];
-        for i in 0..8 {
-            keys[i] = (b'a' + i as u8) as u8;
+        for (i, slot) in keys.iter_mut().enumerate().take(8) {
+            *slot = b'a' + i as u8;
         }
         assert_eq!(node16_find_byte(&keys, 8, b'z'), None);
     }
@@ -263,13 +263,15 @@ mod tests {
         use std::collections::HashSet;
         // Generate pseudo-random Node16 contents and random queries;
         // SIMD and scalar must always agree.
-        let mut state: u64 = 0xDEADBEEFCAFEBABE;
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let next = |s: &mut u64| -> u8 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             (*s >> 33) as u8
         };
         for _ in 0..1000 {
-            let count = (next(&mut state) % 17) as u8; // 0..=16
+            let count = next(&mut state) % 17; // 0..=16
             let mut keys = [0u8; 16];
             let mut used = HashSet::new();
             for k in keys.iter_mut().take(count as usize) {
@@ -284,7 +286,10 @@ mod tests {
             let query = next(&mut state);
             let got = node16_find_byte(&keys, count, query);
             let expected = node16_find_byte_scalar(&keys, count, query);
-            assert_eq!(got, expected, "mismatch on keys={keys:?} count={count} q={query}");
+            assert_eq!(
+                got, expected,
+                "mismatch on keys={keys:?} count={count} q={query}"
+            );
         }
     }
 

@@ -45,14 +45,56 @@
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
-#![allow(clippy::module_name_repetitions)]
+// `clippy::pedantic` opt-in is on purpose — we want the high
+// signal-to-noise lints firing. The blanket allows below are
+// the categories we've reviewed and judged to be either
+// intentional design choices in this crate or stylistic
+// preferences that don't carry their weight here.
+#![allow(
+    // Intentional: many `T as U` casts are guarded by upstream
+    // invariants (slot < MAX_SLOTS = 10240 < u16::MAX, value
+    // length already validated < u16::MAX, etc.). Replacing all
+    // with `try_into().unwrap()` would be net negative.
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    // Misleading suggestion when we're explicitly choosing the
+    // unchecked path for layout reasons.
+    clippy::cast_ptr_alignment,
+    // Many internal `Result`-returning helpers don't need an
+    // `# Errors` section — the docstring already explains
+    // failure modes inline.
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    // Pedantic style nits that don't affect correctness:
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::stable_sort_primitive,
+    clippy::large_types_passed_by_value,
+    clippy::struct_field_names,
+    // Reserved-counter fields in `BlobHeader` (RE'd byte
+    // positions) intentionally aren't read from yet; the
+    // compile-time offset asserts pin them in place.
+    clippy::struct_excessive_bools,
+    // Docstrings already use backticks for code spans; the
+    // remaining flagged identifiers (e.g. "BufferManager",
+    // "BlobFrame") are prose-level references where the
+    // backtick noise is net-negative.
+    clippy::doc_markdown,
+    // Mixing items / statements is fine in small fns; refusing
+    // it forces hoisting of locally-scoped const helpers.
+    clippy::items_after_statements
+)]
 
-pub mod layout;
+pub mod api;
 pub mod concurrency;
-pub mod store;
 pub mod engine;
 pub mod journal;
-pub mod api;
+pub mod layout;
+pub mod store;
 
 mod prelude_private {
     // Internal helpers shared across modules without exposing
@@ -64,7 +106,7 @@ mod prelude_private {
 pub use api::config::{Storage, TreeConfig};
 pub use api::errors::{Error, Result};
 
-pub use api::tree::Tree;
 pub use api::builder::TreeBuilder;
+pub use api::tree::Tree;
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 pub use store::BufferManager;

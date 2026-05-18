@@ -13,10 +13,7 @@ use crate::store::BlobFrameRef;
 
 use super::cast;
 
-pub(super) fn resolve_typed<'a>(
-    frame: BlobFrameRef<'a>,
-    slot: u16,
-) -> Result<(NodeType, &'a [u8])> {
+pub(super) fn resolve_typed(frame: BlobFrameRef<'_>, slot: u16) -> Result<(NodeType, &[u8])> {
     let entry = frame.slot_entry(slot).ok_or(Error::NodeCorrupt {
         context: "walker: invalid slot",
     })?;
@@ -42,14 +39,18 @@ pub(super) fn leaf_extent<'a>(
     frame: BlobFrameRef<'a>,
     leaf: &Leaf,
 ) -> Result<(&'a [u8], &'a [u8])> {
-    let hdr = frame.bytes_at(leaf.key_offset, 2).ok_or(Error::NodeCorrupt {
-        context: "leaf extent header out of range",
-    })?;
+    let hdr = frame
+        .bytes_at(leaf.key_offset, 2)
+        .ok_or(Error::NodeCorrupt {
+            context: "leaf extent header out of range",
+        })?;
     let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
     let total = 2 + key_len + u32::from(leaf.value_size);
-    let extent = frame.bytes_at(leaf.key_offset, total).ok_or(Error::NodeCorrupt {
-        context: "leaf extent body out of range",
-    })?;
+    let extent = frame
+        .bytes_at(leaf.key_offset, total)
+        .ok_or(Error::NodeCorrupt {
+            context: "leaf extent body out of range",
+        })?;
     Ok((
         &extent[2..2 + key_len as usize],
         &extent[2 + key_len as usize..],
