@@ -49,6 +49,89 @@ pub const RECORD_FOOTER_SIZE: usize = 4;
 /// Overhead per record (header + footer, excluding variable body).
 pub const RECORD_OVERHEAD: usize = RECORD_HEADER_SIZE + RECORD_FOOTER_SIZE;
 
+// ---------- File header ----------
+
+/// Top-of-file magic — `"WALA"` little-endian. Sits at offset 0 of
+/// every WAL file and is checked on open. Mismatch = "this isn't
+/// one of our WAL files".
+pub const FILE_MAGIC: u32 = 0x414C_4157;
+
+/// Format version stored in the file header. New format revisions
+/// bump this and grow the header (in the reserved tail) rather
+/// than moving existing fields.
+pub const FORMAT_VERSION: u32 = 1;
+
+/// File-header byte size. The record stream starts at this offset.
+pub const FILE_HEADER_SIZE: usize = 32;
+
+/// Top-of-file layout:
+///
+/// ```text
+/// +------+------+------+--------+--------+
+/// | MAGIC|  VER | TREE | CREATED|  RSVD  |
+/// |  u32 |  u32 |  u64 |   u64  |  u64   |
+/// +------+------+------+--------+--------+
+/// ```
+///
+/// - `MAGIC` = [`FILE_MAGIC`] (`"WALA"` LE).
+/// - `VER`   = [`FORMAT_VERSION`].
+/// - `TREE`  = tree owner identifier; `0` for the single-tree v0.1.
+/// - `CREATED` = unix epoch seconds; `0` when the writer chose
+///   not to stamp a time (e.g. tests).
+/// - `RSVD`  = reserved for a future version bump, must be `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileHeader {
+    /// Tree owner identifier.
+    pub tree_id: u64,
+    /// Unix-epoch seconds when the file was created. `0` if the
+    /// writer didn't stamp one.
+    pub created_at: u64,
+}
+
+impl FileHeader {
+    /// Build a header with the current wall clock.
+    #[must_use]
+    pub fn now(tree_id: u64) -> Self {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self { tree_id, created_at }
+    }
+}
+
+/// Encode the file header into the first [`FILE_HEADER_SIZE`] bytes
+/// of `out` (the buffer is resized as needed).
+pub fn encode_file_header(h: &FileHeader, out: &mut Vec<u8>) {
+    out.extend_from_slice(&FILE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&h.tree_id.to_le_bytes());
+    out.extend_from_slice(&h.created_at.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    debug_assert_eq!(out.len(), FILE_HEADER_SIZE);
+}
+
+/// Decode a file header from the first [`FILE_HEADER_SIZE`] bytes
+/// of `buf`. Returns the header on success and a sanity-failed
+/// error (with `record_offset = 0`) on mismatch.
+pub fn decode_file_header(buf: &[u8]) -> Result<FileHeader> {
+    if buf.len() < FILE_HEADER_SIZE {
+        return Err(sanity("WAL file header truncated"));
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if magic != FILE_MAGIC {
+        return Err(sanity("WAL file magic mismatch"));
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != FORMAT_VERSION {
+        return Err(sanity("WAL file format version unsupported"));
+    }
+    let tree_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let created_at = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    // bytes 24..32 reserved; ignore for forward-compatibility.
+    Ok(FileHeader { tree_id, created_at })
+}
+
 // On-disk variant tags. Stable; only ever add new tags, never
 // renumber existing ones.
 const TY_INSERT: u8 = 0;

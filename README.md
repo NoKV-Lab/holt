@@ -38,7 +38,7 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**v0.1 in active development.** 145 tests pass; `cargo bench --bench main`
+**v0.1 in active development.** 159 tests pass; `cargo bench --bench main`
 runs a side-by-side comparison with RocksDB (memory + persistent
 variants, both showing artisan **~3.5–5× faster** on small-metadata
 workloads — see [benches/README.md](benches/README.md)).
@@ -88,9 +88,15 @@ Done — algorithm core:
   4 corruption catch-cases (CRC, magic, truncation, unknown tag)
   surface as `Error::ReplaySanityFailed`. See
   [`src/journal/codec.rs`](src/journal/codec.rs).
+- **WAL writer + replay scanner** (Stage 5b) —
+  [`WalWriter`](src/journal/writer.rs) is append-only with explicit
+  `flush()`-for-durability (`sync_data`); [`replay()`](src/journal/reader.rs)
+  is a forward scanner that handles a torn tail gracefully and
+  patches in the byte offset when reporting mid-file corruption.
 
 Queued — see [ROADMAP.md](ROADMAP.md):
-- `WalWriter` + replay scanner + Tree integration (Stage 5b/5c)
+- `Tree::open` replays the log; `put` / `delete` / `rename` emit
+  records; `Tree::checkpoint` trims (Stage 5c)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
 - `mergeBlob` (child-blob → parent inverse of splitBlob)

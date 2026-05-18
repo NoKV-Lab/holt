@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 145 tests + a
+writes with **no Tree-wide writer mutex**. 159 tests + a
 4-readers × 1-writer concurrent stress test all green.
 
 The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
@@ -94,10 +94,17 @@ Required for the v0.1 tag:
       All variants round-trip; corruption (CRC, magic, truncation,
       unknown tag) surfaces as `Error::ReplaySanityFailed`. See
       [`journal::codec`](src/journal/codec.rs).
-- [ ] `WalWriter` — append-only file with buffered I/O and
-      `fdatasync`-on-flush (Stage 5b)
-- [ ] `WalReader` / replay scanner that resyncs after a torn
-      tail (Stage 5b)
+- [x] **`WalWriter`** (Stage 5b) — append-only file with
+      buffered I/O and `sync_data`-on-flush; explicit `flush()` is
+      the durability boundary. `discard_pending()` for bail-out
+      paths. `open_or_create()` validates the `tree_id` of an
+      existing log.
+- [x] **`replay()` forward scanner** (Stage 5b) — yields every
+      record to a callback in order; stops cleanly at a torn tail
+      and reports its byte offset in `ReplayStats`. Real
+      corruption mid-file (CRC mismatch, magic mismatch, unknown
+      variant tag) surfaces as `Error::ReplaySanityFailed` with
+      the bad record's offset patched in.
 - [ ] Tree integration — `put` / `delete` / `rename` emit ops;
       `Tree::open` replays the log; `Tree::checkpoint` trims past
       the last durable blob commit (Stage 5c)
