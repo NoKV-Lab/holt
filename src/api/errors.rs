@@ -40,6 +40,13 @@ pub enum Error {
         /// Position in the journal.
         record_offset: u64,
     },
+    /// `Tree::rename` (or similar) called with a `src` that has no
+    /// leaf in the tree.
+    NotFound,
+    /// `Tree::rename(.., force=false)` called with a `dst` that
+    /// already has a leaf. Caller can retry with `force=true` to
+    /// overwrite.
+    DstExists,
 }
 
 impl std::fmt::Display for Error {
@@ -55,6 +62,8 @@ impl std::fmt::Display for Error {
             Self::ReplaySanityFailed { record_offset } => {
                 write!(f, "WAL replay sanity-check failed at offset {record_offset}")
             }
+            Self::NotFound => write!(f, "key not found"),
+            Self::DstExists => write!(f, "destination key already exists (use force=true to overwrite)"),
         }
     }
 }

@@ -13,6 +13,7 @@
 use std::mem::size_of;
 
 use crate::api::errors::{Error, Result};
+use crate::engine::simd;
 use crate::layout::{
     leaf_extent_size, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, PREFIX_MAX_INLINE,
 };
@@ -255,15 +256,10 @@ fn node16_descend<'a>(
         return Ok(LookupResult::NotFound);
     }
     let byte = key[depth];
-    let count = (n.count as usize).min(16);
-    // Stage 4 swaps this scan for a SIMD `pcmpeqb` + movemask path.
-    for i in 0..count {
-        if n.keys[i] == byte {
-            return descend(frame, n.children[i] as u16, key, depth + 1);
-        }
-        if n.keys[i] > byte {
-            break;
-        }
+    // SIMD: one `pcmpeqb` + movemask on x86_64, vceqq_u8 + nibble
+    // pack on aarch64, scalar elsewhere.
+    if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
+        return descend(frame, n.children[i as usize] as u16, key, depth + 1);
     }
     Ok(LookupResult::NotFound)
 }
@@ -705,16 +701,11 @@ fn inner_find_child(
         }
         NodeType::Node16 => {
             let n = read_node16(frame, slot)?;
-            let count = (n.count as usize).min(16);
-            for i in 0..count {
-                if n.keys[i] == byte {
-                    return Ok(Some(n.children[i] as u16));
-                }
-                if n.keys[i] > byte {
-                    break;
-                }
+            if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
+                Ok(Some(n.children[i as usize] as u16))
+            } else {
+                Ok(None)
             }
-            Ok(None)
         }
         NodeType::Node48 => {
             let n = read_node48(frame, slot)?;
@@ -1323,13 +1314,11 @@ fn finish_inner_with_sorted<T>(
 
 // ---------- misc ----------
 
+/// Length of the longest common prefix of `a` and `b`. SIMD on
+/// x86_64 / aarch64, scalar fallback elsewhere — see
+/// [`crate::engine::simd::longest_common_prefix`].
 fn longest_common(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    let mut i = 0;
-    while i < n && a[i] == b[i] {
-        i += 1;
-    }
-    i
+    simd::longest_common_prefix(a, b)
 }
 
 #[cfg(test)]
