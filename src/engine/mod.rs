@@ -16,7 +16,7 @@ pub mod simd;
 pub mod walker;
 
 pub use walker::{
-    compact_blob, erase, erase_multi, insert, insert_multi, lookup, lookup_at, lookup_multi,
-    make_blob_from_node, BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome, LookupResult,
-    MakeBlobOutcome,
+    collect_blob_guids, compact_blob, erase, erase_multi, insert, insert_multi, lookup, lookup_at,
+    lookup_multi, make_blob_from_node, BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome,
+    LookupResult, MakeBlobOutcome,
 };

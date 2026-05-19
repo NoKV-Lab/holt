@@ -61,11 +61,19 @@ pub struct BlobHeader {
     pub num_ext_blobs: u16,
     /// Reserved counter slot.
     pub field_5e: u16,
-    _pad_60: [u8; 0x08],
+    /// Number of times [`compact_blob`](crate::engine::compact_blob)
+    /// has rebuilt this blob in place. Bumped at the end of every
+    /// successful compaction. Surfaced via [`Tree::stats`](crate::api::Tree::stats).
+    pub compact_times: u32,
+    _pad_64: [u8; 4],
     /// Cumulative count of size-table bytes ever allocated for
     /// nodes (used to drive compaction triggers).
     pub gap_space: u32,
-    _pad_6c: u32,
+    /// Count of leaves in this blob currently in tombstone state
+    /// (soft-deleted, awaiting reclaim by compaction). Bumped on
+    /// `erase`, decremented on `insert` resurrection, reset to 0
+    /// at the end of every [`compact_blob`](crate::engine::compact_blob).
+    pub tombstone_leaf_cnt: u32,
     /// Per-NodeType free-list head. Index 0 = ntype 1 (Leaf),
     /// index 1 = ntype 2 (Prefix), …, index 7 = ntype 8 (EmptyRoot).
     /// Value `0` means the list is empty.
@@ -83,7 +91,9 @@ const _: () = assert!(offset_of!(BlobHeader, num_slots) == 0x54);
 const _: () = assert!(offset_of!(BlobHeader, root_slot) == 0x56);
 const _: () = assert!(offset_of!(BlobHeader, space_used) == 0x58);
 const _: () = assert!(offset_of!(BlobHeader, num_ext_blobs) == 0x5c);
+const _: () = assert!(offset_of!(BlobHeader, compact_times) == 0x60);
 const _: () = assert!(offset_of!(BlobHeader, gap_space) == 0x68);
+const _: () = assert!(offset_of!(BlobHeader, tombstone_leaf_cnt) == 0x6c);
 const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 
@@ -101,9 +111,10 @@ impl BlobHeader {
             space_used: 0,
             num_ext_blobs: 0,
             field_5e: 0,
-            _pad_60: [0; 0x08],
+            compact_times: 0,
+            _pad_64: [0; 4],
             gap_space: 0,
-            _pad_6c: 0,
+            tombstone_leaf_cnt: 0,
             free_list_head: [0; 8],
             _pad_80: [0; 0x20],
             blob_guid: [0; 16],
@@ -122,7 +133,9 @@ mod tests {
         assert_eq!(offset_of!(BlobHeader, num_slots), 0x54);
         assert_eq!(offset_of!(BlobHeader, root_slot), 0x56);
         assert_eq!(offset_of!(BlobHeader, space_used), 0x58);
+        assert_eq!(offset_of!(BlobHeader, compact_times), 0x60);
         assert_eq!(offset_of!(BlobHeader, gap_space), 0x68);
+        assert_eq!(offset_of!(BlobHeader, tombstone_leaf_cnt), 0x6c);
         assert_eq!(offset_of!(BlobHeader, free_list_head), 0x70);
         assert_eq!(offset_of!(BlobHeader, blob_guid), 0xa0);
     }

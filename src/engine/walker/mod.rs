@@ -23,6 +23,10 @@
 //! - `migrate` — deep-clone primitives: [`make_blob_from_node`]
 //!   (spillover) + [`compact_blob`] (in-place repack). Share the
 //!   internal `clone_subtree` machinery.
+//! - `scan` — tree-wide BFS over reachable blobs ([`collect_blob_guids`]).
+//!   Used by [`crate::api::Tree::stats`] and
+//!   [`crate::api::Tree::compact`] to fan out across the whole
+//!   on-disk tree.
 
 use std::mem::size_of;
 
@@ -31,6 +35,7 @@ mod insert;
 mod lookup;
 mod migrate;
 mod readers;
+mod scan;
 mod spillover;
 #[cfg(test)]
 mod tests;
@@ -43,6 +48,7 @@ pub use erase::{erase, erase_multi};
 pub use insert::{insert, insert_multi};
 pub use lookup::{lookup, lookup_at, lookup_multi};
 pub use migrate::{compact_blob, make_blob_from_node};
+pub use scan::collect_blob_guids;
 pub use types::{
     BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome, LookupResult, MakeBlobOutcome,
 };

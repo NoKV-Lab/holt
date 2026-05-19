@@ -74,10 +74,10 @@ pub fn make_blob_from_node(
 /// the heap, lives for the duration of the call) plus one full
 /// blob memcpy at the end. Roughly tens of µs on a modern machine.
 pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
-    let (old_space_used, blob_guid, old_root) = {
+    let (old_space_used, blob_guid, old_root, old_compact_times) = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let h = old_frame.header();
-        (h.space_used, h.blob_guid, h.root_slot)
+        (h.space_used, h.blob_guid, h.root_slot, h.compact_times)
     };
 
     let mut new_buf = AlignedBlobBuf::zeroed();
@@ -89,6 +89,10 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
             new_frame.free_node(1)?;
         }
         new_frame.header_mut().root_slot = entry;
+        // Compaction is a fresh-start rebuild — `compact_times`
+        // carries the lifetime count of rebuilds for this blob,
+        // bumped by one for the round we just performed.
+        new_frame.header_mut().compact_times = old_compact_times.saturating_add(1);
         let used = new_frame.header().space_used;
         (entry, used)
     };

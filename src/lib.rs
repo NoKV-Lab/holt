@@ -107,6 +107,6 @@ pub use api::config::{Storage, TreeConfig};
 pub use api::errors::{Error, Result};
 
 pub use api::builder::TreeBuilder;
-pub use api::tree::Tree;
+pub use api::tree::{BlobStats, Tree, TreeStats};
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 pub use store::BufferManager;

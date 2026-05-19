@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use holt::{AlignedBlobBuf, Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig};
+use holt::{AlignedBlobBuf, Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig, TreeStats};
 
 #[test]
 fn open_memory_get_on_empty_tree_returns_none() {
@@ -754,4 +754,95 @@ fn optimistic_readers_dont_block_writers() {
         let k = format!("stable/{i:04}").into_bytes();
         assert_eq!(tree.get(&k).unwrap().as_deref(), Some(&stable_value[..]));
     }
+}
+
+// ----------------------------------------------------------------
+// Stats + Compact
+// ----------------------------------------------------------------
+
+#[test]
+fn stats_on_fresh_tree_reports_root_blob_only() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let s = tree.stats().unwrap();
+    assert_eq!(s.blob_count, 1, "fresh tree has exactly the root blob");
+    assert_eq!(s.blobs.len(), 1);
+    assert_eq!(s.total_compactions, 0);
+    assert_eq!(s.total_tombstones, 0);
+    // A freshly-initialised blob holds the EmptyRoot sentinel, so
+    // it has consumed some bump-area bytes and at least one slot.
+    assert!(s.total_space_used > 0);
+    assert!(s.total_slots >= 1);
+}
+
+#[test]
+fn stats_reflects_inserts() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let before = tree.stats().unwrap();
+    for i in 0..16u32 {
+        tree.put(format!("k{i:04}").as_bytes(), b"value-bytes-here")
+            .unwrap();
+    }
+    let after = tree.stats().unwrap();
+    assert!(after.total_space_used > before.total_space_used);
+    assert!(after.total_slots > before.total_slots);
+    assert_eq!(after.blob_count, 1, "16 small keys still fit in one blob");
+}
+
+#[test]
+fn compact_on_empty_tree_bumps_compact_times() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let before = tree.stats().unwrap();
+    assert_eq!(before.total_compactions, 0);
+    tree.compact().unwrap();
+    let after = tree.stats().unwrap();
+    assert_eq!(
+        after.total_compactions, 1,
+        "one blob compacted once → compact_times = 1"
+    );
+}
+
+#[test]
+fn compact_after_writes_preserves_data_and_bumps_count() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..32u32 {
+        tree.put(format!("k{i:04}").as_bytes(), format!("v-{i}").as_bytes())
+            .unwrap();
+    }
+    let pre_space = tree.stats().unwrap().total_space_used;
+    tree.compact().unwrap();
+    let post = tree.stats().unwrap();
+    assert_eq!(post.total_compactions, 1);
+    // Re-read every key — compact must not lose data.
+    for i in 0..32u32 {
+        let got = tree.get(format!("k{i:04}").as_bytes()).unwrap();
+        assert_eq!(got.as_deref(), Some(format!("v-{i}").as_bytes()));
+    }
+    // No tombstones yet (no deletes), so compact should not have
+    // grown the blob. Allow equality (no churn to reclaim).
+    assert!(post.total_space_used <= pre_space + 4096);
+}
+
+#[test]
+fn stats_aggregates_across_multi_blob_tree() {
+    // Force the tree across blob boundaries with large values.
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(8)
+        .open()
+        .unwrap();
+    let big = vec![0xABu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    let s: TreeStats = tree.stats().unwrap();
+    assert!(
+        s.blob_count >= 2,
+        "256×4 KB values must spill into multiple blobs (got {} blobs)",
+        s.blob_count
+    );
+    // Aggregate is just the sum of per-blob counters.
+    let sum_space: u64 = s.blobs.iter().map(|b| u64::from(b.space_used)).sum();
+    assert_eq!(sum_space, s.total_space_used);
+    let sum_slots: u64 = s.blobs.iter().map(|b| u64::from(b.num_slots)).sum();
+    assert_eq!(sum_slots, s.total_slots);
 }

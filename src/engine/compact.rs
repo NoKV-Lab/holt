@@ -1,16 +1,18 @@
-//! Compaction primitives — split_blob / make_blob_from_node /
-//! compact_blob / merge_blob.
+//! [`CompactReason`] — the on-disk tag carried in
+//! [`crate::journal::TxnOp::Compact`] records.
 //!
-//! **Status: stub.** v0.1 implements:
-//! - `make_blob_from_node` — recursive copy of a subtree into a
-//!   fresh blob.
-//! - `split_blob` — the out-of-space trigger; allocates a new
-//!   blob + installs a `BlobNode` crossing in the parent.
-//! - `compact_blob` — in-place rebuild dropping orphans /
-//!   tombstones.
-//! - `merge_blob` — pull a small child blob back into the parent.
+//! The compaction primitives themselves live next to their callers:
+//!
+//! - [`crate::engine::make_blob_from_node`] (deep-clone into a fresh
+//!   blob) — in `walker/migrate.rs`, used by spillover.
+//! - [`crate::engine::compact_blob`] (in-place rebuild reclaiming
+//!   leaf-extent leaks and dropping orphans) — in `walker/migrate.rs`,
+//!   wired into `insert_multi` / `insert_at_blob_node`'s OOM retry.
+//! - `splitBlob` (out-of-space spillover) — in `walker/spillover.rs`.
+//! - `mergeBlob` (inverse of split) — queued for v0.1.
 
-/// Reason a compaction or split fired.
+/// Reason a compaction or split fired. Encoded into the WAL as the
+/// `reason` body of [`crate::journal::TxnOp::Compact`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactReason {
     /// Too many tombstone leaves; rebuild dropping them.
@@ -21,5 +23,3 @@ pub enum CompactReason {
     /// Alloc failed in current blob; spill a subtree.
     OutOfBlobFrame,
 }
-
-// TODO: split_blob / compact_blob / merge_blob implementations.

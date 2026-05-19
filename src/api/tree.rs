@@ -41,7 +41,7 @@ use crate::journal::txn_op::TxnOp;
 use crate::journal::writer::WalWriter;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
-use crate::store::{BlobFrame, BufferManager};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 #[cfg(unix)]
 use crate::store::backend::PersistentBackend;
@@ -86,6 +86,59 @@ impl std::fmt::Debug for Tree {
 /// Fixed GUID of the root blob in v0.1. Multi-root trees
 /// (post-v0.1) will allocate per-tree root GUIDs from a manifest.
 pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
+
+/// Per-blob counters captured by [`Tree::stats`].
+///
+/// Each field mirrors a [`BlobHeader`](crate::layout::BlobHeader)
+/// counter and is read in a single shared-guard pass over the blob.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobStats {
+    /// GUID identifying this blob within the tree.
+    pub guid: BlobGuid,
+    /// Bytes currently consumed in the blob's data area (bump
+    /// cursor, monotonically advancing).
+    pub space_used: u32,
+    /// Bytes lost to bump-allocator waste (extents freed without
+    /// recycling). Compaction reclaims this to zero.
+    pub gap_space: u32,
+    /// High-water slot count — slot indices `[1, num_slots)` have
+    /// ever held a node body in this blob.
+    pub num_slots: u16,
+    /// Count of cross-blob crossings (`BlobNode` slots) currently
+    /// installed in this blob.
+    pub num_ext_blobs: u16,
+    /// Number of times this blob has been rebuilt by
+    /// [`crate::engine::compact_blob`]. Bumped at the end of every
+    /// successful compaction.
+    pub compact_times: u32,
+    /// Count of leaves in this blob currently in tombstone state
+    /// (soft-deleted, awaiting reclaim by compaction).
+    pub tombstone_leaf_cnt: u32,
+}
+
+/// Tree-wide aggregate counters from [`Tree::stats`].
+///
+/// `blobs` carries the per-blob breakdown in BFS order from the
+/// root; the totals are pre-summed for the common "how big is the
+/// tree?" question. All bytes / counts are sums over `blobs`.
+#[derive(Debug, Clone)]
+pub struct TreeStats {
+    /// Number of distinct blobs reachable from the tree root.
+    pub blob_count: u32,
+    /// Sum of `space_used` over every blob.
+    pub total_space_used: u64,
+    /// Sum of `gap_space` over every blob.
+    pub total_gap_space: u64,
+    /// Sum of `num_slots` over every blob.
+    pub total_slots: u64,
+    /// Sum of `compact_times` over every blob (lifetime
+    /// compactions across the whole tree).
+    pub total_compactions: u64,
+    /// Sum of `tombstone_leaf_cnt` over every blob.
+    pub total_tombstones: u64,
+    /// Per-blob breakdown in BFS order from the root.
+    pub blobs: Vec<BlobStats>,
+}
 
 /// Append the engine's internal terminator byte (`\0`) to a
 /// user-supplied key. See the module docs.
@@ -380,6 +433,86 @@ impl Tree {
         self.backend.flush()?;
         if let Some(wal) = &self.wal {
             wal.lock().unwrap().truncate()?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot per-blob and aggregate counters for every blob
+    /// reachable from the root.
+    ///
+    /// Each blob is pinned + read under a single shared guard, so
+    /// stats never block ongoing reads and only contend with writers
+    /// on a blob-by-blob basis. Returned counters are a consistent
+    /// snapshot of each individual blob but the aggregate is **not**
+    /// linearised across blobs — a concurrent writer mid-traversal
+    /// can shift one blob's counters before another's are read.
+    /// Acceptable for observability; use [`Tree::checkpoint`] first
+    /// if you need a quiescent snapshot.
+    pub fn stats(&self) -> Result<TreeStats> {
+        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        let mut blobs: Vec<BlobStats> = Vec::with_capacity(guids.len());
+        let mut total_space_used: u64 = 0;
+        let mut total_gap_space: u64 = 0;
+        let mut total_slots: u64 = 0;
+        let mut total_compactions: u64 = 0;
+        let mut total_tombstones: u64 = 0;
+        for guid in &guids {
+            let pin = self.backend.pin(*guid)?;
+            let guard = pin.read();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let h = frame.header();
+            let s = BlobStats {
+                guid: *guid,
+                space_used: h.space_used,
+                gap_space: h.gap_space,
+                num_slots: h.num_slots,
+                num_ext_blobs: h.num_ext_blobs,
+                compact_times: h.compact_times,
+                tombstone_leaf_cnt: h.tombstone_leaf_cnt,
+            };
+            total_space_used += u64::from(s.space_used);
+            total_gap_space += u64::from(s.gap_space);
+            total_slots += u64::from(s.num_slots);
+            total_compactions += u64::from(s.compact_times);
+            total_tombstones += u64::from(s.tombstone_leaf_cnt);
+            blobs.push(s);
+        }
+        Ok(TreeStats {
+            blob_count: blobs.len() as u32,
+            total_space_used,
+            total_gap_space,
+            total_slots,
+            total_compactions,
+            total_tombstones,
+            blobs,
+        })
+    }
+
+    /// Compact every blob reachable from the root in place.
+    ///
+    /// Per-blob: takes an exclusive guard, runs
+    /// [`crate::engine::compact_blob`] (rebuild dropping orphans /
+    /// tombstones and reclaiming bump-area waste), and commits the
+    /// rebuilt buffer through the BM. `compact_times` is bumped by
+    /// one on each blob; `tombstone_leaf_cnt` resets to zero (the
+    /// leaves it counted are dropped from the new image — wired in
+    /// the tombstone work).
+    ///
+    /// Does **not** fsync the backend or touch the WAL — compaction
+    /// is logically idempotent (the post-compact tree is observationally
+    /// identical to the pre-compact one), so a crash mid-compact just
+    /// means the next run re-does the work. Call [`Tree::checkpoint`]
+    /// after if you want the rebuilt blobs durable on disk.
+    pub fn compact(&self) -> Result<()> {
+        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        for guid in guids {
+            let pin = self.backend.pin(guid)?;
+            {
+                let mut guard = pin.write();
+                engine::compact_blob(&mut guard)?;
+            }
+            drop(pin);
+            self.backend.commit(guid)?;
         }
         Ok(())
     }
