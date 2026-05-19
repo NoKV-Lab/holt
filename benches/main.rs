@@ -576,6 +576,111 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
 }
 
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// DURABLE-WRITE benches (Group A)
+// ---------------------------------------------------------------
+//
+// Same shape as `*_persist_put` but every engine flips its
+// strongest "per-op durability" flag:
+//
+// | engine   | knob set                                            |
+// | -------- | --------------------------------------------------- |
+// | holt     | `wal_sync_on_commit = true`                         |
+// | rocksdb  | `WriteOptions::set_sync(true)`                      |
+// | sqlite   | `PRAGMA journal_mode = WAL; synchronous = FULL`     |
+//
+// All three now `sync_data`/`fsync` per op, so the bench is
+// dominated by storage-stack syscall latency. This is the
+// honest "what about fsync workloads" answer to the
+// `*_persist_put` baseline numbers (which use `sync=false` to
+// match RocksDB / SQLite defaults).
+
+/// Persistent holt with per-op WAL fsync.
+fn make_holt_durable() -> (Tree, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.wal_sync_on_commit = true;
+    let tree = Tree::open(cfg).expect("holt durable open");
+    (tree, dir)
+}
+
+/// RocksDB `WriteOptions` with `sync=true` (every put fsyncs WAL).
+fn rocksdb_write_opts_durable() -> WriteOptions {
+    let mut wo = WriteOptions::default();
+    wo.disable_wal(false);
+    wo.set_sync(true);
+    wo
+}
+
+/// SQLite file-backed with `synchronous=FULL` (every commit
+/// fsyncs both data + WAL pages).
+fn make_sqlite_durable() -> (Connection, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let conn = Connection::open(dir.path().join("bench.db")).expect("sqlite open");
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;\n\
+         PRAGMA synchronous = FULL;\n\
+         PRAGMA cache_size = -65536;\n\
+         CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID;",
+    )
+    .expect("sqlite pragmas + schema");
+    (conn, dir)
+}
+
+fn bench_durable_put(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
+    let key_count = pairs.len();
+    let mut group = c.benchmark_group(format!("{name}_durable_put"));
+    group.throughput(Throughput::Elements(1));
+    // Per-op fsync brings the wall clock to hundreds of µs on a
+    // typical NVMe + ~ms on a slow SSD. Criterion's default 100
+    // samples × 5 s warm-up explodes from there; cap it.
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    let (holt, _dir) = make_holt_durable();
+    preload_holt(&holt, pairs);
+    let mut rng = StdRng::seed_from_u64(SEED + 30);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            let idx = (rng.next_u32() as usize) % key_count;
+            let (k, v) = &pairs[idx];
+            black_box(holt.put(black_box(k), black_box(v)).unwrap());
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    let wo = rocksdb_write_opts_durable();
+    for (k, v) in pairs {
+        db.put_opt(k, v, &wo).expect("rocksdb preload");
+    }
+    let mut rng = StdRng::seed_from_u64(SEED + 30);
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            let idx = (rng.next_u32() as usize) % key_count;
+            let (k, v) = &pairs[idx];
+            db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+            black_box(());
+        });
+    });
+
+    let (conn, _dir) = make_sqlite_durable();
+    preload_sqlite(&conn, pairs);
+    let mut rng = StdRng::seed_from_u64(SEED + 30);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            let idx = (rng.next_u32() as usize) % key_count;
+            let (k, v) = &pairs[idx];
+            let mut stmt = conn
+                .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+                .unwrap();
+            stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+            black_box(());
+        });
+    });
+
+    group.finish();
+}
+
 // LIST / range-scan benches
 // ---------------------------------------------------------------
 //
@@ -845,6 +950,7 @@ fn kv_benches(c: &mut Criterion) {
     let pairs = gen_kv_dataset();
     bench_scenario(c, "kv", &pairs);
     bench_scenario_persistent(c, "kv", &pairs);
+    bench_durable_put(c, "kv", &pairs);
     // kv has no prefix structure — no list benches.
 }
 
@@ -852,6 +958,7 @@ fn objstore_benches(c: &mut Criterion) {
     let pairs = gen_objstore_dataset();
     bench_scenario(c, "objstore", &pairs);
     bench_scenario_persistent(c, "objstore", &pairs);
+    bench_durable_put(c, "objstore", &pairs);
     // Single-bucket listing: prefix narrows to ~625 files.
     bench_list_plain(c, "objstore_list", &pairs, b"bucket-05/", 100);
     bench_list_plain_persistent(c, "objstore_persist_list", &pairs, b"bucket-05/", 100);
@@ -864,6 +971,7 @@ fn fs_benches(c: &mut Criterion) {
     let pairs = gen_fs_dataset();
     bench_scenario(c, "fs", &pairs);
     bench_scenario_persistent(c, "fs", &pairs);
+    bench_durable_put(c, "fs", &pairs);
     // Single-dir listing: prefix narrows to ~1250 files.
     bench_list_plain(c, "fs_list", &pairs, b"/usr/local/share/category-5/", 100);
     bench_list_plain_persistent(
