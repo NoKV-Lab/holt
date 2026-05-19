@@ -26,7 +26,7 @@ io-uring = "0.7"
 [dev-dependencies]
 rand = "0.9"
 tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 rocksdb = { version = "0.24", default-features = false }
 # `bundled` ships a vendored libsqlite3 so contributors don't need
 # a system SQLite — keeps the bench comparator apples-to-apples

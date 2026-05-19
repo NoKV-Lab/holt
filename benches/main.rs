@@ -42,7 +42,9 @@
 //! cargo bench --bench main -- kv_get           # single scenario
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
