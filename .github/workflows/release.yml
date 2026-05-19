@@ -45,29 +45,18 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
-      - name: Build release notes
+      - name: Build release notes from CHANGELOG slice
         id: changelog
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          CURATED="release-notes/v${VERSION}.md"
-          # Prefer a hand-curated note (`release-notes/v$VERSION.md`)
-          # over the raw CHANGELOG slice — the CHANGELOG keeps the
-          # engineering log; the curated note is the marketing-shape
-          # summary that lands on the GitHub Release page.
-          if [ -f "$CURATED" ]; then
-            cp "$CURATED" release_notes.md
-            echo "Using curated $CURATED"
-          else
-            # Fallback: pull everything between "## [VERSION]" and the
-            # next top-level "## [" header from CHANGELOG. `awk` is
-            # more portable here than `sed` ranges across BSD / GNU.
-            awk -v v="$VERSION" '
-              $0 ~ "^## \\[" v "\\]" { p = 1; next }
-              p && $0 ~ "^## \\[" { exit }
-              p { print }
-            ' CHANGELOG.md > release_notes.md
-            echo "Using CHANGELOG slice for $VERSION (no $CURATED)"
-          fi
+          # Pull everything between `## [VERSION]` and the next
+          # top-level `## [` header out of CHANGELOG.md. `awk` is
+          # more portable here than `sed` ranges across BSD / GNU.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { p = 1; next }
+            p && $0 ~ "^## \\[" { exit }
+            p { print }
+          ' CHANGELOG.md > release_notes.md
           echo "notes_path=release_notes.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release

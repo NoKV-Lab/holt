@@ -7,6 +7,49 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.2.1] — 2026-05-20
+
+### Fixed — durability (silent data loss path)
+
+- **`BufferManager::try_evict_lru` was evicting dirty cache
+  images.** The inline-overflow eviction picked victims based on
+  `Arc::strong_count == 1` alone — it did not check the dirty
+  map. A blob that had been mutated (`pin → write → mark_dirty →
+  drop pin`) could be picked as a victim by the next cache-miss
+  load, leaving the dirty entry orphaned (cache image gone, dirty
+  map still pointing at the now-missing guid). Downstream the
+  next checkpoint's `snapshot_bytes(guid)` returned `None` and
+  the round / `Tree::checkpoint` silently `continue`-d past it;
+  in memory mode the cache mutation was lost outright, in
+  persistent mode the WAL truncate gate stuck closed forever
+  (dirty_count never reached zero).
+
+  `try_evict_lru` now matches `try_evict_cold`'s contract: skip
+  any entry whose guid is in `dirty` or `pending_deletes`. Both
+  the victim-selection loop and the `remove_if` predicate
+  re-check under the relevant lock, guarding against a fresh
+  `mark_dirty` landing between scan and remove.
+
+- **Checkpoint paths no longer silently drop a missing cache
+  image.** `Tree::checkpoint` and the background round's phase 2
+  used to `if let Some(bytes) = snapshot_bytes(guid) { ... }`
+  and silently fall through on `None`. They now treat that case
+  as the invariant-I1 violation it is: restore both drained
+  snapshots and return `Error::Internal("checkpoint: dirty
+  entry lost cache image — invariant I1 violated")`. Better to
+  fail loud than truncate the WAL while data is still pending.
+
+- Regression test: `lru_eviction_skips_dirty_entries` in
+  `src/store/buffer_manager.rs` exercises capacity-2 cache with
+  one dirty + one clean entry, asserts the clean entry is the
+  victim of inline overflow and the dirty cache image survives.
+
+### Internal
+
+- `release.yml`: dropped the `release-notes/v$VERSION.md`
+  curated-note branch — CHANGELOG is now the single source for
+  GitHub Release body content.
+
 ## [0.2.0] — 2026-05-20
 
 ### Breaking

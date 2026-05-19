@@ -1,6 +1,6 @@
 [package]
 name = "holt"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.82"
 description = "An adaptive-radix-tree metadata storage engine for path-shaped keys, with per-blob concurrency and crash-safe persistence."
