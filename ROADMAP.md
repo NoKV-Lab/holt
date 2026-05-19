@@ -312,18 +312,16 @@ by `~leaves_per_rollup` once fast-forward lands.
       AArch64. The 256-entry table from v0.1's WAL fast-path
       gets ≈1.5 GB/s; SIMD variants push past 8 GB/s. Drops
       persistent-put cost another ≈80 ns.
-- [ ] **Cached `Tree.root_pin`** — every `get` / `put` / `delete`
-      currently re-pins `root_guid` through `BufferManager`'s
-      `Mutex<HashMap>` lookup. Keep an `Arc<CachedBlob>` for the
-      root inside `Tree` and skip that lookup. Estimated saving
-      ≈300 ns / op.
-- [ ] **`RangeIter` fast-forward in delimiter mode** — after
-      emitting a `CommonPrefix(C)`, ascend the descent stack past
-      `C`'s subtree instead of scanning every leaf under it to
-      dedup. This alone makes `*_list_dir` go from
-      `O(leaves_under_prefix)` to `O(distinct_rollups)` —
-      typically a 100-1000× speedup on `?delimiter=/` queries
-      with deep buckets.
+- [x] **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
+      `get` / `put` / `delete` keeps the root pinned via
+      `Arc<CachedBlob>` and skips `BufferManager`'s
+      `Mutex<HashMap>` lookup on the root hop. ≈300 ns / op
+      saving on the hot path.
+- [x] **`RangeIter` fast-forward in delimiter mode** (commit
+      `861dba9`) — after emitting a `CommonPrefix(C)`, ascend the
+      descent stack past `C`'s subtree instead of scanning every
+      leaf under it to dedup. `*_list_dir` is now
+      `O(distinct_rollups)` instead of `O(leaves_under_prefix)`.
 - [ ] **Sharded `BufferManager` state** — replace the single
       `Mutex<BMState>` with sharded buckets (DashMap-style) so
       concurrent pins on different blobs don't contend.
@@ -346,12 +344,17 @@ by `~leaves_per_rollup` once fast-forward lands.
 
 ### Durability + background work
 
-- [ ] **Async checkpoint thread** (one thread — we're an
-      embedded engine, not the upstream's three-thread RPC
-      server). Triggers on a dirty-bytes threshold,
-      runs `Tree::checkpoint` off the application thread, surfaces
-      progress via metrics. Caller can opt out for "explicit
-      checkpoint only" mode.
+- [x] **Async checkpoint thread** — one thread,
+      round-driven via [`CheckpointConfig`]. Each round
+      (1) folds mergeable child blobs back into parents,
+      (2) snapshots the BM dirty set + flushes WAL,
+      (3) commits each blob to backend, (4) `fdatasync`s the
+      backend, (5) atomically truncates the WAL when no racing
+      writer has re-dirtied. Default `enabled = false`
+      (opt-in until v0.3 promotes it on by default). Final
+      synchronous round runs in `Checkpointer::Drop` so the
+      window between the last bg round and Tree shutdown
+      doesn't lose dirty cache state.
 - [ ] **Free-list retry/backoff subsystem** — under heap
       exhaustion, the per-NodeType LIFO chains today fail-fast.
       The original ancestor has a backoff path

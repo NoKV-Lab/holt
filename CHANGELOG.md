@@ -2,8 +2,76 @@
 
 All notable changes to **holt** are documented in this file. Format
 adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-versioning will follow [Semantic Versioning](https://semver.org/) once
-v0.1.0 ships.
+versioning follows [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added — durability + background work
+
+- **Background checkpointer** (`pub(crate) mod checkpoint` + opt-in
+  `CheckpointConfig`). One thread, round-driven, parked between
+  rounds via `park_timeout(idle_interval)`. Each round:
+  (1) folds mergeable child blobs back into parents
+  (`engine::try_merge_children`),
+  (2) snapshots the `BufferManager` dirty set,
+  (3) flushes the WAL writer (`sync_data`),
+  (4) commits each snapshotted blob to backend,
+  (5) `fdatasync`s the backend,
+  (6) atomically truncates the WAL when `dirty_count == 0` under
+  the WAL lock.
+  `Drop` joins the bg thread then runs one final synchronous round
+  on the calling thread to close the window between the last bg
+  round and Tree shutdown.
+- **`BufferManager` dirty-tracking** (`mark_dirty` / `snapshot_dirty`
+  / `restore_dirty` / `min_unflushed_txn`). Per-blob lowest unflushed
+  WAL seq, drained atomically via `mem::take` so concurrent writers'
+  `mark_dirty` calls land in the fresh empty map. `commit` drains
+  on success and restores on failure. The WAL trim watermark falls
+  out as `min(dirty.values()) − 1`.
+- **`CheckpointConfig`** + **`TreeBuilder::checkpoint(cfg)`** —
+  user-facing opt-in for the background thread. Default is
+  `enabled = false`; flipping it on flips on `auto_merge = true` by
+  default. `idle_interval` / `dirty_blob_threshold` knobs match the
+  fjall / sled flusher conventions.
+
+### Changed — public surface
+
+- **`engine` + `concurrency` are now `pub(crate)`** (commit
+  `3cfa80f`). Their public types (`RangeBuilder` / `RangeEntry` /
+  `RangeIter`) are now curated by new `api::range` and `api::stats`
+  re-export modules; the top-level `holt::*` flat surface is
+  unchanged from a user's perspective.
+- **`api::stats`** is the canonical home for `BlobStats` /
+  `TreeStats` (moved here from `api::tree`).
+- **`lib.rs` re-exports grouped + commented** (Core / Range / Stats /
+  Txn / Backend / Checkpoint sections).
+
+### Removed — dead code surfaced by the lockdown
+
+- `HybridLatch::try_upgrade`, `Guard::{state, upgrade_to_shared,
+  upgrade_to_exclusive}`, `LatchMode` — no callers post-lockdown.
+- `engine::walker::types::CompactStats` — `compact_blob` now returns
+  `Result<()>`. Test sites that read the stats counters read
+  `space_used` straight off the frame header instead.
+
+### Performance
+
+- **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
+  `get` / `put` / `delete` keeps the root pinned via
+  `Arc<CachedBlob>` and skips the BM `Mutex<HashMap>` lookup on the
+  root hop. ≈300 ns / op on the hot path.
+- **`RangeIter` delimiter fast-forward** (commit `861dba9`) — after
+  emitting a `CommonPrefix(C)`, ascend the descent stack past `C`'s
+  subtree instead of scanning every leaf under it to dedup.
+  `*_list_dir` is now `O(distinct_rollups)`.
+
+### Internal
+
+- Drop dead `journal/checkpoint.rs` stub and `engine/compact.rs`
+  shim; fold `CompactReason` into `journal::txn_op`.
+- Move the cross-blob descent unit test from `tests/tree_smoke.rs`
+  into the walker's internal `tests` module — the
+  `make_blob_from_node` primitive it pokes is now crate-private.
 
 ## [0.1.0] — 2026-05-19
 
