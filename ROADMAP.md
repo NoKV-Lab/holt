@@ -338,15 +338,46 @@ by `~leaves_per_rollup` once fast-forward lands.
 
 ### Concurrency primitive upgrades
 
-- [ ] **Per-node `HybridLatch`** — currently lives on
-      `BlobFrame.Header` (per-blob granularity); any write in a
-      blob invalidates every optimistic reader in that blob.
-      Moving the latch to `NodeHeader` lets readers and writers
-      of disjoint subtrees inside one blob run truly in parallel.
-- [ ] **Cross-blob lock-coupling** — acquire the child blob's
-      latch before stepping into it (currently happens inside
-      `resolveNodePtr`). Tightens descent's visible-state window
-      and prepares the ground for ext-blob latching.
+Both items in this subsection are **deferred to v0.3** because
+the realistic implementations need structural changes the v0.2
+scope didn't budget for:
+
+- [→v0.3] **Per-node `HybridLatch`** — every `NodeType` body
+  needs an embedded `version: AtomicU64` (or an out-of-line
+  `slot_versions: [AtomicU64; MAX_SLOTS]` in `CachedBlob`).
+  Either choice requires the lookup walker to capture +
+  validate per-slot versions across the entire descent
+  (currently does one `HybridLatch::validate` at the end), and
+  every walker writer site (`write_struct_to_slot`,
+  `alloc_node`, `free_node`) needs `bump_slot_version`
+  bracketing. The in-memory `CachedBlob` variant avoids an
+  on-disk format break but still touches ~12 walker functions
+  + buffer-manager glue. Planned as a single v0.3 milestone.
+
+- [→v0.3] **Cross-blob lock-coupling** — `insert_multi` /
+  `erase_multi` currently hold the root blob's exclusive guard
+  for the entire descent (including all child-blob work). The
+  fix is to flatten the recursive walker into an iterative
+  blob-by-blob loop so the parent's guard releases before
+  pinning the child and re-acquires only if the parent's
+  `BlobNode` needs an update — but the re-acquire path needs
+  an optimistic verification protocol (the parent's `bn_slot`
+  may have been freed + reused while we were gone). Couples
+  cleanly with the per-node latch design (per-slot version
+  doubles as the verification token), so the two land
+  together in v0.3.
+
+- [x] **Multi-reader stress bench** —
+      `tests/bench_multi_reader.rs` spawns N reader threads
+      against a populated tree and measures aggregate
+      throughput. Sample numbers (Apple M-series, release,
+      10000-key tree):
+      `1 → 5.67 M ops/s`, `2 → 7.36 M (1.30×)`,
+      `4 → 14.73 M (2.60×)`, `8 → 18.14 M (3.20×)`,
+      `16 → 19.06 M (3.36×)`. Wait-free read path verified;
+      sub-linear scaling beyond 4 threads is from `DashMap`
+      shard atomics + the BM `clock_tick` global counter, both
+      identified as v0.3 follow-ups.
 - [x] **Multi-reader stress bench** —
       `tests/bench_multi_reader.rs` spawns N reader threads
       against a populated tree and measures aggregate
