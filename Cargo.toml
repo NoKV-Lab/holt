@@ -25,7 +25,7 @@ crossbeam-channel = "0.5"
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 rand = "0.9"
@@ -40,6 +40,13 @@ proptest = { version = "1", default-features = false, features = ["std", "fork",
 
 [features]
 default = []
+# Linux-only fast path: route PersistentBackend reads + writes
+# through io_uring instead of pread/pwrite syscalls. On non-Linux
+# targets the feature is a no-op (the underlying `io-uring` crate
+# is gated to `cfg(target_os = "linux")`, so PersistentBackend
+# stays on the pread/pwrite path). Adds the `io-uring` crate as a
+# build dep.
+io-uring = ["dep:io-uring"]
 # Future: "metrics" for prometheus, "mvcc" for snapshot isolation.
 
 [profile.release]

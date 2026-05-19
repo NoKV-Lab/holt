@@ -32,25 +32,45 @@
 //! - **Manifest** holds the GUID → slot mapping. Crash-safe via
 //!   atomic rename: writes go to `manifest.bin.tmp` then `rename(2)`.
 //!
-//! Stage 1 status (this file): the trait body uses `pread64` /
-//! `pwrite64` via `std::os::unix::fs::FileExt`. Stage 7 will swap
-//! the hot path to `io_uring` (Linux only) with `register_buffers`
-//! for syscall-free submission and `IOPOLL` for ultra-low
-//! completion latency on NVMe.
+//! ## I/O backend
+//!
+//! Two code paths share the same `PersistentBackend` struct:
+//!
+//! - **`pread`/`pwrite`** (default): every Unix target, every build
+//!   configuration. Uses `std::os::unix::fs::FileExt`.
+//! - **`io_uring`** (`cfg(target_os = "linux")` + `feature =
+//!   "io-uring"`): submits one SQE per read/write to a dedicated
+//!   ring owned by the backend. Eliminates the per-syscall entry/
+//!   exit cost on Linux.
+//!
+//! Both paths share the same on-disk layout and the same
+//! `Backend::flush` semantics (`sync_data` + manifest persist).
+//! Switching between them is an internal performance toggle; no
+//! caller-visible behaviour changes.
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+mod uring;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+use std::os::unix::fs::FileExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use std::sync::Mutex;
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
 use super::{AlignedBlobBuf, Backend};
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use self::uring::UringContext;
 
 /// Filename of the packed blob data file inside `data_dir`.
 const DATA_FILENAME: &str = "blobs.dat";
@@ -74,6 +94,12 @@ pub struct PersistentBackend {
     data_dir: PathBuf,
     data_file: File,
     manifest: RwLock<Manifest>,
+    /// `io_uring` context — present iff Linux + `feature =
+    /// "io-uring"`. Held behind a `Mutex` so concurrent callers
+    /// serialise on the submission queue; with the v0.2 single I/O
+    /// worker thread this lock is uncontended on the hot path.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    uring: Mutex<UringContext>,
 }
 
 #[derive(Debug)]
@@ -129,10 +155,15 @@ impl PersistentBackend {
 
         let manifest = Manifest::load_or_create(&manifest_path)?;
 
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let uring = Mutex::new(UringContext::new(&data_file)?);
+
         Ok(Self {
             data_dir,
             data_file,
             manifest: RwLock::new(manifest),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            uring,
         })
     }
 
@@ -175,21 +206,51 @@ impl PersistentBackend {
         m.slots.insert(guid, s);
         s
     }
+
+    // ---------- I/O dispatch (uring vs pread/pwrite) ----------
+    //
+    // Two paired cfg-gated helpers per direction: the active one
+    // compiles, the inactive one doesn't. Keeps `read_blob` /
+    // `write_blob` clean of any conditional plumbing.
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn pread_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let mut ring = self.uring.lock().unwrap();
+        ring.pread_at(offset, dst)?;
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn pread_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.data_file.read_exact_at(dst, offset)?;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn pwrite_at(&self, offset: u64, src: &[u8]) -> Result<()> {
+        let mut ring = self.uring.lock().unwrap();
+        ring.pwrite_at(offset, src)?;
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn pwrite_at(&self, offset: u64, src: &[u8]) -> Result<()> {
+        self.data_file.write_all_at(src, offset)?;
+        Ok(())
+    }
 }
 
 impl Backend for PersistentBackend {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         let offset = self.offset_of(guid)?;
-        // Stage 7 will replace this with `io_uring` ReadFixed.
-        self.data_file.read_exact_at(dst.as_mut_slice(), offset)?;
+        self.pread_at(offset, dst.as_mut_slice())?;
         Ok(())
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let slot = self.assign_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
-        // Stage 7 will replace this with `io_uring` WriteFixed.
-        self.data_file.write_all_at(src.as_slice(), offset)?;
+        self.pwrite_at(offset, src.as_slice())?;
         Ok(())
     }
 

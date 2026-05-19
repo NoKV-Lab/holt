@@ -6,6 +6,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — I/O backend
+
+- **`io-uring` feature flag** (Linux only). When enabled,
+  `PersistentBackend::{read_blob, write_blob}` route through a
+  single per-backend `io_uring` ring instead of `pread`/`pwrite`.
+  Default builds + macOS / other Unix builds are unaffected.
+  Behind a `Mutex<UringContext>` so concurrent callers serialise
+  on the submission queue; with the new I/O worker thread the
+  lock is uncontended on the hot path.
+
 ### Added — durability + background work
 
 - **Background checkpointer** (`pub(crate) mod checkpoint` + opt-in

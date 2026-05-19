@@ -303,11 +303,14 @@ by `~leaves_per_rollup` once fast-forward lands.
 
 ### Hot-path performance
 
-- [ ] **`io_uring` persistent-backend submission/completion**
-      (Linux, behind a `feature = "io-uring"` flag). The current
-      backend uses `pread`/`pwrite`; uring removes the per-call
-      syscall + lets the BM batch reads on cold-cache walks.
-      Stage 7 of the original Stage chain.
+- [x] **`io_uring` persistent-backend submission/completion**
+      (Linux, behind `feature = "io-uring"`). When enabled,
+      `PersistentBackend::{read_blob, write_blob}` route through a
+      single per-backend ring (8 SQEs deep) instead of `pread`/
+      `pwrite`. macOS / non-Linux builds remain on the syscall
+      path even with the flag enabled (the `io-uring` crate is
+      `cfg(target_os = "linux")`-gated). Batched-flush mode for
+      saturating the ring is queued for v0.3.
 - [ ] **SIMD CRC32** — PCLMULQDQ on x86_64, CRC32 intrinsic on
       AArch64. The 256-entry table from v0.1's WAL fast-path
       gets ≈1.5 GB/s; SIMD variants push past 8 GB/s. Drops

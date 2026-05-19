@@ -96,6 +96,39 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # --------------------------------------------------------------
+  # Linux-only fast-path matrix: build + test with the `io-uring`
+  # feature enabled. The feature swaps PersistentBackend's
+  # pread/pwrite path for io_uring SQE/CQE; correctness should
+  # be identical to the default build, perf depends on kernel /
+  # workload. Job exists so a regression on the uring code path
+  # gets caught regardless of which path the user runs in
+  # production.
+  # --------------------------------------------------------------
+  test_io_uring:
+    name: test (linux, --features io-uring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (lib + tests, io-uring on)
+        run: cargo build --lib --tests --features io-uring --locked
+
+      - name: cargo test (lib + integration, io-uring on)
+        run: cargo test --lib --tests --features io-uring --locked
+
+      - name: cargo clippy (io-uring on)
+        run: cargo clippy --lib --tests --features io-uring --locked -- -D warnings
+
+  # --------------------------------------------------------------
   # `cargo doc` — fails on broken intra-doc links / missing docs
   # so the rendered docs.rs page stays clean.
   # --------------------------------------------------------------
