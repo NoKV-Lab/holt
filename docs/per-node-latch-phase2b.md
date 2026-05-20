@@ -454,3 +454,92 @@ Phase 3 closes the remaining edges (compact/merge lock ordering),
 Phase 4 wires the structural-op coverage, Phase 5 stress-tests
 everything. Then #8 (WAL group commit) becomes the next visible
 perf lever.
+
+## Open design gap — header.root_slot tracking across the hop
+
+**Discovered during a follow-up implementation attempt; documented
+here so it's solved before any Phase 2.B PR is opened.**
+
+During Phase C unwind, the popped parent context's
+`bn_snapshot.child_entry_ptr` must be compared against the **child
+blob's CURRENT `header.root_slot`** to decide whether a writeback
+is needed. For the deepest blob this is trivially the value we
+just wrote in Phase B (`final_inframe.slot_after`). For
+intermediate blobs (those that returned `CrossBlobHop` from
+`run_blob_attempts`) the value is whatever each blob's
+`header.root_slot` was at the moment its walker call returned —
+typically unchanged from descent time, **but possibly bumped by an
+in-blob `compact_blob` run inside the spillover-retry loop**.
+
+The protocol as written in this doc captures only `bn_slot`,
+`bn_snapshot`, `parent_bn_version`, `child_guid`,
+`child_entry_slot`, `child_depth`. It does not record the
+intermediate blob's `header.root_slot` post-descent. So at unwind
+time we can't tell whether to write back the parent's
+`BlobNode.child_entry_ptr` — we'd need to re-acquire a guard on the
+intermediate blob (just to read its header), and even then a
+concurrent writer running `compact_blob` could renumber the
+intermediate's slot table between our read and our parent-side
+writeback.
+
+The naive fixes each fail for a different reason:
+
+1. **Capture the intermediate's `header.root_slot` at push time
+   into the hop context.** Stale by unwind time if a concurrent
+   writer ran compact on the intermediate between our descent and
+   our return — we'd write a stale value into the parent's BN.
+
+2. **Re-read intermediate's `header.root_slot` during unwind under
+   a brief read guard.** The race window between the read and the
+   parent-side writeback is smaller but still exists.
+
+3. **Hold the intermediate's exclusive guard all the way through
+   the unwind.** Recreates Phase 2.A's "parent + child both held"
+   pathology — defeats the whole point of lock-coupling.
+
+4. **Treat the intermediate's `header.root_slot` as locked behind
+   `bn_slot`'s version.** Doesn't work: `bn_slot`'s version
+   tracks mutations to the parent's BN slot body, not to the
+   child's header.
+
+The genuine fix is one of:
+
+- **(A) Version the child blob's header.root_slot.** Add a
+  separate `header_root_slot_version: AtomicU64` to `CachedBlob`
+  (or repurpose a slot-version slot 0). Bump on every
+  `header.root_slot` mutation (compact / write-back). On unwind:
+  capture-at-push-time + re-load + compare. Mismatch → restart
+  from root. This is the LeanStore-equivalent of versioning the
+  parent-pointer target.
+- **(B) Lock-coupling that keeps the intermediate latched until
+  parent's BN is patched.** Hand-over-hand: when we descend into
+  a deeper child, take the deeper child's guard *before* dropping
+  the intermediate's. This bounds the held-latch window to "two
+  blobs during the hop boundary" rather than "all ancestors
+  throughout the descent". Less concurrency but correct without
+  versioning the header. The Phase 2.B doc's "release parent
+  before child" then becomes "release grandparent before
+  pinning grandchild" — the immediate parent stays held until
+  the writeback completes.
+- **(C) Avoid touching parent's BN.child_entry_ptr during normal
+  ops.** Currently spillover/compact in the child can change
+  child's root_slot. If we restructure so the child's compact
+  is coordinated with parent's BN update (e.g. compact takes a
+  "pending compact" reservation that the next parent-side write
+  picks up), the cross-blob pointer stays stable except at
+  explicitly synchronised moments. Heavier protocol change.
+
+**Recommendation for next session:** start with (B)
+hand-over-hand — preserves correctness without the protocol churn
+of (A) or (C), still meaningfully more concurrent than Phase 2.A
+(any writer NOT on the same grandparent-of-parent can proceed).
+(A) is the long-term endgame but adds one more atomic per blob
+write — defer until #8 makes the bench numbers worth optimising.
+
+The InsertHop / CrossBlobInsertHop type definitions sketched
+above are **still useful** but need the `current_blob_root_slot`
+field added (option A or B both want it).
+
+The design doc was published *before* this gap was discovered.
+Next session's first task: pick (A) or (B) explicitly and edit
+this section + the protocol sketch above accordingly.
