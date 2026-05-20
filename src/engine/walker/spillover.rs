@@ -9,12 +9,17 @@
 //!   [`super::migrate`])
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix};
+use crate::layout::{
+    leaf_extent_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
+    Prefix, DATA_AREA_START, PAGE_SIZE,
+};
 use crate::store::{BlobFrame, BufferManager};
 
 use super::cast;
 use super::migrate::make_blob_from_node;
-use super::readers::{ntype_of, read_node16, read_node256, read_node4, read_node48, read_prefix};
+use super::readers::{
+    ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
+};
 use super::types::{Victim, VictimEdgeKind};
 use super::writers::{inner_update_child, set_prefix_child, write_struct_to_slot};
 
@@ -22,15 +27,45 @@ use super::writers::{inner_update_child, set_prefix_child, write_struct_to_slot}
 // `super::spillover::compact_blob`.
 pub(super) use super::migrate::compact_blob;
 
+const SPILLOVER_TARGET_CHILD_FILL_PCT: u32 = 70;
+const SPILLOVER_MIN_CHILD_FILL_PCT: u32 = 35;
+
+#[derive(Debug, Clone, Copy)]
+struct SubtreeFootprint {
+    nodes: u32,
+    bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VictimCandidate {
+    victim: Victim,
+    footprint: SubtreeFootprint,
+}
+
+fn spillover_data_capacity() -> u32 {
+    PAGE_SIZE - DATA_AREA_START
+}
+
+fn spillover_target_child_bytes() -> u32 {
+    spillover_data_capacity() * SPILLOVER_TARGET_CHILD_FILL_PCT / 100
+}
+
+fn spillover_min_child_bytes() -> u32 {
+    spillover_data_capacity() * SPILLOVER_MIN_CHILD_FILL_PCT / 100
+}
+
 /// Trigger spillover on `frame`: migrate a subtree out to a fresh
 /// child blob (via [`make_blob_from_node`]), free the migrated
 /// slots, and install a [`BlobNode`] placeholder at the migrated
 /// location.
 ///
-/// Heuristic: pick the **largest non-Blob** subtree at the root's
-/// first branching node (i.e. skip BlobNode children — those are
-/// already migrated). This maximises space freed per spillover
-/// iteration.
+/// Heuristic: pick an occupancy-aware non-Blob subtree at the
+/// root's first branching node (i.e. skip BlobNode children —
+/// those are already migrated). The target is a child blob around
+/// 70% full, with node count used only as a tie-breaker. This keeps
+/// blob hops and follow-up split pressure stable at multi-million
+/// key scale instead of repeatedly peeling off the largest branch
+/// into near-full child blobs.
 ///
 /// Returns the BlobNode slot installed in `frame` so callers /
 /// tests can verify. The new blob lives in the BM cache + dirty
@@ -109,41 +144,49 @@ pub(super) fn spillover_blob(
     Ok(bn_alloc.slot)
 }
 
-/// Count the total number of node slots reachable from `root`
-/// in `frame`. Bounded by `MAX_SLOTS` (= 10240). Used by the
-/// spillover heuristic to pick the largest migration candidate.
-pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u32> {
+fn subtree_footprint(frame: &BlobFrame<'_>, root: u16) -> Result<SubtreeFootprint> {
     let ntype = ntype_of(frame.as_ref(), root)?;
+    if ntype == NodeType::Invalid {
+        return Err(Error::node_corrupt("subtree_footprint: Invalid"));
+    }
     let body = frame.body_of_slot(root).ok_or(Error::node_corrupt(
-        "count_subtree_nodes: body resolution failed",
+        "subtree_footprint: body resolution failed",
     ))?;
-    let mut count: u32 = 1;
+    let mut out = SubtreeFootprint {
+        nodes: 1,
+        bytes: size_of_node(ntype),
+    };
     match ntype {
-        NodeType::Invalid => {
-            return Err(Error::node_corrupt("count_subtree_nodes: Invalid"));
+        NodeType::Invalid => unreachable!("handled before size_of_node"),
+        NodeType::Leaf => {
+            let (key, leaf) = read_leaf_key_ref(frame.as_ref(), root)?;
+            out.bytes = out.bytes.saturating_add(leaf_extent_size(
+                key.len() as u32,
+                u32::from(leaf.value_size),
+            ));
         }
-        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
-            count = count.saturating_add(count_subtree_nodes(frame, p.child as u16)?);
+            out = out.saturating_add(subtree_footprint(frame, p.child as u16)?);
         }
         NodeType::Node4 => {
             let n = cast::<Node4>(body);
             for i in 0..(n.count as usize).min(4) {
-                count = count.saturating_add(count_subtree_nodes(frame, n.children[i] as u16)?);
+                out = out.saturating_add(subtree_footprint(frame, n.children[i] as u16)?);
             }
         }
         NodeType::Node16 => {
             let n = cast::<Node16>(body);
             for i in 0..(n.count as usize).min(16) {
-                count = count.saturating_add(count_subtree_nodes(frame, n.children[i] as u16)?);
+                out = out.saturating_add(subtree_footprint(frame, n.children[i] as u16)?);
             }
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
             for c in &n.children {
                 if *c != 0 {
-                    count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
+                    out = out.saturating_add(subtree_footprint(frame, *c as u16)?);
                 }
             }
         }
@@ -151,15 +194,23 @@ pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u3
             let n = cast::<Node256>(body);
             for c in &n.children {
                 if *c != 0 {
-                    count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
+                    out = out.saturating_add(subtree_footprint(frame, *c as u16)?);
                 }
             }
         }
     }
-    Ok(count)
+    Ok(out)
 }
 
-/// Pick the largest non-`BlobNode` subtree at the root's first
+impl SubtreeFootprint {
+    fn saturating_add(mut self, rhs: Self) -> Self {
+        self.nodes = self.nodes.saturating_add(rhs.nodes);
+        self.bytes = self.bytes.saturating_add(rhs.bytes);
+        self
+    }
+}
+
+/// Pick an occupancy-aware non-`BlobNode` subtree at the root's first
 /// branching node. Walks through chained `Prefix` nodes to reach
 /// the first `Node4/16/48/256`.
 ///
@@ -167,8 +218,9 @@ pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u3
 /// - Skipping `Blob` children avoids spillover-stutter (previously-
 ///   migrated children would otherwise get re-migrated into
 ///   wrapper blobs without freeing any actual data).
-/// - Picking the *largest* child (by node count) maximises space
-///   freed per spillover iteration.
+/// - Choosing a subtree close to the target child fill ratio avoids
+///   creating child blobs that are immediately full, which is what
+///   turns path-shaped 2M+ put workloads into repeated blob hops.
 #[allow(clippy::too_many_lines)] // intentional — one match over NodeType arms
 fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim> {
     let mut current = start_slot;
@@ -177,7 +229,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
         match ntype {
             NodeType::Node4 => {
                 let n = read_node4(frame.as_ref(), current)?;
-                return pick_largest_non_blob(
+                return pick_occupancy_aware_non_blob(
                     frame,
                     current,
                     NodeType::Node4,
@@ -189,7 +241,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
             }
             NodeType::Node16 => {
                 let n = read_node16(frame.as_ref(), current)?;
-                return pick_largest_non_blob(
+                return pick_occupancy_aware_non_blob(
                     frame,
                     current,
                     NodeType::Node16,
@@ -201,8 +253,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
             }
             NodeType::Node48 => {
                 let n = read_node48(frame.as_ref(), current)?;
-                let mut best: Option<Victim> = None;
-                let mut best_size: u32 = 0;
+                let mut best: Option<VictimCandidate> = None;
                 for b in 0..256usize {
                     let idx = n.index[b];
                     if idx == 0 {
@@ -212,26 +263,28 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
                     if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
                         continue;
                     }
-                    let size = count_subtree_nodes(frame, child_slot)?;
-                    if size > best_size {
-                        best_size = size;
-                        best = Some(Victim {
+                    consider_candidate(
+                        frame,
+                        child_slot,
+                        Victim {
                             parent_slot: current,
                             kind: VictimEdgeKind::Inner(NodeType::Node48),
                             byte: b as u8,
                             victim_slot: child_slot,
                             via_header_root: false,
-                        });
-                    }
+                        },
+                        &mut best,
+                    )?;
                 }
-                return best.ok_or(Error::NotYetImplemented(
-                    "spillover: no non-Blob children to migrate (Node48)",
-                ));
+                return best
+                    .map(|candidate| candidate.victim)
+                    .ok_or(Error::NotYetImplemented(
+                        "spillover: no non-Blob children to migrate (Node48)",
+                    ));
             }
             NodeType::Node256 => {
                 let n = read_node256(frame.as_ref(), current)?;
-                let mut best: Option<Victim> = None;
-                let mut best_size: u32 = 0;
+                let mut best: Option<VictimCandidate> = None;
                 for (i, c) in n.children.iter().enumerate() {
                     if *c == 0 {
                         continue;
@@ -240,21 +293,24 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
                     if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
                         continue;
                     }
-                    let size = count_subtree_nodes(frame, child_slot)?;
-                    if size > best_size {
-                        best_size = size;
-                        best = Some(Victim {
+                    consider_candidate(
+                        frame,
+                        child_slot,
+                        Victim {
                             parent_slot: current,
                             kind: VictimEdgeKind::Inner(NodeType::Node256),
                             byte: i as u8,
                             victim_slot: child_slot,
                             via_header_root: false,
-                        });
-                    }
+                        },
+                        &mut best,
+                    )?;
                 }
-                return best.ok_or(Error::NotYetImplemented(
-                    "spillover: no non-Blob children to migrate (Node256)",
-                ));
+                return best
+                    .map(|candidate| candidate.victim)
+                    .ok_or(Error::NotYetImplemented(
+                        "spillover: no non-Blob children to migrate (Node256)",
+                    ));
             }
             NodeType::Prefix => {
                 let p = read_prefix(frame.as_ref(), current)?;
@@ -297,8 +353,8 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
 }
 
 /// Scan a Node4/Node16's `keys[]`+`children[]` parallel arrays for
-/// the largest non-`BlobNode` child.
-fn pick_largest_non_blob(
+/// the best occupancy-aware non-`BlobNode` child.
+fn pick_occupancy_aware_non_blob(
     frame: &BlobFrame<'_>,
     parent_slot: u16,
     parent_ntype: NodeType,
@@ -307,28 +363,87 @@ fn pick_largest_non_blob(
     children: &[u32],
     via_header_root: bool,
 ) -> Result<Victim> {
-    let mut best: Option<Victim> = None;
-    let mut best_size: u32 = 0;
+    let mut best: Option<VictimCandidate> = None;
     for i in 0..count {
         let child_slot = children[i] as u16;
         if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
             continue;
         }
-        let size = count_subtree_nodes(frame, child_slot)?;
-        if size > best_size {
-            best_size = size;
-            best = Some(Victim {
+        consider_candidate(
+            frame,
+            child_slot,
+            Victim {
                 parent_slot,
                 kind: VictimEdgeKind::Inner(parent_ntype),
                 byte: keys[i],
                 victim_slot: child_slot,
                 via_header_root,
-            });
-        }
+            },
+            &mut best,
+        )?;
     }
-    best.ok_or(Error::NotYetImplemented(
-        "spillover: no non-Blob children to migrate",
-    ))
+    best.map(|candidate| candidate.victim)
+        .ok_or(Error::NotYetImplemented(
+            "spillover: no non-Blob children to migrate",
+        ))
+}
+
+fn consider_candidate(
+    frame: &BlobFrame<'_>,
+    child_slot: u16,
+    victim: Victim,
+    best: &mut Option<VictimCandidate>,
+) -> Result<()> {
+    let candidate = VictimCandidate {
+        victim,
+        footprint: subtree_footprint(frame, child_slot)?,
+    };
+    if best
+        .as_ref()
+        .is_none_or(|current| candidate_is_better(candidate, *current))
+    {
+        *best = Some(candidate);
+    }
+    Ok(())
+}
+
+fn candidate_is_better(candidate: VictimCandidate, current: VictimCandidate) -> bool {
+    let c = candidate.footprint;
+    let b = current.footprint;
+    let target = spillover_target_child_bytes();
+    let min = spillover_min_child_bytes();
+    let c_in_band = c.bytes >= min && c.bytes <= target;
+    let b_in_band = b.bytes >= min && b.bytes <= target;
+    if c_in_band != b_in_band {
+        return c_in_band;
+    }
+    if c_in_band {
+        return candidate_tie(c, b, c.bytes.abs_diff(target), b.bytes.abs_diff(target));
+    }
+
+    let c_below = c.bytes < min;
+    let b_below = b.bytes < min;
+    if c_below && b_below {
+        return candidate_tie(c, b, b.bytes, c.bytes);
+    }
+
+    let c_over = c.bytes > target;
+    let b_over = b.bytes > target;
+    if c_over && b_over {
+        return candidate_tie(c, b, c.bytes, b.bytes);
+    }
+
+    candidate_tie(c, b, c.bytes.abs_diff(target), b.bytes.abs_diff(target))
+}
+
+fn candidate_tie(
+    candidate: SubtreeFootprint,
+    current: SubtreeFootprint,
+    candidate_score: u32,
+    current_score: u32,
+) -> bool {
+    candidate_score < current_score
+        || (candidate_score == current_score && candidate.nodes > current.nodes)
 }
 
 /// Recursively free every slot of the subtree rooted at `root` in
@@ -476,5 +591,60 @@ fn fill_os_entropy(buf: &mut [u8]) -> bool {
     {
         let _ = buf;
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(bytes: u32, nodes: u32) -> VictimCandidate {
+        VictimCandidate {
+            victim: Victim {
+                parent_slot: 0,
+                kind: VictimEdgeKind::Prefix,
+                byte: 0,
+                victim_slot: 0,
+                via_header_root: false,
+            },
+            footprint: SubtreeFootprint { nodes, bytes },
+        }
+    }
+
+    #[test]
+    fn spillover_scoring_prefers_target_band_over_largest() {
+        let target = spillover_target_child_bytes();
+        assert!(candidate_is_better(
+            candidate(target - 1024, 10),
+            candidate(target + 80_000, 100),
+        ));
+        assert!(!candidate_is_better(
+            candidate(target + 80_000, 100),
+            candidate(target - 1024, 10),
+        ));
+    }
+
+    #[test]
+    fn spillover_scoring_avoids_tiny_and_overfull_children() {
+        let min = spillover_min_child_bytes();
+        let target = spillover_target_child_bytes();
+
+        assert!(candidate_is_better(
+            candidate(min - 1024, 20),
+            candidate(min / 2, 100),
+        ));
+        assert!(candidate_is_better(
+            candidate(target + 1024, 20),
+            candidate(target + 90_000, 100),
+        ));
+    }
+
+    #[test]
+    fn spillover_scoring_uses_node_count_only_as_tie_breaker() {
+        let target = spillover_target_child_bytes();
+        assert!(candidate_is_better(
+            candidate(target - 4096, 20),
+            candidate(target - 4096, 10),
+        ));
     }
 }

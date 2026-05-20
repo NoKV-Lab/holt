@@ -60,6 +60,7 @@ use crate::journal::reader::replay;
 use crate::journal::txn_op::TxnOp;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
+use crate::store::buffer_manager::WriteThroughEntry;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::txn::{BatchOp, TxnBatch};
@@ -832,8 +833,8 @@ impl Tree {
         self.range().prefix(prefix)
     }
 
-    /// Drain the BM dirty map and synchronously push each entry
-    /// to the inner backend via `write_through` (CAS-on-seq).
+    /// Drain the BM dirty map and synchronously push entries to
+    /// the inner backend via batched write-through (CAS-on-seq).
     ///
     /// Used by:
     /// - The no-WAL `memory_flush_on_write` path, where every op must
@@ -844,7 +845,7 @@ impl Tree {
     ///
     /// `snapshot_dirty` atomically drains the map; concurrent
     /// `mark_dirty` calls land in the fresh empty map and stay
-    /// tracked for the next round. `write_through(expected_seq)`
+    /// tracked for the next round. Write-through with `expected_seq`
     /// matches the checkpoint round's protocol: the dirty entry
     /// is retired only when no racing writer has bumped its seq
     /// in the meantime (snapshot 的 expected_seq 反映了我们抓到的
@@ -854,19 +855,37 @@ impl Tree {
         let snap = self.backend.snapshot_dirty();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
+        let mut entries = Vec::with_capacity(snap.len());
         for (guid, expected_seq) in snap {
             // `snapshot_bytes` clones the cached image under a
             // brief shared read guard so we hand owned bytes to
-            // `write_through`. `None` means the blob was evicted
-            // between snapshot_dirty and snapshot_bytes — drop
-            // the dirty entry on the floor; the eviction path
-            // already cleared `dirty` for it.
+            // write-through. `None` means the blob was evicted
+            // between snapshot_dirty and snapshot_bytes — invariant
+            // I1 regressed, so restore the entry and fail loudly.
             if let Some(bytes) = self.backend.snapshot_bytes(guid) {
-                if let Err(e) = self.backend.write_through(guid, &bytes, expected_seq) {
+                entries.push(WriteThroughEntry {
+                    guid,
+                    bytes,
+                    expected_seq,
+                });
+            } else {
+                failed.insert(guid, expected_seq);
+                first_err.get_or_insert(Error::Internal(
+                    "flush_dirty_inline: dirty entry lost cache image — invariant I1 violated",
+                ));
+            }
+        }
+        if !entries.is_empty() {
+            let expected: Vec<_> = entries
+                .iter()
+                .map(|entry| (entry.guid, entry.expected_seq))
+                .collect();
+            if let Err(e) = self.backend.write_through_batch(&entries) {
+                for (guid, expected_seq) in expected {
                     failed.insert(guid, expected_seq);
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                }
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }
@@ -936,7 +955,7 @@ impl Tree {
     ///    the data file + persist the manifest) so step 2's
     ///    writes hit stable storage *before* any manifest delete
     ///    runs. Sync failure → restore pending, return.
-    /// 4. **Abort-on-dirty-failure gate**. If any write_through
+    /// 4. **Abort-on-dirty-failure gate**. If any write-through
     ///    at step 2 failed, the round must NOT apply pending
     ///    deletes: a parent that didn't flush might still
     ///    reference a child that's about to be removed from the
@@ -959,6 +978,7 @@ impl Tree {
     ///
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
+    #[allow(clippy::too_many_lines)]
     pub fn checkpoint(&self) -> Result<()> {
         use std::collections::HashMap;
 
@@ -1009,7 +1029,7 @@ impl Tree {
             (snap_dirty, snap_pending, snap_bytes)
         };
 
-        // Phase 2: per-blob write_through with CAS-on-seq.
+        // Phase 2: batch write-through with CAS-on-seq.
         //
         // A drained dirty entry **must** have a cache image —
         // invariant I1 (dirty ⟺ cache newer than backend). If
@@ -1020,9 +1040,25 @@ impl Tree {
         // Restore both snapshots and bail loud.
         let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
         let mut first_dirty_err: Option<Error> = None;
-        for (guid, expected_seq, bytes) in &snap_bytes {
-            if let Err(e) = self.backend.write_through(*guid, bytes, *expected_seq) {
-                dirty_failed.insert(*guid, *expected_seq);
+        let entries: Vec<_> = snap_bytes
+            .into_iter()
+            .map(|(guid, expected_seq, bytes)| WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq,
+            })
+            .collect();
+        if !entries.is_empty() {
+            let expected: Vec<_> = entries
+                .iter()
+                .map(|entry| (entry.guid, entry.expected_seq))
+                .collect();
+            if let Err(e) = self.backend.write_through_batch(&entries) {
+                // Backend batch failure may have landed any prefix;
+                // retry the whole snapshot next round.
+                for (guid, expected_seq) in expected {
+                    dirty_failed.insert(guid, expected_seq);
+                }
                 if first_dirty_err.is_none() {
                     first_dirty_err = Some(e);
                 }
@@ -1035,7 +1071,7 @@ impl Tree {
 
         // Phase 3: pre-delete sync. Even when some writes failed at
         // phase 2, the successful ones already retired their dirty
-        // entries via the write_through CAS — we must still fsync
+        // entries via the write-through CAS — we must still fsync
         // so those bytes are stable on disk. On sync failure,
         // pending deletes haven't been applied yet, so restore them
         // and bail.
@@ -1045,7 +1081,7 @@ impl Tree {
         }
 
         // Phase 4: abort-on-dirty-failure gate. A failed parent
-        // write_through must NOT propagate to a manifest delete of
+        // write-through must NOT propagate to a manifest delete of
         // its dependent child — that would orphan the parent's
         // BlobNode pointer (parent on-disk still has the child
         // pointer; manifest no longer has the child entry; WAL
@@ -1098,7 +1134,7 @@ impl Tree {
 
         // 6. Conditional truncate. A writer that landed a
         //    mark_dirty between our snapshot and here has its
-        //    entry still in `dirty` (write_through's CAS won't
+        //    entry still in `dirty` (write-through CAS won't
         //    retire newer-seq entries, and snapshot only drained
         //    what we observed at step 1); leave the WAL alone so
         //    that entry's WAL record stays recoverable. Same

@@ -16,9 +16,9 @@
 //! The `io_uring` types (`IoUring`, `SubmissionQueueEntry`,
 //! `CompletionQueueEntry`, …) are heavily `unsafe`-bound — keeping
 //! them isolated here lets the rest of `PersistentBackend` stay
-//! safe-Rust. The module exports exactly three operations:
-//! [`UringContext::pread_at`], [`UringContext::pwrite_at`], and
-//! [`UringContext::new`].
+//! safe-Rust. The module exports exactly four operations:
+//! [`UringContext::pread_at`], [`UringContext::pwrite_at`],
+//! [`UringContext::pwrite_many_at`], and [`UringContext::new`].
 //!
 //! ## Concurrency
 //!
@@ -29,20 +29,18 @@
 //!
 //! ## SQE depth
 //!
-//! `RING_DEPTH = 8` — comfortably accommodates one submit + one
-//! completion at a time plus head-room for batched flushes once
-//! the planner can prepare a whole snapshot of dirty blobs in
-//! one go.
+//! `RING_DEPTH = 64` — enough to keep a local NVMe queue fed by
+//! checkpoint batches without exploding CQ drain latency.
 
 use std::io;
 use std::os::unix::io::AsRawFd;
 
 use io_uring::{opcode, types, IoUring};
 
-/// Number of SQEs / CQEs the ring is sized for. Each blob is one
-/// SQE today; the depth has head-room for a future batched-flush
-/// mode that submits a whole dirty-set in one go.
-const RING_DEPTH: u32 = 8;
+/// Number of SQEs / CQEs the ring is sized for. Each checkpoint
+/// blob write is one SQE; larger dirty snapshots are submitted in
+/// ring-sized chunks.
+const RING_DEPTH: u32 = 64;
 
 /// Owns a single `io_uring` plus the `RawFd` of the file we
 /// submit against. The file itself is owned by
@@ -50,7 +48,8 @@ const RING_DEPTH: u32 = 8;
 /// borrows its descriptor.
 pub(super) struct UringContext {
     ring: IoUring,
-    fd: types::Fd,
+    raw_fd: i32,
+    fixed_fd: types::Fixed,
 }
 
 impl std::fmt::Debug for UringContext {
@@ -59,7 +58,7 @@ impl std::fmt::Debug for UringContext {
         // the fd alone is enough to identify which backend file
         // this context drives.
         f.debug_struct("UringContext")
-            .field("fd", &self.fd.0)
+            .field("fd", &self.raw_fd)
             .finish_non_exhaustive()
     }
 }
@@ -70,8 +69,13 @@ impl UringContext {
     /// (e.g. kernel too old).
     pub(super) fn new(file: &std::fs::File) -> io::Result<Self> {
         let ring = IoUring::new(RING_DEPTH)?;
-        let fd = types::Fd(file.as_raw_fd());
-        Ok(Self { ring, fd })
+        let raw_fd = file.as_raw_fd();
+        ring.submitter().register_files(&[raw_fd])?;
+        Ok(Self {
+            ring,
+            raw_fd,
+            fixed_fd: types::Fixed(0),
+        })
     }
 
     /// Synchronous `pwrite` via `io_uring`: push one SQE,
@@ -81,39 +85,61 @@ impl UringContext {
     /// never push a second SQE before the first's CQE has been
     /// drained — i.e. the SQ + CQ never get out of sync.
     pub(super) fn pwrite_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        let entry = opcode::Write::new(self.fd, buf.as_ptr(), buf.len() as u32)
-            .offset(offset)
-            .build()
-            .user_data(0);
+        self.pwrite_many_at(&[(offset, buf)])
+    }
 
-        // SAFETY: the SQE references `buf` for the duration of the
-        // operation; we synchronously `submit_and_wait` below
-        // before returning, so the borrow outlives the kernel's
-        // read of the buffer.
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| io::Error::other("uring SQ full"))?;
-        }
-        self.ring.submit_and_wait(1)?;
+    /// Synchronous batched `pwrite` via `io_uring`: push up to
+    /// `RING_DEPTH` SQEs, submit once, then drain all completions.
+    pub(super) fn pwrite_many_at(&mut self, writes: &[(u64, &[u8])]) -> io::Result<()> {
+        for chunk in writes.chunks(RING_DEPTH as usize) {
+            for (idx, (offset, buf)) in chunk.iter().enumerate() {
+                let entry = opcode::Write::new(self.fixed_fd, buf.as_ptr(), buf.len() as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(idx as u64);
 
-        // Exactly one CQE per submit_and_wait(1).
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::other("uring CQE missing"))?;
-        let n = cqe.result();
-        if n < 0 {
-            return Err(io::Error::from_raw_os_error(-n));
-        }
-        if (n as usize) != buf.len() {
-            return Err(io::Error::other(format!(
-                "short uring write: wrote {} of {}",
-                n,
-                buf.len()
-            )));
+                // SAFETY: every SQE references a slice borrowed
+                // from `writes`; this function synchronously waits
+                // for all completions before returning, so all
+                // buffers outlive the kernel reads.
+                unsafe {
+                    self.ring
+                        .submission()
+                        .push(&entry)
+                        .map_err(|_| io::Error::other("uring SQ full"))?;
+                }
+            }
+            self.ring.submit_and_wait(chunk.len())?;
+            let mut seen = vec![false; chunk.len()];
+            let mut complete = 0usize;
+            while complete < chunk.len() {
+                let cqe = self
+                    .ring
+                    .completion()
+                    .next()
+                    .ok_or_else(|| io::Error::other("uring CQE missing"))?;
+                let idx = usize::try_from(cqe.user_data())
+                    .map_err(|_| io::Error::other("uring CQE user_data overflow"))?;
+                if idx >= chunk.len() {
+                    return Err(io::Error::other("uring CQE user_data out of batch"));
+                }
+                if seen[idx] {
+                    return Err(io::Error::other("duplicate uring CQE user_data"));
+                }
+                let n = cqe.result();
+                if n < 0 {
+                    return Err(io::Error::from_raw_os_error(-n));
+                }
+                let expected = chunk[idx].1.len();
+                if (n as usize) != expected {
+                    return Err(io::Error::other(format!(
+                        "short uring write: wrote {} of {}",
+                        n, expected
+                    )));
+                }
+                seen[idx] = true;
+                complete += 1;
+            }
         }
         Ok(())
     }
@@ -121,7 +147,7 @@ impl UringContext {
     /// Synchronous `pread` via `io_uring`: same shape as
     /// [`Self::pwrite_at`].
     pub(super) fn pread_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let entry = opcode::Read::new(self.fd, buf.as_mut_ptr(), buf.len() as u32)
+        let entry = opcode::Read::new(self.fixed_fd, buf.as_mut_ptr(), buf.len() as u32)
             .offset(offset)
             .build()
             .user_data(0);
@@ -153,5 +179,11 @@ impl UringContext {
             )));
         }
         Ok(())
+    }
+}
+
+impl Drop for UringContext {
+    fn drop(&mut self) {
+        let _ = self.ring.submitter().unregister_files();
     }
 }

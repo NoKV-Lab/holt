@@ -60,6 +60,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -94,6 +95,10 @@ pub struct PersistentBackend {
     data_dir: PathBuf,
     data_file: File,
     manifest: RwLock<Manifest>,
+    /// Tracks whether `manifest.bin` needs a rewrite. Data-only
+    /// overwrites of existing blobs leave this false, avoiding a
+    /// full tmp+rename manifest cycle on every checkpoint.
+    manifest_dirty: AtomicBool,
     /// `io_uring` context — present iff Linux + `feature =
     /// "io-uring"`. Held behind a `Mutex` so concurrent callers
     /// serialise on the submission queue; with the single I/O
@@ -163,6 +168,7 @@ impl PersistentBackend {
             data_dir,
             data_file,
             manifest: RwLock::new(manifest),
+            manifest_dirty: AtomicBool::new(false),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             uring,
         })
@@ -205,7 +211,29 @@ impl PersistentBackend {
         let s = m.next_slot;
         m.next_slot += 1;
         m.slots.insert(guid, s);
+        self.manifest_dirty.store(true, Ordering::Release);
         s
+    }
+
+    fn assign_slots(&self, guids: impl IntoIterator<Item = BlobGuid>) -> Vec<u64> {
+        let mut m = self.manifest.write().unwrap();
+        let mut out = Vec::new();
+        let mut dirty = false;
+        for guid in guids {
+            if let Some(&s) = m.slots.get(&guid) {
+                out.push(s);
+                continue;
+            }
+            let s = m.next_slot;
+            m.next_slot += 1;
+            m.slots.insert(guid, s);
+            dirty = true;
+            out.push(s);
+        }
+        if dirty {
+            self.manifest_dirty.store(true, Ordering::Release);
+        }
+        out
     }
 
     // ---------- I/O dispatch (uring vs pread/pwrite) ----------
@@ -234,9 +262,24 @@ impl PersistentBackend {
         Ok(())
     }
 
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn pwrite_many_at(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        let mut ring = self.uring.lock().unwrap();
+        ring.pwrite_many_at(writes)?;
+        Ok(())
+    }
+
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
     fn pwrite_at(&self, offset: u64, src: &[u8]) -> Result<()> {
         self.data_file.write_all_at(src, offset)?;
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn pwrite_many_at(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        for (offset, src) in writes {
+            self.data_file.write_all_at(src, *offset)?;
+        }
         Ok(())
     }
 }
@@ -255,9 +298,23 @@ impl Backend for PersistentBackend {
         Ok(())
     }
 
+    fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let slots = self.assign_slots(writes.iter().map(|(guid, _)| *guid));
+        let mut io = Vec::with_capacity(writes.len());
+        for ((_, src), slot) in writes.iter().zip(slots) {
+            io.push((slot * u64::from(PAGE_SIZE), src.as_slice()));
+        }
+        self.pwrite_many_at(&io)
+    }
+
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let mut m = self.manifest.write().unwrap();
-        m.slots.remove(&guid);
+        if m.slots.remove(&guid).is_some() {
+            self.manifest_dirty.store(true, Ordering::Release);
+        }
         // TODO: feed the released slot into a per-backend free
         // list so `assign_slot` can reuse it. Today the slot
         // leaks — the data on disk stays as garbage until a
@@ -277,8 +334,13 @@ impl Backend for PersistentBackend {
         // write cache.
         self.data_file.sync_data()?;
 
-        let m = self.manifest.read().unwrap();
-        m.persist(&self.data_dir)?;
+        if self.manifest_dirty.swap(false, Ordering::AcqRel) {
+            let m = self.manifest.read().unwrap();
+            if let Err(e) = m.persist(&self.data_dir) {
+                self.manifest_dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
         Ok(())
     }
 }

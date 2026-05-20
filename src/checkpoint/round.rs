@@ -15,11 +15,12 @@
 //! 2. **Flush WAL** through the journal worker so every record that
 //!    mirrors a snapshotted seq is durable before we drop it.
 //! 3. **Clone snapshotted bytes** while still holding the same
-//!    commit-publish gate, then submit one `IoTask::Flush` per blob.
-//! 4. **Collect completions** — wait for each task's one-shot
-//!    completion. On any failure, restore the corresponding dirty
-//!    entry via `bm.restore_dirty` so the next round retries.
-//! 5. **Submit `Sync`** — one `IoTask::Sync` after every `Flush`
+//!    commit-publish gate, then submit one `IoTask::FlushBatch`.
+//! 4. **Collect completion** — wait for the batch one-shot
+//!    completion. On failure, restore the whole dirty snapshot via
+//!    `bm.restore_dirty` because a backend batch may have written
+//!    an arbitrary prefix.
+//! 5. **Submit `Sync`** — one `IoTask::Sync` after the `FlushBatch`
 //!    landed. `fdatasync` of the inner backend, including the
 //!    PersistentBackend's manifest persist.
 //! 6. **Truncate WAL** — only when (a) no `Flush` failed AND (b)
@@ -44,6 +45,7 @@ use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
 use crate::store::backend::Backend;
+use crate::store::buffer_manager::WriteThroughEntry;
 
 use super::io::IoTask;
 use super::Shared;
@@ -157,32 +159,31 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         return Ok(());
     }
 
-    // 3. Snapshot bytes + submit Flush tasks.
-    let mut completions: Vec<(BlobGuid, u64, crossbeam_channel::Receiver<Result<()>>)> =
-        Vec::with_capacity(snap.len());
+    // 3. Submit one batched Flush task. The snapshot bytes were
+    // already cloned under the commit-publish gate above.
     let mut failed: HashMap<BlobGuid, u64> = HashMap::new();
 
-    for (guid, txn_id, bytes) in snap_bytes {
+    if !snap_bytes.is_empty() {
+        let mut entries = Vec::with_capacity(snap_bytes.len());
+        let mut expected = Vec::with_capacity(snap_bytes.len());
+        for (guid, txn_id, bytes) in snap_bytes {
+            expected.push((guid, txn_id));
+            entries.push(WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: txn_id,
+            });
+        }
         let (tx, rx) = bounded(1);
-        let task = IoTask::Flush {
-            guid,
-            bytes,
-            // Carry the drained dirty seq so the I/O worker can
-            // tell "no writer raced us" (safe to retire the dirty
-            // entry) from "racer landed" (must leave the new
-            // entry alone for the next round).
-            expected_seq: txn_id,
+        let task = IoTask::FlushBatch {
+            entries,
             on_done: tx,
         };
         if shared.io_tx.send(task).is_err() {
             // I/O thread is gone (Drop is mid-sequence on another
             // path) — restore EVERYTHING we drained at step 1 so
-            // the next round retries:
-            //  - dirty entries we haven't yet handed off to the
-            //    worker, AND those still in-flight as completions
-            //    we'll never collect;
-            //  - the whole `pending` snapshot — we never reached
-            //    phase 6, and dropping it would lose unlink intent.
+            // the next round retries. The whole `pending` snapshot
+            // is restored because phase 6 won't run.
             for (g, t) in &snap {
                 failed.entry(*g).or_insert(*t);
             }
@@ -192,25 +193,31 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                 "checkpoint: I/O worker channel closed mid-round",
             ));
         }
-        completions.push((guid, txn_id, rx));
-    }
 
-    // 4. Collect completions.
-    for (guid, txn_id, rx) in completions {
+        // 4. Collect batch completion. On error, restore the whole
+        // snapshot: `Backend::write_blobs` may have landed any
+        // prefix, and retrying all entries is the only portable
+        // recovery shape.
         match rx.recv() {
             Ok(Ok(())) => {
-                shared.blobs_flushed.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .blobs_flushed
+                    .fetch_add(expected.len() as u64, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
                 eprintln!(
-                    "holt: checkpoint flush failed for blob {:02x?} (min_txn={txn_id}): {e}",
-                    &guid[..4]
+                    "holt: checkpoint flush batch failed ({} blobs): {e}",
+                    expected.len()
                 );
-                failed.insert(guid, txn_id);
+                for (guid, txn_id) in expected {
+                    failed.insert(guid, txn_id);
+                }
             }
             Err(_) => {
                 // Sender dropped before sending — I/O thread died.
-                failed.insert(guid, txn_id);
+                for (guid, txn_id) in expected {
+                    failed.insert(guid, txn_id);
+                }
             }
         }
     }
@@ -220,8 +227,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         shared.bm.restore_dirty(failed.clone());
     }
 
-    // 5. Pre-delete Sync — every successful Flush above retired
-    //    its dirty entry via write_through CAS; we must still
+    // 5. Pre-delete Sync — a successful FlushBatch above retired
+    //    dirty entries via write-through CAS; we must still
     //    fsync so those bytes are stable on disk before phase 6
     //    mutates the manifest. Each early-return path restores
     //    `pending` because phase 6 won't run.
@@ -381,7 +388,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// Candidate-driven merge pass — fold mergeable `BlobNode`
 /// children back into their parents. Stages the mutations via the
 /// unified `mark_dirty` + `mark_for_delete` protocol so the round's
-/// later phases (WAL flush → Flush tasks → Sync → pending
+/// later phases (WAL flush → FlushBatch → Sync → pending
 /// deletes → re-Sync → truncate) handle persistence under W2D.
 /// Takes the exclusive maintenance gate around one parent at a
 /// time so no foreground writer is lock-coupling through the child
@@ -400,7 +407,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// later `backend.flush` could persist while the corresponding
 /// user WAL records still hadn't reached disk. Staging through
 /// dirty / pending-delete avoids both: the only flush path is
-/// the round's own `IoTask::Flush`, which runs strictly after
+/// the round's own `IoTask::FlushBatch`, which runs strictly after
 /// step 2's WAL flush.
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;

@@ -14,7 +14,7 @@
 //!
 //! - **Synchronous checkpoint** — [`crate::Tree::checkpoint`]
 //!   drains the dirty map, clones cached bytes, then calls
-//!   [`BufferManager::write_through`] with the snapshotted seq.
+//!   [`BufferManager::write_through_batch`] with the snapshotted seqs.
 //! - **Background checkpointer** — drives the same protocol from
 //!   its planner/I/O threads; see [`BufferManager::snapshot_dirty`]
 //!   / [`BufferManager::restore_dirty`].
@@ -86,12 +86,11 @@
 //!   with `as_slice()` + `validate()`. Wrap with
 //!   `BlobFrameRef::wrap(guard.as_slice())` for zero-copy traversal.
 //! - [`CachedBlob::read`] → [`BlobReadGuard`] (shared). Same
-//!   `BlobFrameRef::wrap` shape, but blocks behind any active
-//!   writer.
+//!   `BlobFrameRef::wrap` shape, but blocks behind any active writer.
 //! - [`CachedBlob::write`] → [`BlobWriteGuard`] (exclusive). Use
 //!   `guard.frame()` for in-place mutation. The owning tree later
 //!   publishes dirty state and checkpoint writes it through via
-//!   [`BufferManager::write_through`].
+//!   [`BufferManager::write_through_batch`].
 //!
 //! ## Eviction
 //!
@@ -150,12 +149,26 @@ pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
 const BOOKKEEPING_SHARDS: usize = 64;
 
+/// One pre-snapshotted blob image ready for checkpoint write-through.
+///
+/// The bytes are owned by the checkpoint round / I/O task so the
+/// backend write never holds a cache read guard. `expected_seq` is
+/// the dirty-map value that was drained into `flushing`; successful
+/// batch writes retire that exact flushing entry without stomping a
+/// racing writer's newer dirty entry.
+pub(crate) struct WriteThroughEntry {
+    pub(crate) guid: BlobGuid,
+    pub(crate) bytes: AlignedBlobBuf,
+    pub(crate) expected_seq: u64,
+}
+
 #[derive(Default)]
 struct MutationState {
     /// New dirty entries not yet claimed by a checkpoint round.
     dirty: HashMap<BlobGuid, u64>,
     /// Dirty entries drained by a checkpoint round whose cached
-    /// image still has to survive until `write_through` completes.
+    /// image still has to survive until checkpoint write-through
+    /// completes.
     flushing: HashMap<BlobGuid, u64>,
     /// Blobs unlinked from the tree but not yet deleted from the
     /// backend manifest because WAL/checkpoint ordering still owns
@@ -1230,33 +1243,27 @@ impl BufferManager {
         Some(buf.clone())
     }
 
-    /// Push pre-snapshotted bytes for `guid` directly to the inner
-    /// backend, bypassing the cache. Used by the I/O worker
-    /// thread, which receives bytes that were snapshotted by the
-    /// orchestrator under a shared read guard.
-    ///
-    /// `expected_seq` is the dirty-map value the checkpointer
-    /// observed when it snapshotted this blob. `snapshot_dirty`
-    /// moves that value into the in-flight flushing set; on a
-    /// successful backend write `write_through` releases that
-    /// flushing protection. A racing writer lands in the fresh
-    /// dirty map and survives unless its value exactly matches a
-    /// real WAL seq `expected_seq` (the snapshot's bytes don't
-    /// include that writer's mutation, so we mustn't claim the blob
-    /// is clean). `STRUCTURAL_SEQ` is intentionally excluded from
-    /// the equality retire path because it is a shared sentinel, not
-    /// a unique mutation sequence.
-    ///
-    /// On failure both the unflushed-snapshot fact and any racing
-    /// writer's entry survive in the dirty map — restoration is
-    /// the caller's responsibility (see `round::run_round`).
-    pub(crate) fn write_through(
-        &self,
-        guid: BlobGuid,
-        bytes: &AlignedBlobBuf,
-        expected_seq: u64,
-    ) -> Result<()> {
-        self.backend.write_blob(guid, bytes)?;
+    /// Push a whole checkpoint snapshot to the inner backend using
+    /// its native batch path, then retire each matching flushing
+    /// entry. On backend error the caller must restore the whole
+    /// dirty snapshot; we intentionally retire nothing because the
+    /// backend contract permits an arbitrary written prefix.
+    pub(crate) fn write_through_batch(&self, entries: &[WriteThroughEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let writes: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.guid, &entry.bytes))
+            .collect();
+        self.backend.write_blobs(&writes)?;
+        for entry in entries {
+            self.retire_write_through(entry.guid, entry.expected_seq);
+        }
+        Ok(())
+    }
+
+    fn retire_write_through(&self, guid: BlobGuid, expected_seq: u64) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if expected_seq != STRUCTURAL_SEQ {
             if let std::collections::hash_map::Entry::Occupied(e) = state.dirty.entry(guid) {
@@ -1272,7 +1279,6 @@ impl BufferManager {
         if matches!(state.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
             state.flushing.remove(&guid);
         }
-        Ok(())
     }
 
     /// Forward `flush` to the inner backend without touching the
@@ -1357,6 +1363,24 @@ impl Backend for BufferManager {
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
         self.decrement_candidate_totals(removed);
+        Ok(())
+    }
+
+    fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        for (guid, src) in writes {
+            if let Some(entry) = self.get_cached(*guid) {
+                let mut buf = entry.write();
+                buf.as_mut_slice().copy_from_slice(src.as_slice());
+            }
+        }
+        self.backend.write_blobs(writes)?;
+        for (guid, _) in writes {
+            let mut state = self.mutation_shard(*guid).lock().unwrap();
+            state.remove_dirty(guid);
+            let removed = state.remove_maintenance_candidates(guid);
+            drop(state);
+            self.decrement_candidate_totals(removed);
+        }
         Ok(())
     }
 
@@ -1784,17 +1808,22 @@ mod tests {
 
         assert!(
             !bm.try_evict_cold(guid),
-            "checkpoint-owned flushing entries must stay cached until write_through",
+            "checkpoint-owned flushing entries must stay cached until write-through",
         );
         let bytes = bm
             .snapshot_bytes(guid)
             .expect("flushing protection must preserve cached bytes");
         assert_eq!(bytes.as_slice()[123], 0xAB);
 
-        bm.write_through(guid, &bytes, 42).unwrap();
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid,
+            bytes,
+            expected_seq: 42,
+        }])
+        .unwrap();
         assert!(
             bm.try_evict_cold(guid),
-            "successful write_through releases flushing protection",
+            "successful write-through releases flushing protection",
         );
     }
 
@@ -1824,10 +1853,10 @@ mod tests {
     fn write_through_keeps_racing_writer_dirty_entry() {
         // Reproduces the dirty-race fix: a checkpointer drains the
         // dirty map at snapshot time (snap_seq=50), then before
-        // `write_through` runs an in-process writer marks the
+        // checkpoint write-through runs an in-process writer marks the
         // same blob dirty with a newer seq (200). The writer's
         // mutation is NOT in our snapshot bytes, so the entry
-        // must survive `write_through`'s clear.
+        // must survive the retire path.
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         inner.write_blob([0xAA; 16], &make_buf(0)).unwrap();
         let bm = BufferManager::new(inner, 4);
@@ -1840,11 +1869,16 @@ mod tests {
 
         // The planner's snap had captured snap_seq=50 (a stale
         // pre-drain value). Pass that through.
-        bm.write_through([0xAA; 16], &snap_bytes, 50).unwrap();
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid: [0xAA; 16],
+            bytes: snap_bytes,
+            expected_seq: 50,
+        }])
+        .unwrap();
         assert_eq!(
             bm.dirty_count(),
             1,
-            "write_through must not stomp a racing newer-seq entry",
+            "write-through must not stomp a racing newer-seq entry",
         );
         let live = bm.snapshot_dirty();
         assert_eq!(live[&[0xAA; 16]], 200, "racing writer's seq survives");
@@ -1864,8 +1898,12 @@ mod tests {
         bm.mark_dirty([0xA5; 16], STRUCTURAL_SEQ);
         let snap_bytes = bm.snapshot_bytes([0xA5; 16]).unwrap();
 
-        bm.write_through([0xA5; 16], &snap_bytes, STRUCTURAL_SEQ)
-            .unwrap();
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid: [0xA5; 16],
+            bytes: snap_bytes,
+            expected_seq: STRUCTURAL_SEQ,
+        }])
+        .unwrap();
         assert_eq!(
             bm.dirty_count(),
             1,
@@ -1879,7 +1917,7 @@ mod tests {
     fn write_through_retires_clean_snapshot() {
         // Counterpart to the race test: when the dirty entry
         // still matches the snapshot's seq (no racing writer),
-        // `write_through` does retire it.
+        // checkpoint write-through does retire it.
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         inner.write_blob([0xBB; 16], &make_buf(0)).unwrap();
         let bm = BufferManager::new(inner, 4);
@@ -1889,8 +1927,79 @@ mod tests {
         let snap_bytes = bm.snapshot_bytes([0xBB; 16]).unwrap();
 
         // expected_seq matches the current entry → safe to retire.
-        bm.write_through([0xBB; 16], &snap_bytes, 42).unwrap();
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid: [0xBB; 16],
+            bytes: snap_bytes,
+            expected_seq: 42,
+        }])
+        .unwrap();
         assert_eq!(bm.dirty_count(), 0);
+    }
+
+    #[test]
+    fn write_through_batch_retires_clean_snapshots() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let g1 = [0xB1; 16];
+        let g2 = [0xB2; 16];
+        inner.write_blob(g1, &make_buf(0)).unwrap();
+        inner.write_blob(g2, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+
+        for (guid, byte) in [(g1, 11), (g2, 22)] {
+            let pin = bm.pin(guid).unwrap();
+            let mut guard = pin.write();
+            guard.as_mut_slice()[100] = byte;
+            bm.mark_dirty(guid, u64::from(byte));
+        }
+
+        let snap = bm.snapshot_dirty();
+        let entries: Vec<_> = snap
+            .iter()
+            .map(|(guid, expected_seq)| WriteThroughEntry {
+                guid: *guid,
+                bytes: bm.snapshot_bytes(*guid).unwrap(),
+                expected_seq: *expected_seq,
+            })
+            .collect();
+        bm.write_through_batch(&entries).unwrap();
+
+        assert_eq!(bm.dirty_count(), 0);
+        let mut dst = AlignedBlobBuf::zeroed();
+        inner.read_blob(g1, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 11);
+        inner.read_blob(g2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 22);
+    }
+
+    #[test]
+    fn write_through_batch_keeps_racing_writer_dirty_entry() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let g1 = [0xC1; 16];
+        let g2 = [0xC2; 16];
+        inner.write_blob(g1, &make_buf(0)).unwrap();
+        inner.write_blob(g2, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _ = bm.pin(g1).unwrap();
+        let _ = bm.pin(g2).unwrap();
+
+        bm.mark_dirty(g1, 50);
+        bm.mark_dirty(g2, 60);
+        let snap = bm.snapshot_dirty();
+        bm.mark_dirty(g1, 200);
+
+        let entries: Vec<_> = snap
+            .iter()
+            .map(|(guid, expected_seq)| WriteThroughEntry {
+                guid: *guid,
+                bytes: bm.snapshot_bytes(*guid).unwrap(),
+                expected_seq: *expected_seq,
+            })
+            .collect();
+        bm.write_through_batch(&entries).unwrap();
+
+        let live = bm.snapshot_dirty();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[&g1], 200);
     }
 
     #[test]
@@ -1964,7 +2073,12 @@ mod tests {
         // backend has the bytes and the dirty entry is cleared.
         let snap = bm.snapshot_dirty();
         let bytes = bm.snapshot_bytes(new_guid).unwrap();
-        bm.write_through(new_guid, &bytes, snap[&new_guid]).unwrap();
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid: new_guid,
+            bytes,
+            expected_seq: snap[&new_guid],
+        }])
+        .unwrap();
         bm.backend_flush().unwrap();
         assert_eq!(bm.dirty_count(), 0);
         assert!(inner.has_blob(new_guid).unwrap());

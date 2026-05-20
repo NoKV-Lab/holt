@@ -62,6 +62,14 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
+    fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        let mut g = self.inner.write().unwrap();
+        for (guid, src) in writes {
+            g.insert(*guid, (*src).clone());
+        }
+        Ok(())
+    }
+
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let mut g = self.inner.write().unwrap();
         g.remove(&guid);

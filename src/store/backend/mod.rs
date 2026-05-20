@@ -55,6 +55,20 @@ pub trait Backend: Send + Sync {
     /// Call [`Backend::flush`] to wait for it to be *durable*.
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()>;
 
+    /// Write a batch of full-blob images.
+    ///
+    /// The default implementation loops over [`Self::write_blob`].
+    /// Backends with a cheaper native batch path should override
+    /// this. The contract is conservative: if this returns `Err`,
+    /// the caller must assume an arbitrary prefix may have reached
+    /// the backend and retry the whole batch later.
+    fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        for (guid, src) in writes {
+            self.write_blob(*guid, src)?;
+        }
+        Ok(())
+    }
+
     /// Delete blob `guid`. No-op if it doesn't exist.
     fn delete_blob(&self, guid: BlobGuid) -> Result<()>;
 

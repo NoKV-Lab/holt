@@ -9,7 +9,7 @@
 //! │   park_timeout(idle_interval)                            │
 //! │     ├─ run_merge_pass                                    │
 //! │     ├─ snapshot_dirty + journal.flush                    │
-//! │     ├─ submit IoTask::Flush per dirty blob               │
+//! │     ├─ submit one IoTask::FlushBatch for dirty blobs     │
 //! │     ├─ wait completions                                  │
 //! │     ├─ submit IoTask::Sync, wait                         │
 //! │     └─ journal.truncate iff dirty_count == 0             │
@@ -151,7 +151,7 @@ pub struct CheckpointConfig {
     /// Default 1024 — roughly "untouched for the last ~1024
     /// `pin`/`get_cached` operations".
     pub eviction_idle_ticks: u64,
-    /// Bounded I/O queue capacity (depth of `Flush` / `Sync`
+    /// Bounded I/O queue capacity (depth of `FlushBatch` / `Sync`
     /// tasks in flight between the planner and the I/O thread).
     /// Bigger = more parallelism head-room for io_uring; smaller
     /// = tighter back-pressure on the planner.
