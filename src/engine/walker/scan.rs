@@ -17,7 +17,7 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{
     BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
+use crate::store::{BlobFrameRef, BufferManager};
 
 use super::cast;
 use super::readers::resolve_typed;
@@ -183,7 +183,7 @@ pub fn refresh_blob_node_pointers(bm: &BufferManager, root_guid: BlobGuid) -> Re
         {
             let parent_pin = bm.pin(parent_guid)?;
             let mut guard = parent_pin.write();
-            let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+            let mut frame = guard.frame();
             for (bn_slot, new_child_entry) in want {
                 let body = frame.body_of_slot(bn_slot).ok_or(Error::node_corrupt(
                     "refresh_blob_node_pointers: body resolution failed",

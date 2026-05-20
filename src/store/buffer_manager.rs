@@ -133,7 +133,7 @@ use dashmap::DashMap;
 
 use crate::api::errors::Result;
 use crate::concurrency::{Guard as LatchGuard, HybridLatch};
-use crate::layout::BlobGuid;
+use crate::layout::{BlobGuid, MAX_SLOTS};
 
 use super::backend::{AlignedBlobBuf, Backend};
 
@@ -211,6 +211,27 @@ pub struct CachedBlob {
     /// cold enough to drop. Relaxed reads/writes — see
     /// [`BufferManager::clock`].
     last_touched: AtomicU64,
+    /// Per-slot version counters, indexed `[slot - 1]` (1-based
+    /// slot indices in the layout, 0-based in this array). Bumped
+    /// on every slot mutation routed through [`crate::store::BlobFrame`]
+    /// — `alloc_node`, `free_node`, and body-rewrite via
+    /// `write_struct_to_slot`. Sized to `MAX_SLOTS` (= 10240) so
+    /// every possible slot index has its own counter; ~80 KB per
+    /// blob (10240 × `AtomicU64`).
+    ///
+    /// **Phase 1 status (current):** bumps are emitted on the
+    /// writer side but not yet consulted on the reader side. The
+    /// walker still uses blob-level [`HybridLatch`] for all
+    /// concurrency. Phases 2-3 will introduce per-slot optimistic
+    /// reads + cross-blob lock-coupling using these counters as
+    /// the re-acquire tokens (walker releases parent latch before
+    /// descending into a child blob; re-validates the parent's
+    /// slot counter on the way back up).
+    ///
+    /// Default 64-blob pool → ~5.2 MB total for these counters,
+    /// 128-blob pool → ~10.4 MB. Acceptable for the concurrency
+    /// gains they unlock.
+    slot_versions: Box<[AtomicU64]>,
 }
 
 // SAFETY: every access to `buf` is gated by `latch`, which provides
@@ -222,10 +243,17 @@ unsafe impl Sync for CachedBlob {}
 
 impl CachedBlob {
     fn new(buf: AlignedBlobBuf) -> Self {
+        // 10240 AtomicU64s = 80 KB. Allocated once per CachedBlob;
+        // amortised across the blob's lifetime in the cache.
+        let slot_versions = (0..MAX_SLOTS as usize)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             latch: HybridLatch::new(),
             buf: UnsafeCell::new(buf),
             last_touched: AtomicU64::new(0),
+            slot_versions,
         }
     }
 
@@ -234,6 +262,31 @@ impl CachedBlob {
     #[must_use]
     pub(crate) fn last_touched(&self) -> u64 {
         self.last_touched.load(Ordering::Relaxed)
+    }
+
+    /// Acquire-load the current per-slot version counter for the
+    /// given 1-based slot index. Returns 0 for `slot == 0` or any
+    /// out-of-range index.
+    ///
+    /// Pairs with the Release-store performed by
+    /// [`crate::store::BlobFrame::bump_slot_version`] inside the walker's
+    /// mutation paths. Consumers capture a version before a
+    /// latch-free read of the slot, then re-load after the read
+    /// completes — a mismatch means a writer landed in between
+    /// and the caller must restart.
+    ///
+    /// Phase 1 (current): only consumers are tests. Phases 2-3
+    /// of the per-node-latch milestone wire this into the walker's
+    /// cross-blob descent paths.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn slot_version(&self, slot: u16) -> u64 {
+        if slot == 0 {
+            return 0;
+        }
+        self.slot_versions
+            .get((slot as usize) - 1)
+            .map_or(0, |av| av.load(Ordering::Acquire))
     }
 
     /// Wait-free read snapshot. No real lock taken — the caller
@@ -264,6 +317,7 @@ impl CachedBlob {
         BlobWriteGuard {
             _latch: LatchGuard::exclusive(&self.latch),
             buf: &self.buf,
+            slot_versions: &self.slot_versions,
         }
     }
 }
@@ -323,10 +377,35 @@ impl Deref for BlobReadGuard<'_> {
 /// Exclusive-mode write guard returned by [`CachedBlob::write`].
 ///
 /// Derefs to `&mut AlignedBlobBuf`; call `.as_mut_slice()` for
-/// byte-level access.
+/// byte-level access. For walker paths that mutate the typed
+/// [`crate::store::BlobFrame`] view, prefer [`Self::frame`] over
+/// `BlobFrame::wrap(guard.as_mut_slice())` — the frame
+/// constructed via `frame()` is wired to the owning blob's
+/// per-slot version counters, so mutations through it bump those
+/// counters (the foundation for cross-blob lock-coupling in
+/// Phases 2-3 of the per-node-latch milestone).
 pub struct BlobWriteGuard<'a> {
     _latch: LatchGuard<'a>,
     buf: &'a UnsafeCell<AlignedBlobBuf>,
+    /// Reference to the owning blob's per-slot version counters,
+    /// threaded through from [`CachedBlob::write`]. Used by
+    /// [`Self::frame`] to construct a version-tracking
+    /// `BlobFrame`.
+    slot_versions: &'a [AtomicU64],
+}
+
+impl BlobWriteGuard<'_> {
+    /// Construct a version-tracking [`crate::store::BlobFrame`] view over this
+    /// guard's buffer. Equivalent to
+    /// `BlobFrame::wrap_versioned(self.as_mut_slice(), <slot_versions>)`
+    /// — every slot mutation routed through the returned frame
+    /// (alloc / free / `write_struct_to_slot`) bumps the
+    /// corresponding per-slot version counter on the owning
+    /// `CachedBlob`.
+    pub fn frame(&mut self) -> super::BlobFrame<'_> {
+        let svs = self.slot_versions;
+        super::BlobFrame::wrap_versioned(self.as_mut_slice(), svs)
+    }
 }
 
 impl Deref for BlobWriteGuard<'_> {
@@ -1475,6 +1554,89 @@ mod tests {
         let mut dst = AlignedBlobBuf::zeroed();
         inner.read_blob(new_guid, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[200], 0x77);
+    }
+
+    /// Phase 1 of the per-node-latch milestone: writes routed
+    /// through a versioned `BlobFrame` (via
+    /// `BlobWriteGuard::frame()`) must bump the owning
+    /// `CachedBlob`'s per-slot version counter so observers can
+    /// detect the mutation across latch releases.
+    ///
+    /// This test isolates the contract end-to-end without going
+    /// through the walker: install a fresh blob, take a write
+    /// guard, do one `alloc_node`, release the guard, then check
+    /// that `CachedBlob::slot_version(newly_allocated_slot)`
+    /// changed from 0 to something > 0.
+    #[test]
+    fn slot_version_bumps_on_versioned_frame_mutation() {
+        use crate::layout::{BlobGuid, NodeType, PAGE_SIZE};
+        use crate::store::BlobFrame;
+
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let bm = BufferManager::new(Arc::clone(&inner), 4);
+
+        // Format a fresh blob buffer (init seeds the EmptyRoot
+        // sentinel at slot 1).
+        let guid: BlobGuid = [0xCC; 16];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        {
+            let _ = BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+        }
+        bm.install_new_blob(guid, bytes, /*seq=*/ 1);
+
+        // Pin + write guard.
+        let pin = bm.pin(guid).unwrap();
+
+        // Before the alloc, the to-be-allocated slot's version is
+        // 0 (no mutation yet). After `init` ran above on a raw
+        // `&mut [u8]` (not a versioned frame), slot 1's counter
+        // is also 0 — the EmptyRoot sentinel's bump went to the
+        // None branch.
+        assert_eq!(
+            pin.slot_version(2),
+            0,
+            "slot 2 should be unallocated → version 0"
+        );
+
+        // Run one alloc through a versioned frame (= what the
+        // walker does once `BlobWriteGuard::frame()` is on the
+        // hot path).
+        let allocated_slot = {
+            let mut guard = pin.write();
+            let mut frame = guard.frame();
+            frame.alloc_node(NodeType::Node4).unwrap().slot
+        };
+
+        assert_eq!(
+            allocated_slot, 2,
+            "first alloc after init should land at slot 2"
+        );
+
+        // The bump landed on slot 2's counter.
+        assert!(
+            pin.slot_version(2) > 0,
+            "alloc_node through versioned frame should bump slot version"
+        );
+
+        // Untouched slots stay at 0.
+        assert_eq!(
+            pin.slot_version(3),
+            0,
+            "neighbour slots must not have spurious bumps"
+        );
+
+        // Sanity: out-of-range / zero slot indices stay at 0.
+        assert_eq!(pin.slot_version(0), 0);
+        assert_eq!(pin.slot_version(u16::MAX), 0);
+
+        // Ensure the install_new_blob seeding stays clean for the
+        // rest of the test suite.
+        drop(pin);
+        bm.commit(guid).unwrap();
+        assert!(inner.has_blob(guid).unwrap());
+        // The freshly-formatted blob is one PAGE_SIZE of bytes
+        // — just confirm we didn't accidentally truncate.
+        assert_eq!(PAGE_SIZE as usize, 524_288);
     }
 
     #[test]

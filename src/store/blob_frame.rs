@@ -11,6 +11,8 @@
 //! All operations enforce the on-disk invariants: 8-byte body
 //! alignment, MAX_SLOTS cap, and slot-entry bit-packing.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::layout::{
     size_of_node, BlobGuid, BlobHeader, NodeType, SlotEntry, SlotEntryRaw, DATA_AREA_START,
     HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
@@ -186,25 +188,108 @@ impl<'a> BlobFrameRef<'a> {
 /// For read-only access (e.g. walker `lookup` against a
 /// `RwLock`-guarded `BufferManager` blob), use [`BlobFrameRef`]
 /// instead — it wraps `&[u8]` and is `Copy`.
+///
+/// # Slot version tracking
+///
+/// Two constructors:
+///
+/// - [`Self::wrap`] — no version tracking. Used by init paths
+///   (a fresh blob being constructed before it's installed in
+///   the cache) and tests.
+/// - [`Self::wrap_versioned`] — wires up the owning
+///   [`crate::store::CachedBlob`]'s per-slot version counters; every
+///   slot mutation (alloc / free / body rewrite via
+///   `write_struct_to_slot`) bumps the corresponding counter
+///   with `Release` ordering. The walker's write paths construct
+///   this variant via [`crate::store::BlobWriteGuard::frame`] so observers
+///   reading the slot after the latch release can detect the
+///   mutation. Foundation for cross-blob lock-coupling (queued
+///   Phases 2-3 of the per-node-latch milestone).
 pub struct BlobFrame<'a> {
     /// Backing buffer (must be exactly `PAGE_SIZE` bytes).
     buf: &'a mut [u8],
+    /// Per-slot version counters from the owning [`crate::store::CachedBlob`],
+    /// or `None` for init / local-buf paths that don't yet have
+    /// a cache entry. When `Some`, every slot mutation routed
+    /// through this frame bumps the corresponding counter.
+    slot_versions: Option<&'a [AtomicU64]>,
 }
 
 impl<'a> BlobFrame<'a> {
-    /// Wrap an existing buffer that's already been formatted.
+    /// Wrap an existing buffer that's already been formatted —
+    /// **without** per-slot version tracking.
+    ///
+    /// Use for init paths (fresh blob being constructed before
+    /// it's installed in the cache) and for tests / ad-hoc
+    /// callers that don't need observers to detect mutations
+    /// across latch releases.
     ///
     /// Caller asserts that `buf` was previously initialized via
     /// `init` (or loaded from disk in the same format). No
-    /// validation is done — use `wrap_validated` to also run a
-    /// sanity check on the header.
+    /// validation is done.
     pub fn wrap(buf: &'a mut [u8]) -> Self {
         assert_eq!(
             buf.len(),
             PAGE_SIZE as usize,
             "BlobFrame requires PAGE_SIZE buffer"
         );
-        Self { buf }
+        Self {
+            buf,
+            slot_versions: None,
+        }
+    }
+
+    /// Wrap an existing buffer **with** per-slot version tracking.
+    ///
+    /// `slot_versions` is the owning [`crate::store::CachedBlob`]'s
+    /// per-slot counter array — typically obtained via
+    /// [`crate::store::BlobWriteGuard::frame`] which pulls the slice off
+    /// the cached blob and pairs it with the write guard's mutable
+    /// buffer in one call.
+    ///
+    /// Every subsequent slot mutation through this frame bumps the
+    /// corresponding counter with `Release` ordering. The bump
+    /// happens **after** the mutation completes, so any observer
+    /// that performs an `Acquire` load of the counter and then
+    /// reads the slot's body either sees both the old body + old
+    /// counter or both the new body + new counter — the bumps act
+    /// as the read-after-validate fence for optimistic
+    /// concurrency.
+    pub fn wrap_versioned(buf: &'a mut [u8], slot_versions: &'a [AtomicU64]) -> Self {
+        assert_eq!(
+            buf.len(),
+            PAGE_SIZE as usize,
+            "BlobFrame requires PAGE_SIZE buffer"
+        );
+        Self {
+            buf,
+            slot_versions: Some(slot_versions),
+        }
+    }
+
+    /// Bump the per-slot version counter for the given 1-based
+    /// slot index. No-op if this frame was constructed via
+    /// [`Self::wrap`] (no version tracking) or if the slot index
+    /// is out of range.
+    ///
+    /// Uses `Release` ordering so the bump is ordered after any
+    /// prior writes to the slot's body, matching the `Acquire`
+    /// load on the observer side.
+    ///
+    /// Called from the centralised slot-write paths (this module's
+    /// `alloc_node` / `free_node`; the walker's
+    /// `writers::write_struct_to_slot`); usually the caller
+    /// doesn't invoke this directly.
+    pub(crate) fn bump_slot_version(&self, slot: u16) {
+        let Some(svs) = self.slot_versions else {
+            return;
+        };
+        if slot == 0 {
+            return;
+        }
+        if let Some(av) = svs.get((slot as usize) - 1) {
+            av.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Cheap conversion to a read-only [`BlobFrameRef`]. Useful
@@ -229,7 +314,10 @@ impl<'a> BlobFrame<'a> {
         for b in buf.iter_mut() {
             *b = 0;
         }
-        let mut frame = Self { buf };
+        let mut frame = Self {
+            buf,
+            slot_versions: None,
+        };
         // Seed the header.
         {
             let h = frame.header_mut();
@@ -333,7 +421,18 @@ impl<'a> BlobFrame<'a> {
     /// several `Prefix` nodes (also 128 B). Letting `alloc(Blob)`
     /// reuse those slot bodies makes spillover succeed without
     /// extending the bump cursor.
+    ///
+    /// On success, the allocated slot's per-slot version counter
+    /// is bumped (see [`Self::wrap_versioned`]). The bump signals
+    /// "this slot's identity changed" — important for observers
+    /// who captured a version before the latch was acquired.
     pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
+        let outcome = self.alloc_node_inner(ntype)?;
+        self.bump_slot_version(outcome.slot);
+        Ok(outcome)
+    }
+
+    fn alloc_node_inner(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
         if ntype == NodeType::Invalid {
             return Err(AllocError::InvalidRequest);
         }
@@ -417,7 +516,18 @@ impl<'a> BlobFrame<'a> {
     /// Push a slot onto its NodeType's free list. The body bytes
     /// remain in place (they'll be overwritten on the next alloc
     /// that reuses this slot).
+    ///
+    /// On success, the freed slot's per-slot version counter is
+    /// bumped (see [`Self::wrap_versioned`]) — observers who
+    /// captured a version before the latch was acquired will see
+    /// the mismatch on re-validate.
     pub fn free_node(&mut self, slot: u16) -> Result<(), FreeError> {
+        self.free_node_inner(slot)?;
+        self.bump_slot_version(slot);
+        Ok(())
+    }
+
+    fn free_node_inner(&mut self, slot: u16) -> Result<(), FreeError> {
         let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
         let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
             slot,

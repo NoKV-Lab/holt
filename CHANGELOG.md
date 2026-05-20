@@ -119,6 +119,47 @@ same change applied inside the batch-path rename arm of
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
 
+### Infrastructure — per-node-latch milestone, Phase 1
+
+Lays the data-structure groundwork for cross-blob lock-coupling
+(the path to closing the remaining `fs_put` 2 M structural gap
+vs RocksDB; cf. `benches/RESULTS.md`). **No user-visible behavior
+change in Phase 1** — the walker still uses blob-level latches
+for all concurrency. Phases 2-5 (queued for follow-up sessions
+within this v0.3 cycle) will refactor the walker descent to
+release parent latches before child blobs, using these counters
+as the cross-blob re-acquire tokens.
+
+Concretely:
+
+- `CachedBlob` gains a `slot_versions: Box<[AtomicU64; MAX_SLOTS]>`
+  field — one `AtomicU64` per 1-based slot index. 10240 × 8 bytes
+  = **~80 KB per blob**; with the default 64-blob buffer pool
+  that's +5.2 MB resident, +10.4 MB at the 128-blob default
+  upper end. Acceptable for the concurrency gains the counters
+  unlock.
+- New `BlobFrame::wrap_versioned(buf, slot_versions)` constructor
+  + private `bump_slot_version(slot)` helper. The existing
+  `BlobFrame::wrap(buf)` keeps its no-version semantics for init /
+  local-buf / test paths.
+- `BlobWriteGuard::frame()` is the writer-side convenience that
+  pairs `as_mut_slice()` with the owning `CachedBlob`'s
+  `slot_versions` in one call.
+- Walker write paths migrate from
+  `BlobFrame::wrap(guard.as_mut_slice())` to `guard.frame()` —
+  ~20 call sites across `insert.rs` / `erase.rs` / `migrate.rs` /
+  `scan.rs`.
+- `BlobFrame::alloc_node` / `free_node` and walker
+  `write_struct_to_slot` bump the relevant slot's counter
+  (Release ordering) after every body mutation. Counters start
+  at 0; bumps are monotonic across the blob's lifetime in the
+  cache.
+- `CachedBlob::slot_version(slot)` reader (Acquire load) ready
+  for Phase 2-3 consumers. Phase 1 only consumer is the
+  contract test
+  (`slot_version_bumps_on_versioned_frame_mutation` in
+  `src/store/buffer_manager.rs::tests`).
+
 ## [0.3.0] — 2026-05-20
 
 ### Breaking — API redesign (split returning from blind)

@@ -241,7 +241,7 @@ pub fn merge_blob(
     let new_subtree_root = {
         let child_pin = bm.pin(child_guid)?;
         let mut child_guard = child_pin.write();
-        let child_frame = BlobFrame::wrap(child_guard.as_mut_slice());
+        let child_frame = child_guard.frame();
         clone_subtree(&child_frame, parent_frame, child_entry_ptr, false)?
             .expect("preserve mode never returns None")
     };

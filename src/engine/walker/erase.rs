@@ -75,17 +75,17 @@ pub fn erase_multi(
     let mut guard = root_pin.write();
 
     let r = {
-        let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+        let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
         erase_at(Some(bm), &mut frame, root_slot, key, 0, seq, wants_prev)?
     };
     let new_root = {
-        let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+        let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
         resolve_new_root_after_erase(&mut frame, root_slot, &r.signal)?
     };
     {
-        let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+        let mut frame = guard.frame();
         frame.header_mut().root_slot = new_root;
     }
     Ok(EraseOutcome {
@@ -532,12 +532,20 @@ fn erase_at_blob_node(
 
     let r = {
         let mut guard = child_pin.write();
-        let mut cf = BlobFrame::wrap(guard.as_mut_slice());
+        let mut cf = guard.frame();
         // Errors propagating up are about something the recursive
         // descent found inside `child_guid`'s frame; tag them so
         // logs / panics carry actionable blob context.
-        erase_at(Some(bm), &mut cf, child_entry, key, child_depth, seq, wants_prev)
-            .map_err(|e| e.with_blob_guid(child_guid))?
+        erase_at(
+            Some(bm),
+            &mut cf,
+            child_entry,
+            key,
+            child_depth,
+            seq,
+            wants_prev,
+        )
+        .map_err(|e| e.with_blob_guid(child_guid))?
     };
 
     // Mark the child blob dirty when the descent actually mutated
@@ -570,7 +578,7 @@ fn erase_at_blob_node(
         EraseSignal::Replaced(new_entry) => {
             {
                 let mut guard = child_pin.write();
-                let mut cf = BlobFrame::wrap(guard.as_mut_slice());
+                let mut cf = guard.frame();
                 cf.header_mut().root_slot = new_entry;
             }
             let mut new_bn = bn;

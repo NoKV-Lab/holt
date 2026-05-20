@@ -112,14 +112,23 @@ pub fn insert_multi(
     // `insert_at_blob_node`.
     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
         let r = {
-            let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+            let mut frame = guard.frame();
             let root_slot = frame.header().root_slot;
-            insert_at(Some(bm), &mut frame, root_slot, key, value, 0, seq, wants_prev)
+            insert_at(
+                Some(bm),
+                &mut frame,
+                root_slot,
+                key,
+                value,
+                0,
+                seq,
+                wants_prev,
+            )
         };
         match r {
             Ok(out) => {
                 {
-                    let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+                    let mut frame = guard.frame();
                     frame.header_mut().root_slot = out.slot_after;
                 }
                 return Ok(InsertOutcome {
@@ -129,7 +138,7 @@ pub fn insert_multi(
             }
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                 {
-                    let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+                    let mut frame = guard.frame();
                     spillover_blob(bm, &mut frame, seq)?;
                 }
                 compact_blob(&mut guard)?;
@@ -162,9 +171,7 @@ pub(super) fn insert_at(
         )),
         NodeType::EmptyRoot => insert_into_empty_root(frame, slot, key, value, seq),
         NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev),
-        NodeType::Prefix => {
-            insert_into_prefix(bm, frame, slot, key, value, depth, seq, wants_prev)
-        }
+        NodeType::Prefix => insert_into_prefix(bm, frame, slot, key, value, depth, seq, wants_prev),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
             insert_into_inner(bm, frame, slot, ntype, key, value, depth, seq, wants_prev)
         }
@@ -237,8 +244,7 @@ fn insert_into_leaf(
         };
         let key_off = existing_leaf.key_offset;
         let key_len_u32 = new_key.len() as u32;
-        let old_extent_size =
-            leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
+        let old_extent_size = leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
         let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
 
         if new_extent_size <= old_extent_size {
@@ -344,7 +350,16 @@ fn insert_into_prefix(
     let common = longest_common(prefix_bytes, key_tail);
 
     if common == plen {
-        let r = insert_at(bm, frame, child_slot, key, value, depth + plen, seq, wants_prev)?;
+        let r = insert_at(
+            bm,
+            frame,
+            child_slot,
+            key,
+            value,
+            depth + plen,
+            seq,
+            wants_prev,
+        )?;
         if r.slot_after != child_slot {
             set_prefix_child(frame, pfx_slot, u32::from(r.slot_after))?;
         }
@@ -412,7 +427,16 @@ fn insert_into_inner(
     let byte = key[depth];
 
     if let Some(child_slot) = inner_find_child(frame, inner_slot, ntype, byte)? {
-        let r = insert_at(bm, frame, child_slot, key, value, depth + 1, seq, wants_prev)?;
+        let r = insert_at(
+            bm,
+            frame,
+            child_slot,
+            key,
+            value,
+            depth + 1,
+            seq,
+            wants_prev,
+        )?;
         if r.slot_after != child_slot {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(r.slot_after))?;
         }
@@ -492,7 +516,7 @@ fn insert_at_blob_node(
         for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
             let r = {
                 let mut guard = child_pin.write();
-                let mut cf = BlobFrame::wrap(guard.as_mut_slice());
+                let mut cf = guard.frame();
                 insert_at(
                     Some(bm),
                     &mut cf,
@@ -512,7 +536,7 @@ fn insert_at_blob_node(
                 Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                     {
                         let mut guard = child_pin.write();
-                        let mut cf = BlobFrame::wrap(guard.as_mut_slice());
+                        let mut cf = guard.frame();
                         spillover_blob(bm, &mut cf, seq)
                             .map_err(|e| e.with_blob_guid(child_guid))?;
                     }
@@ -560,7 +584,7 @@ fn insert_at_blob_node(
     // future `make_blob_from_node` migrating *out* of it.
     {
         let mut guard = child_pin.write();
-        let mut cf = BlobFrame::wrap(guard.as_mut_slice());
+        let mut cf = guard.frame();
         cf.header_mut().root_slot = child_result.slot_after;
     }
 
