@@ -183,10 +183,12 @@ its corresponding WAL record already buffered, because both
 `wal.lock`. This is the W2D-strict invariant: every backend
 mutation is preceded by a durable WAL record describing it.
 
-Concurrent writers serialise on `wal.lock`. That's the intentional
-barrier. Cross-blob lock-coupling — letting writers on disjoint
-child blobs release the root early — is deferred to v0.3, paired
-with the per-node latch milestone.
+Concurrent writers serialise on `wal.lock`. That's the current
+barrier, not the end state. The v0.3 performance track replaces
+the coarse write shape with slot-versioned cross-blob
+lock-coupling and a journal worker / group-commit pipeline, so
+writers on disjoint child blobs do not keep an ancestor guard or
+the WAL mutex for the full mutation.
 
 `Tree::rename` takes a separate `Mutex<()>` `rename_lock` around
 its multi-step `lookup → erase → insert` so other renames see it
@@ -284,8 +286,9 @@ shutdown doesn't get lost.
 
 `Tree::compact` is currently documented **NOT online-safe** —
 running concurrently with reads or writes can torn-read across
-`BlobNode` crossings. The v0.3 maintenance latch will lift this
-restriction.
+`BlobNode` crossings. The v0.3 performance track moves this
+toward incremental online maintenance guarded by structure
+versions, not a stop-the-world compact pass.
 
 ## 7. Range iteration
 

@@ -10,7 +10,7 @@ use crate::store::{BlobFrame, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{
-    ntype_of, read_leaf_key_only, read_node16, read_node256, read_node4, read_node48, read_prefix,
+    ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
 use super::types::{EraseOutcome, EraseReturn, EraseSignal};
 use super::writers::{
@@ -173,14 +173,17 @@ fn erase_at_leaf(
     // (`Tree::remove`) actually asks for it — `Tree::delete` (blind)
     // sets `wants_prev = false` and saves the leaf-extent value
     // clone per op.
-    let (existing_key, leaf) = read_leaf_key_only(frame.as_ref(), leaf_slot)?;
-    if existing_key != key {
-        return Ok(EraseReturn {
-            signal: EraseSignal::Unchanged,
-            mutated: false,
-            previous: None,
-        });
-    }
+    let leaf = {
+        let (existing_key, leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
+        if existing_key != key {
+            return Ok(EraseReturn {
+                signal: EraseSignal::Unchanged,
+                mutated: false,
+                previous: None,
+            });
+        }
+        leaf
+    };
     if leaf.tombstone != 0 {
         // Already soft-deleted — replay-idempotent.
         return Ok(EraseReturn {

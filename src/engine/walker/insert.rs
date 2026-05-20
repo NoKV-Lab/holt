@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
-use super::readers::{longest_common, ntype_of, read_leaf_key_only, read_prefix};
+use super::readers::{longest_common, ntype_of, read_leaf_key_ref, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertOutcome, InsertReturn};
 use super::writers::{
@@ -208,100 +208,124 @@ fn insert_into_leaf(
     seq: u64,
     wants_prev: bool,
 ) -> Result<InsertReturn> {
+    enum LeafInsertPlan {
+        SameKey(Leaf),
+        Split {
+            common_prefix: Vec<u8>,
+            byte_existing: u8,
+            byte_new: u8,
+        },
+    }
+
     // Always read the existing key (needed for both same-key
-    // update and divergence-split paths). Only read + clone the
-    // existing value when (a) we're on the same-key update path
-    // AND (b) the caller (`Tree::insert`) actually wants it back.
-    // `Tree::put` (blind) sets `wants_prev = false` and skips
-    // the leaf-extent value clone entirely.
-    let (existing_key, existing_leaf) = read_leaf_key_only(frame.as_ref(), leaf_slot)?;
-
-    if existing_key == new_key {
-        // Same-key update path (covers two semantic cases via the
-        // same alloc machinery):
-        //
-        // 1. **Resurrect**: the existing leaf is tombstoned — the
-        //    user just put the key back after deleting it. From
-        //    the user's view this is a fresh insert (`previous`
-        //    is `None`) and the blob's `tombstone_leaf_cnt` drops
-        //    by one because the slot leaves the tombstone state.
-        // 2. **Update**: the existing leaf is live — return the
-        //    prior value and overwrite (in place when extents fit;
-        //    fall back to alloc-fresh + free-old when the value
-        //    grew past the existing extent).
-        //
-        // `Leaf::live` always pins `tombstone = 0` so both write
-        // paths naturally clear the bit in the new leaf body.
-        let was_tombstoned = existing_leaf.tombstone != 0;
-        // Only materialise the prev value on the returning API
-        // (`Tree::insert`). The blind `Tree::put` path skips the
-        // `leaf_extent` walk + `.to_vec()` entirely.
-        let prev = if wants_prev && !was_tombstoned {
-            let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &existing_leaf)?;
-            Some(v.to_vec())
+    // update and divergence-split paths), but keep it borrowed
+    // from the blob. Only the split path materialises the shared
+    // prefix bytes because subsequent writes mutate the frame.
+    let plan = {
+        let (existing_key, existing_leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
+        if existing_key == new_key {
+            LeafInsertPlan::SameKey(existing_leaf)
         } else {
-            None
-        };
-        let key_off = existing_leaf.key_offset;
-        let key_len_u32 = new_key.len() as u32;
-        let old_extent_size = leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
-        let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
+            let suffix_a = &existing_key[depth..];
+            let suffix_b = &new_key[depth..];
+            let common_len = longest_common(suffix_a, suffix_b);
 
-        if new_extent_size <= old_extent_size {
-            let value_offset = key_off + 2 + key_len_u32;
-            let value_room = old_extent_size - 2 - key_len_u32;
-            let region =
-                frame
-                    .bytes_at_mut(value_offset, value_room)
-                    .ok_or(Error::node_corrupt(
-                        "insert_into_leaf: extent value range out of bounds",
-                    ))?;
-            region[..new_value.len()].copy_from_slice(new_value);
-            for b in &mut region[new_value.len()..] {
-                *b = 0;
+            if common_len == suffix_a.len() || common_len == suffix_b.len() {
+                return Err(Error::NotYetImplemented(
+                    "walker::insert_into_leaf: one key is a strict prefix of the other",
+                ));
             }
-            let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
-            write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+
+            LeafInsertPlan::Split {
+                common_prefix: suffix_a[..common_len].to_vec(),
+                byte_existing: suffix_a[common_len],
+                byte_new: suffix_b[common_len],
+            }
+        }
+    };
+
+    let (common_prefix, byte_existing, byte_new) = match plan {
+        LeafInsertPlan::SameKey(existing_leaf) => {
+            // Same-key update path (covers two semantic cases via the
+            // same alloc machinery):
+            //
+            // 1. **Resurrect**: the existing leaf is tombstoned — the
+            //    user just put the key back after deleting it. From
+            //    the user's view this is a fresh insert (`previous`
+            //    is `None`) and the blob's `tombstone_leaf_cnt` drops
+            //    by one because the slot leaves the tombstone state.
+            // 2. **Update**: the existing leaf is live — return the
+            //    prior value and overwrite (in place when extents fit;
+            //    fall back to alloc-fresh + free-old when the value
+            //    grew past the existing extent).
+            //
+            // `Leaf::live` always pins `tombstone = 0` so both write
+            // paths naturally clear the bit in the new leaf body.
+            let was_tombstoned = existing_leaf.tombstone != 0;
+            // Only materialise the prev value on the returning API
+            // (`Tree::insert`). The blind `Tree::put` path skips the
+            // `leaf_extent` walk + `.to_vec()` entirely.
+            let prev = if wants_prev && !was_tombstoned {
+                let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &existing_leaf)?;
+                Some(v.to_vec())
+            } else {
+                None
+            };
+            let key_off = existing_leaf.key_offset;
+            let key_len_u32 = new_key.len() as u32;
+            let old_extent_size =
+                leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
+            let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
+
+            if new_extent_size <= old_extent_size {
+                let value_offset = key_off + 2 + key_len_u32;
+                let value_room = old_extent_size - 2 - key_len_u32;
+                let region =
+                    frame
+                        .bytes_at_mut(value_offset, value_room)
+                        .ok_or(Error::node_corrupt(
+                            "insert_into_leaf: extent value range out of bounds",
+                        ))?;
+                region[..new_value.len()].copy_from_slice(new_value);
+                for b in &mut region[new_value.len()..] {
+                    *b = 0;
+                }
+                let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
+                write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+                if was_tombstoned {
+                    let h = frame.header_mut();
+                    h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
+                }
+                return Ok(InsertReturn {
+                    slot_after: leaf_slot,
+                    previous: prev,
+                });
+            }
+
+            // Value grew past the existing extent — fall back to alloc-
+            // fresh + free-old. The old extent bytes leak until
+            // `compact_blob` reclaims; the old leaf slot returns to its
+            // per-NodeType free list.
+            let new_slot = write_leaf(frame, new_key, new_value, seq)?;
+            frame.free_node(leaf_slot)?;
             if was_tombstoned {
                 let h = frame.header_mut();
                 h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
             }
             return Ok(InsertReturn {
-                slot_after: leaf_slot,
+                slot_after: new_slot,
                 previous: prev,
             });
         }
-
-        // Value grew past the existing extent — fall back to alloc-
-        // fresh + free-old. The old extent bytes leak until
-        // `compact_blob` reclaims; the old leaf slot returns to its
-        // per-NodeType free list.
-        let new_slot = write_leaf(frame, new_key, new_value, seq)?;
-        frame.free_node(leaf_slot)?;
-        if was_tombstoned {
-            let h = frame.header_mut();
-            h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
-        }
-        return Ok(InsertReturn {
-            slot_after: new_slot,
-            previous: prev,
-        });
-    }
+        LeafInsertPlan::Split {
+            common_prefix,
+            byte_existing,
+            byte_new,
+        } => (common_prefix, byte_existing, byte_new),
+    };
 
     // Two different keys: split into [Prefix?] -> Node4 -> {old leaf, new leaf}.
-    let suffix_a = &existing_key[depth..];
-    let suffix_b = &new_key[depth..];
-    let common_len = longest_common(suffix_a, suffix_b);
-
-    if common_len == suffix_a.len() || common_len == suffix_b.len() {
-        return Err(Error::NotYetImplemented(
-            "walker::insert_into_leaf: one key is a strict prefix of the other",
-        ));
-    }
-
     let new_leaf = write_leaf(frame, new_key, new_value, seq)?;
-    let byte_existing = suffix_a[common_len];
-    let byte_new = suffix_b[common_len];
     let n4 = write_node4_with(
         frame,
         &[
@@ -310,10 +334,10 @@ fn insert_into_leaf(
         ],
     )?;
 
-    let final_slot = if common_len == 0 {
+    let final_slot = if common_prefix.is_empty() {
         n4
     } else {
-        write_prefix_chain(frame, &suffix_a[..common_len], n4)?
+        write_prefix_chain(frame, &common_prefix, n4)?
     };
 
     Ok(InsertReturn {

@@ -26,12 +26,13 @@
 use std::sync::Arc;
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobGuid, BlobNode, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
+use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{
-    ntype_of, read_leaf_kv, read_node16, read_node256, read_node4, read_node48, read_prefix,
+    leaf_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48,
+    read_prefix,
 };
 use crate::engine::simd;
 
@@ -178,6 +179,48 @@ struct Frame {
     pushed_bytes: u16,
 }
 
+#[derive(Clone, Copy)]
+struct InlinePrefix {
+    bytes: [u8; PREFIX_MAX_INLINE],
+    len: u16,
+}
+
+impl InlinePrefix {
+    #[inline]
+    fn from_slice(src: &[u8]) -> Self {
+        debug_assert!(src.len() <= PREFIX_MAX_INLINE);
+        let mut bytes = [0; PREFIX_MAX_INLINE];
+        bytes[..src.len()].copy_from_slice(src);
+        Self {
+            bytes,
+            len: src.len() as u16,
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+fn read_range_leaf_kv(frame: BlobFrameRef<'_>, slot: u16) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let body = frame
+        .body_of_slot(slot)
+        .ok_or(Error::node_corrupt("read_range_leaf_kv: body"))?;
+    let leaf = *cast::<Leaf>(body);
+    if leaf.tombstone != 0 {
+        return Ok(None);
+    }
+
+    let (stored_key, value) = leaf_extent(frame, &leaf)?;
+    let user_key = if stored_key.last() == Some(&0) {
+        &stored_key[..stored_key.len() - 1]
+    } else {
+        stored_key
+    };
+    Ok(Some((user_key.to_vec(), value.to_vec())))
+}
+
 impl Iterator for RangeIter {
     type Item = Result<RangeEntry>;
 
@@ -206,15 +249,7 @@ impl Iterator for RangeIter {
                     self.terminated = true;
                     return Some(Err(e));
                 }
-                Ok(Some((stored_key, value))) => {
-                    // Strip the engine terminator (always present on
-                    // leaves the public API writes).
-                    let user_key: Vec<u8> = if stored_key.last() == Some(&0) {
-                        stored_key[..stored_key.len() - 1].to_vec()
-                    } else {
-                        stored_key
-                    };
-
+                Ok(Some((user_key, value))) => {
                     // Defensive: the anchor descent guarantees this,
                     // but a concurrent rename could in principle
                     // surface a key outside our prefix; drop it.
@@ -321,18 +356,19 @@ impl RangeIter {
                     // Leaf reached mid-prefix: check if its full
                     // key satisfies the user prefix; if yes, anchor
                     // here, else empty result.
-                    let (stored_key, _v) = {
+                    let matches_prefix = {
                         let top = self.stack.last().unwrap();
                         let guard = top.pin.read();
                         let frame = BlobFrameRef::wrap(guard.as_slice());
-                        read_leaf_kv(frame, top.slot)?
+                        let (stored_key, _leaf) = read_leaf_key_ref(frame, top.slot)?;
+                        let user_key: &[u8] = if stored_key.last() == Some(&0) {
+                            &stored_key[..stored_key.len() - 1]
+                        } else {
+                            stored_key
+                        };
+                        user_key.starts_with(&self.prefix)
                     };
-                    let user_key: &[u8] = if stored_key.last() == Some(&0) {
-                        &stored_key[..stored_key.len() - 1]
-                    } else {
-                        &stored_key[..]
-                    };
-                    if !user_key.starts_with(&self.prefix) {
+                    if !matches_prefix {
                         self.stack.clear();
                         return Ok(());
                     }
@@ -359,8 +395,9 @@ impl RangeIter {
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let p = read_prefix(frame, top.slot)?;
             let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-            (p.child as u16, p.bytes[..plen].to_vec())
+            (p.child as u16, InlinePrefix::from_slice(&p.bytes[..plen]))
         };
+        let p_bytes = p_bytes.as_slice();
         let remaining = &self.prefix[self.curr_key.len()..];
         let cmp_len = p_bytes.len().min(remaining.len());
         if p_bytes[..cmp_len] != remaining[..cmp_len] {
@@ -371,7 +408,7 @@ impl RangeIter {
             (top.pin.clone(), top.blob_guid)
         };
         self.stack.last_mut().unwrap().next = 1;
-        self.curr_key.extend_from_slice(&p_bytes);
+        self.curr_key.extend_from_slice(p_bytes);
         let child_ntype = {
             let guard = top_pin.read();
             ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
@@ -401,16 +438,17 @@ impl RangeIter {
             (
                 b.child_blob_guid,
                 b.child_entry_ptr as u16,
-                b.bytes[..plen].to_vec(),
+                InlinePrefix::from_slice(&b.bytes[..plen]),
             )
         };
+        let p_bytes = p_bytes.as_slice();
         let remaining = &self.prefix[self.curr_key.len()..];
         let cmp_len = p_bytes.len().min(remaining.len());
         if !p_bytes.is_empty() && p_bytes[..cmp_len] != remaining[..cmp_len] {
             return Ok(false);
         }
         self.stack.last_mut().unwrap().next = 1;
-        self.curr_key.extend_from_slice(&p_bytes);
+        self.curr_key.extend_from_slice(p_bytes);
         let child_pin = self.bm.pin(child_guid)?;
         let child_ntype = {
             let guard = child_pin.read();
@@ -492,17 +530,7 @@ impl RangeIter {
                             // iteration must skip them so a leaf
                             // that was erased between snapshot and
                             // iteration isn't emitted.
-                            let body = frame.body_of_slot(top.slot).ok_or_else(|| {
-                                crate::api::errors::Error::node_corrupt(
-                                    "advance_to_next_leaf: body resolution failed",
-                                )
-                            })?;
-                            let leaf = *super::cast::<crate::layout::Leaf>(body);
-                            if leaf.tombstone != 0 {
-                                None
-                            } else {
-                                Some(read_leaf_kv(frame, top.slot)?)
-                            }
+                            read_range_leaf_kv(frame, top.slot)?
                         };
                         if let Some((key, value)) = kv {
                             return Ok(Some((key, value)));
@@ -524,9 +552,14 @@ impl RangeIter {
                             let frame = BlobFrameRef::wrap(guard.as_slice());
                             let p = read_prefix(frame, top.slot)?;
                             let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-                            (p.child as u16, p.bytes[..plen].to_vec())
+                            (p.child as u16, InlinePrefix::from_slice(&p.bytes[..plen]))
                         };
-                        self.push_within_blob(top_pin, top_blob_guid, child_slot, &p_bytes)?;
+                        self.push_within_blob(
+                            top_pin,
+                            top_blob_guid,
+                            child_slot,
+                            p_bytes.as_slice(),
+                        )?;
                     } else {
                         self.pop_frame();
                     }
@@ -545,10 +578,10 @@ impl RangeIter {
                             (
                                 b.child_blob_guid,
                                 b.child_entry_ptr as u16,
-                                b.bytes[..plen].to_vec(),
+                                InlinePrefix::from_slice(&b.bytes[..plen]),
                             )
                         };
-                        self.push_in_other_blob(child_guid, child_slot, &p_bytes)?;
+                        self.push_in_other_blob(child_guid, child_slot, p_bytes.as_slice())?;
                     } else {
                         self.pop_frame();
                     }

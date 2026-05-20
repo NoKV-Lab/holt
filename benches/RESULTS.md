@@ -60,8 +60,7 @@ The scale curve in Group B (below) extends this across
   every tier ≤ 500 k. At 2 M: **1.16×** ahead of RocksDB on kv,
   **1.10×** ahead on objstore, **0.95×** (5 % behind) on fs.
   The one remaining loss is a structural LSM-amortization
-  regime that the v0.4 cross-blob lock-coupling work should
-  close.
+  regime that the v0.3 extreme performance track should close.
 
 ## KV workload (short random keys + short values)
 

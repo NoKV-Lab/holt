@@ -52,29 +52,16 @@ pub(super) fn leaf_extent<'a>(
     ))
 }
 
-pub(super) fn read_leaf_kv(frame: BlobFrameRef<'_>, slot: u16) -> Result<(Vec<u8>, Vec<u8>)> {
+/// Borrow the key and copy only the small leaf header. Update and
+/// delete walkers can decide key equality without allocating; the
+/// returned key borrow must not cross a later frame mutation.
+pub(super) fn read_leaf_key_ref(frame: BlobFrameRef<'_>, slot: u16) -> Result<(&[u8], Leaf)> {
     let body = frame
         .body_of_slot(slot)
-        .ok_or(Error::node_corrupt("read_leaf_kv: body"))?;
-    let leaf = *cast::<Leaf>(body);
-    let (k, v) = leaf_extent(frame, &leaf)?;
-    Ok((k.to_vec(), v.to_vec()))
-}
-
-/// Like [`read_leaf_kv`] but skips the value clone — the value
-/// bytes still live in the blob, but we never copy them into a
-/// fresh `Vec`. Used by the blind-put walker path
-/// ([`super::insert::insert_multi`] with `wants_prev = false`),
-/// which needs only the existing key to decide
-/// `update / divergence / extent-grow` and never returns the prior
-/// value to the caller.
-pub(super) fn read_leaf_key_only(frame: BlobFrameRef<'_>, slot: u16) -> Result<(Vec<u8>, Leaf)> {
-    let body = frame
-        .body_of_slot(slot)
-        .ok_or(Error::node_corrupt("read_leaf_key_only: body"))?;
+        .ok_or(Error::node_corrupt("read_leaf_key_ref: body"))?;
     let leaf = *cast::<Leaf>(body);
     let (k, _v) = leaf_extent(frame, &leaf)?;
-    Ok((k.to_vec(), leaf))
+    Ok((k, leaf))
 }
 
 pub(super) fn read_prefix(frame: BlobFrameRef<'_>, slot: u16) -> Result<Prefix> {

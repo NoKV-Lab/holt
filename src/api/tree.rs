@@ -30,6 +30,7 @@
 //!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
 //!   prevent racing renames from interleaving.
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -118,14 +119,56 @@ impl std::fmt::Debug for Tree {
 /// multi-tenant manifest could allocate per-tree root GUIDs.
 pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
+const INLINE_PADDED_KEY_CAP: usize = 256;
+
+struct PaddedKey {
+    inline: [u8; INLINE_PADDED_KEY_CAP],
+    len: usize,
+    heap: Option<Vec<u8>>,
+}
+
+impl PaddedKey {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match &self.heap {
+            Some(heap) => heap,
+            None => &self.inline[..self.len],
+        }
+    }
+}
+
+impl Deref for PaddedKey {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// Append the engine's internal terminator byte (`\0`) to a
 /// user-supplied key. See the module docs.
 #[inline]
-fn pad_key(key: &[u8]) -> Vec<u8> {
-    let mut padded = Vec::with_capacity(key.len() + 1);
+fn pad_key(key: &[u8]) -> PaddedKey {
+    let len = key.len() + 1;
+    if len <= INLINE_PADDED_KEY_CAP {
+        let mut inline = [0; INLINE_PADDED_KEY_CAP];
+        inline[..key.len()].copy_from_slice(key);
+        return PaddedKey {
+            inline,
+            len,
+            heap: None,
+        };
+    }
+
+    let mut padded = Vec::with_capacity(len);
     padded.extend_from_slice(key);
     padded.push(0u8);
-    padded
+    PaddedKey {
+        inline: [0; INLINE_PADDED_KEY_CAP],
+        len: 0,
+        heap: Some(padded),
+    }
 }
 
 impl Tree {
@@ -1395,4 +1438,25 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
     // next allocated seq to be strictly greater than anything
     // ever seen in the log.
     Ok(highest + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pad_key, INLINE_PADDED_KEY_CAP};
+
+    #[test]
+    fn pad_key_short_key_stays_inline() {
+        let padded = pad_key(b"abc");
+        assert!(padded.heap.is_none());
+        assert_eq!(&*padded, b"abc\0");
+    }
+
+    #[test]
+    fn pad_key_long_key_uses_heap_fallback() {
+        let key = vec![b'x'; INLINE_PADDED_KEY_CAP];
+        let padded = pad_key(&key);
+        assert!(padded.heap.is_some());
+        assert_eq!(padded.len(), INLINE_PADDED_KEY_CAP + 1);
+        assert_eq!(padded[INLINE_PADDED_KEY_CAP], 0);
+    }
 }

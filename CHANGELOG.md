@@ -12,10 +12,11 @@ fine-grained per-commit history is in `git log`.
 The v0.3 milestone is still unreleased. Everything in this
 section is queued for the first v0.3 tag: the API split, walker
 hot-path optimizations, WAL format cleanup, zero-copy reads,
-batch-WAL encoding, and the first per-node-latch groundwork.
+batch-WAL encoding, and the first slot-version lock-coupling
+groundwork.
 
 The three breaking-but-surgical wins below land first; the
-multi-phase per-node-latch milestone (#27) builds on them.
+extreme metadata-engine performance track builds on them.
 
 ### Breaking — WAL format v3 (drops dead audit fields)
 
@@ -125,7 +126,7 @@ same change applied inside the batch-path rename arm of
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
 
-### Infrastructure — per-node-latch milestone, Phase 1
+### Infrastructure — slot-version lock-coupling, Phase 1
 
 Lays the data-structure groundwork for cross-blob lock-coupling
 (the path to closing the remaining `fs_put` 2 M structural gap
@@ -166,7 +167,7 @@ Concretely:
   (`slot_version_bumps_on_versioned_frame_mutation` in
   `src/store/buffer_manager.rs::tests`).
 
-### Infrastructure — per-node-latch milestone, Phase 2.A
+### Infrastructure — slot-version lock-coupling, Phase 2.A
 
 Builds the cross-blob-hop capture/validate scaffolding on top of
 Phase 1's per-slot counters. **Still no user-visible behavior
@@ -399,7 +400,8 @@ competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
   backend.
 - **`Tree::compact` documented `NOT online-safe`** — running
   concurrently with reads or writes can torn-read across
-  `BlobNode` crossings. The v0.3 maintenance latch will lift this.
+  `BlobNode` crossings. Future online-maintenance work needs
+  structure-version protection before this can run with traffic.
 
 ### Added
 

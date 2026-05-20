@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.3.0).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.3 in progress).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> version in your `Cargo.toml` (`holt = "=0.3.0"`) until 1.0
+> published version in your `Cargo.toml` (`holt = "=0.3.0"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -76,8 +76,9 @@ failpoint-injected) pass on Ubuntu + macOS CI.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature
 breakdown and [`ROADMAP.md`](ROADMAP.md) for what's queued
-(per-node `HybridLatch`, cross-blob lock-coupling, MVCC
-snapshots, online compaction).
+(slot-versioned lock coupling, journal-worker group commit,
+batched `io_uring` / NVMe checkpoint I/O, SIMD / memory hot-path
+work, and large-tree shape control).
 
 `cargo bench --bench main` runs a side-by-side comparison with
 RocksDB and SQLite across three metadata workload shapes — see
