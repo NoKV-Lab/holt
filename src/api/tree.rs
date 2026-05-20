@@ -86,7 +86,7 @@ pub struct Tree {
     /// through the BM as normal.
     root_pin: Arc<CachedBlob>,
     /// Serialises **only `rename`** — the multi-step
-    /// `lookup_multi(src)` + `erase_multi(src)` + `insert_multi(dst)`
+    /// `lookup_multi_with(src)` + `erase_multi(src)` + `insert_multi(dst)`
     /// must appear atomic to other writers. `put` / `delete` /
     /// `get` never take this lock; they coordinate via the
     /// per-blob `HybridLatch` inside the BM.
@@ -237,18 +237,56 @@ impl Tree {
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
     /// matches.
     ///
+    /// Owned-`Vec<u8>` convenience over [`Tree::get_with`]. Pays
+    /// one allocation + memcpy per hit; on a miss returns
+    /// `Ok(None)` with no allocation.
+    ///
+    /// Equivalent to `tree.get_with(key, <[u8]>::to_vec)`. Reach
+    /// for `get_with` directly on hot read paths that don't need
+    /// owned bytes (existence checks, in-place decode, filter
+    /// pipelines, cache proxies).
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_with(key, <[u8]>::to_vec)
+    }
+
+    /// Zero-copy lookup with a user-supplied consumer closure.
+    ///
     /// **Zero-copy and lock-free against the writer lock**: pins
     /// each blob via the `BufferManager` and walks the cached
     /// buffer under a shared `RwLock` read guard. N readers on
     /// different blobs progress in parallel; readers on the same
     /// blob also progress in parallel via the read-half.
     ///
+    /// `consume` is invoked at most once on the live cache-pin
+    /// slice when the key is present and the optimistic snapshot
+    /// validates; its return value is wrapped into `Some(_)`. On
+    /// `NotFound` returns `Ok(None)`. Keep the closure short — it
+    /// borrows directly into the cache buffer and a slow closure
+    /// widens the optimistic race window.
+    ///
+    /// Common shapes:
+    ///
+    /// - `tree.get_with(k, <[u8]>::to_vec)` — owned `Vec<u8>` (same
+    ///   as [`Tree::get`]).
+    /// - `tree.get_with(k, |_| ())` — pure existence check; never
+    ///   touches the value bytes after the leaf is found.
+    /// - `tree.get_with(k, |v| serde_json::from_slice(v))` —
+    ///   decode-in-place without an intermediate `Vec`.
+    ///
+    /// `F: FnMut` rather than `FnOnce` lets the walker's restart
+    /// loop hold onto the same closure across optimistic retries;
+    /// the closure is still invoked at most once per successful
+    /// lookup.
+    ///
     /// Transparently follows `BlobNode` crossings — the lookup may
     /// span multiple blobs when the tree has been split by
     /// spillover.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get_with<R, F>(&self, key: &[u8], consume: F) -> Result<Option<R>>
+    where
+        F: FnMut(&[u8]) -> R,
+    {
         let padded = pad_key(key);
-        engine::lookup_multi(&self.backend, &self.root_pin, &padded)
+        engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, consume)
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
@@ -273,7 +311,8 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_inner(key, value, /*wants_prev=*/ false).map(|_| ())
+        self.put_inner(key, value, /*wants_prev=*/ false)
+            .map(|_| ())
     }
 
     /// Insert or replace `(key, value)`. Returns the previous value
@@ -290,8 +329,10 @@ impl Tree {
 
     /// Shared implementation behind [`Tree::put`] (blind) and
     /// [`Tree::insert`] (returning). `wants_prev` controls whether
-    /// the walker materialises the existing leaf's value bytes
-    /// and whether the WAL `Insert` record carries `prev_value`.
+    /// the walker materialises the existing leaf's value bytes —
+    /// only the caller-visible return path is affected; the WAL
+    /// record is identical for both variants (key + value only,
+    /// no prev_value field on disk since v0.3.1 / format v3).
     ///
     /// W2D-strict protocol (WAL mode): walker descent, `mark_dirty`,
     /// and `wal.append` all happen inside one `wal.lock` critical
@@ -300,12 +341,7 @@ impl Tree {
     /// its WAL record already appended (and the trailing
     /// `wal.flush` makes it durable). Concurrent writers serialise
     /// on `wal.lock` — that's the intentional barrier.
-    fn put_inner(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        wants_prev: bool,
-    ) -> Result<Option<Vec<u8>>> {
+    fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -320,13 +356,11 @@ impl Tree {
                 wants_prev,
             )?;
             self.backend.mark_dirty(self.root_guid, seq);
-            // Blind `put` passes `prev_value = None` here — the
-            // WAL `Insert` record's `prev_value` field is unused
-            // by replay (which only redoes from `key, value`), so
-            // skipping the encode is byte-exact equivalent on
-            // recovery. `insert` passes `Some(prev)` for callers
-            // that audit / undo from journal scans.
-            w.append_insert(seq, 0, key, value, outcome.previous.as_deref())?;
+            // Fast-path encoder: writes (tree_id, key, value) only.
+            // Replay redoes from those three; the caller's
+            // `wants_prev` outcome is delivered through the return
+            // path, not the WAL.
+            w.append_insert(seq, 0, key, value)?;
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
@@ -389,15 +423,12 @@ impl Tree {
     /// and [`Tree::remove`] (returning prev). W2D-strict protocol
     /// mirrors [`Self::put_inner`].
     ///
-    /// Blind delete (`wants_prev = false`) saves both the walker
-    /// leaf-extent value read and the WAL `Erase.value` encode —
+    /// Blind delete (`wants_prev = false`) saves the walker
+    /// leaf-extent value read; the WAL record itself is identical
+    /// for both variants (key only since v0.3.1 / format v3).
     /// `EraseOutcome.mutated` is the authoritative "anything
     /// happened" signal, independent of `EraseOutcome.previous`.
-    fn delete_inner(
-        &self,
-        key: &[u8],
-        wants_prev: bool,
-    ) -> Result<engine::EraseOutcome> {
+    fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {
         let padded = pad_key(key);
         // Pre-allocate the seq before the walker descends so any
         // child blob the walker touches can `mark_dirty(child, seq)`
@@ -410,24 +441,18 @@ impl Tree {
 
         let outcome = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
-            let outcome = engine::erase_multi(
-                &self.backend,
-                &self.root_pin,
-                &padded,
-                seq,
-                wants_prev,
-            )?;
+            let outcome =
+                engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
             if outcome.mutated {
                 // Only mark the **root** dirty on an actual erase
                 // — a no-op delete (key absent) leaves the root
                 // image byte-identical to the backend, and the
                 // walker already mark_dirty'd any child it touched.
                 self.backend.mark_dirty(self.root_guid, seq);
-                // Fast-path: skips the `TxnOp::Erase` enum's
-                // `Vec` clones. Blind delete passes `value=None`
-                // (no per-op leaf-extent read); returning remove
-                // passes `value=Some(prev)`.
-                w.append_erase(seq, 0, key, outcome.previous.as_deref())?;
+                // Fast-path encoder: writes (tree_id, key) only.
+                // The prior value (if `Tree::remove` asked for it)
+                // is delivered through the return path, not the WAL.
+                w.append_erase(seq, 0, key)?;
                 if self.cfg.wal_sync_on_commit {
                     w.flush()?;
                 }
@@ -435,13 +460,8 @@ impl Tree {
             // No-op delete (key wasn't there) is not logged.
             outcome
         } else {
-            let outcome = engine::erase_multi(
-                &self.backend,
-                &self.root_pin,
-                &padded,
-                seq,
-                wants_prev,
-            )?;
+            let outcome =
+                engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
             if outcome.mutated {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
@@ -483,7 +503,9 @@ impl Tree {
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
-        let Some(value) = engine::lookup_multi(&self.backend, &self.root_pin, &src_padded)? else {
+        let Some(value) =
+            engine::lookup_multi_with(&self.backend, &self.root_pin, &src_padded, <[u8]>::to_vec)?
+        else {
             return Err(Error::NotFound);
         };
 
@@ -493,7 +515,15 @@ impl Tree {
         }
 
         // Probe dst across all blobs unless overwrite is allowed.
-        if !force && engine::lookup_multi(&self.backend, &self.root_pin, &dst_padded)?.is_some() {
+        if !force
+            && engine::lookup_multi_with(
+                &self.backend,
+                &self.root_pin,
+                &dst_padded,
+                <[u8]>::to_vec,
+            )?
+            .is_some()
+        {
             return Err(Error::DstExists);
         }
 
@@ -503,10 +533,23 @@ impl Tree {
         // rename atomic from the dirty-tracking perspective —
         // failing halfway leaves a coherent partial-dirty set
         // rather than two separately-staged ops.
+        //
+        // Both walker calls pass `wants_prev=false`: the rename
+        // already read the src value (above) and the dst existence
+        // check (or `force=true`) gates the insert side, so the
+        // walker-materialised previous values would just be
+        // dropped on the floor.
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, true)?;
-            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq, true)?;
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+            engine::insert_multi(
+                &self.backend,
+                &self.root_pin,
+                &dst_padded,
+                &value,
+                seq,
+                false,
+            )?;
             self.backend.mark_dirty(self.root_guid, seq);
             // Fast-path: skips the `TxnOp::RenameObject` enum's
             // two `Vec` clones (src_key, dst_key).
@@ -515,8 +558,15 @@ impl Tree {
                 w.flush()?;
             }
         } else {
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, true)?;
-            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq, true)?;
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+            engine::insert_multi(
+                &self.backend,
+                &self.root_pin,
+                &dst_padded,
+                &value,
+                seq,
+                false,
+            )?;
             self.backend.mark_dirty(self.root_guid, seq);
             if self.cfg.memory_flush_on_write {
                 // Walker may have dirtied child blobs across the
@@ -591,7 +641,9 @@ impl Tree {
         let _r = self.rename_lock.lock().unwrap();
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + index` and replay can derive it without storing
-        // per-inner seqs in the body.
+        // per-inner seqs in the body. Pure no-op deletes burn their
+        // seq (BM dirty tracking is unaffected since no mutation
+        // happened); `next_seq` is monotonic regardless.
         let base_seq = self.next_seq.fetch_add(count, Ordering::SeqCst);
 
         // W2D-strict protocol: all inner ops' walker mutations +
@@ -600,48 +652,20 @@ impl Tree {
         // `Tree::put` for the rationale.
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
-            let mut wal_ops: Vec<TxnOp> = Vec::with_capacity(pending.len());
-            for (i, op) in pending.into_iter().enumerate() {
-                let seq = base_seq + i as u64;
-                match op {
-                    BatchOp::Put { key, value } => {
-                        wal_ops.push(self.apply_put_inner(&key, &value, seq)?);
-                    }
-                    BatchOp::Delete { key } => {
-                        if let Some(entry) = self.apply_delete_inner(&key, seq)? {
-                            wal_ops.push(entry);
-                        }
-                        // Pure no-op deletes leave no WAL record,
-                        // matching `Tree::delete`'s contract.
-                    }
-                    BatchOp::Rename { src, dst, force } => {
-                        wal_ops.push(self.apply_rename_inner(&src, &dst, force, seq)?);
-                    }
-                }
-            }
-            let envelope = TxnOp::Batch {
-                tree_id: 0,
-                ops: wal_ops,
-            };
-            w.append(&envelope, base_seq)?;
+            // `BatchEncoder` writes inner-op bytes directly into the
+            // WAL pending buffer from `&[u8]` refs, skipping the
+            // `TxnOp::Insert { key: Vec, value: Vec, .. }` enum
+            // construction (and its per-op `Vec` clones) the old
+            // `wal_ops: Vec<TxnOp>` path forced. On mid-batch error
+            // the encoder's `Drop` rolls back the partial record.
+            let _n = w.append_batch(base_seq, 0, |enc| {
+                self.apply_batch_walker_inline(pending, base_seq, Some(enc))
+            })?;
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
         } else {
-            for (i, op) in pending.into_iter().enumerate() {
-                let seq = base_seq + i as u64;
-                match op {
-                    BatchOp::Put { key, value } => {
-                        let _ = self.apply_put_inner(&key, &value, seq)?;
-                    }
-                    BatchOp::Delete { key } => {
-                        let _ = self.apply_delete_inner(&key, seq)?;
-                    }
-                    BatchOp::Rename { src, dst, force } => {
-                        let _ = self.apply_rename_inner(&src, &dst, force, seq)?;
-                    }
-                }
-            }
+            self.apply_batch_walker_inline(pending, base_seq, None)?;
             if self.cfg.memory_flush_on_write {
                 // Every inner op may have dirtied root + cross-blob
                 // children — drain the whole set rather than just
@@ -649,6 +673,101 @@ impl Tree {
                 // queued SubtreeGone deferred deletes.
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walker-mutation + optional WAL-encode loop, shared between
+    /// the WAL-on and WAL-off branches of [`Self::apply_batch`].
+    ///
+    /// When `enc` is `Some`, each successful walker mutation is
+    /// followed by a `push_*` call on the encoder; when `None`, the
+    /// walker mutations run alone (memory-only mode). Pulling the
+    /// loop out keeps the two batch paths from drifting and makes
+    /// the per-variant arms readable without macro tricks.
+    fn apply_batch_walker_inline(
+        &self,
+        pending: Vec<BatchOp>,
+        base_seq: u64,
+        mut enc: Option<&mut crate::journal::codec::BatchEncoder<'_>>,
+    ) -> Result<()> {
+        for (i, op) in pending.into_iter().enumerate() {
+            let seq = base_seq + i as u64;
+            match op {
+                BatchOp::Put { key, value } => {
+                    let padded = pad_key(&key);
+                    engine::insert_multi(
+                        &self.backend,
+                        &self.root_pin,
+                        &padded,
+                        &value,
+                        seq,
+                        false,
+                    )?;
+                    self.backend.mark_dirty(self.root_guid, seq);
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_insert(0, &key, &value);
+                    }
+                }
+                BatchOp::Delete { key } => {
+                    let padded = pad_key(&key);
+                    let outcome =
+                        engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, false)?;
+                    if outcome.mutated {
+                        self.backend.mark_dirty(self.root_guid, seq);
+                        if let Some(enc) = enc.as_deref_mut() {
+                            enc.push_erase(0, &key);
+                        }
+                    }
+                    // Pure no-op deletes leave no WAL inner op,
+                    // matching `Tree::delete`'s contract.
+                }
+                BatchOp::Rename { src, dst, force } => {
+                    let src_padded = pad_key(&src);
+                    let dst_padded = pad_key(&dst);
+                    let Some(value) = engine::lookup_multi_with(
+                        &self.backend,
+                        &self.root_pin,
+                        &src_padded,
+                        <[u8]>::to_vec,
+                    )?
+                    else {
+                        return Err(Error::NotFound);
+                    };
+                    if src != dst {
+                        if !force
+                            && engine::lookup_multi_with(
+                                &self.backend,
+                                &self.root_pin,
+                                &dst_padded,
+                                |_| (),
+                            )?
+                            .is_some()
+                        {
+                            return Err(Error::DstExists);
+                        }
+                        engine::erase_multi(
+                            &self.backend,
+                            &self.root_pin,
+                            &src_padded,
+                            seq,
+                            false,
+                        )?;
+                        engine::insert_multi(
+                            &self.backend,
+                            &self.root_pin,
+                            &dst_padded,
+                            &value,
+                            seq,
+                            false,
+                        )?;
+                        self.backend.mark_dirty(self.root_guid, seq);
+                    }
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_rename_object(0, &src, &dst, force);
+                    }
+                }
             }
         }
         Ok(())
@@ -766,63 +885,6 @@ impl Tree {
             return Err(e);
         }
         Ok(())
-    }
-
-    fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {
-        let padded = pad_key(key);
-        let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq, true)?;
-        self.backend.mark_dirty(self.root_guid, seq);
-        Ok(TxnOp::Insert {
-            tree_id: 0,
-            seq,
-            key: key.to_vec(),
-            value: value.to_vec(),
-            prev_value: outcome.previous,
-        })
-    }
-
-    fn apply_delete_inner(&self, key: &[u8], seq: u64) -> Result<Option<TxnOp>> {
-        let padded = pad_key(key);
-        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, true)?;
-        if outcome.mutated {
-            // Only an actual erase mutated bytes; the no-op path
-            // leaves the cached image byte-identical to backend.
-            self.backend.mark_dirty(self.root_guid, seq);
-        }
-        if outcome.mutated {
-            Ok(Some(TxnOp::Erase {
-                tree_id: 0,
-                seq,
-                key: key.to_vec(),
-                value: outcome.previous,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn apply_rename_inner(&self, src: &[u8], dst: &[u8], force: bool, seq: u64) -> Result<TxnOp> {
-        let src_padded = pad_key(src);
-        let dst_padded = pad_key(dst);
-        let Some(value) = engine::lookup_multi(&self.backend, &self.root_pin, &src_padded)? else {
-            return Err(Error::NotFound);
-        };
-        if src != dst {
-            if !force && engine::lookup_multi(&self.backend, &self.root_pin, &dst_padded)?.is_some()
-            {
-                return Err(Error::DstExists);
-            }
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, true)?;
-            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq, true)?;
-            self.backend.mark_dirty(self.root_guid, seq);
-        }
-        Ok(TxnOp::RenameObject {
-            tree_id: 0,
-            seq,
-            src_key: src.to_vec(),
-            dst_key: dst.to_vec(),
-            force,
-        })
     }
 
     /// Make every previously-applied mutation durable and trim
@@ -1284,17 +1346,22 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             } => {
                 let src_padded = pad_key(src_key);
                 let dst_padded = pad_key(dst_key);
-                if engine::lookup_multi(bm, &root_pin, &src_padded)?.is_none() {
+                // Existence probes pass a `|_| ()` closure so the
+                // walker doesn't even allocate / copy the value.
+                if engine::lookup_multi_with(bm, &root_pin, &src_padded, |_| ())?.is_none() {
                     // Already reconciled in a prior replay pass —
                     // skip. `highest` was bumped above so the
                     // post-replay `next_seq` still advances past
                     // this record's seq.
                     return Ok(());
                 }
-                if !force && engine::lookup_multi(bm, &root_pin, &dst_padded)?.is_some() {
+                if !force
+                    && engine::lookup_multi_with(bm, &root_pin, &dst_padded, |_| ())?.is_some()
+                {
                     return Ok(());
                 }
-                let value = engine::lookup_multi(bm, &root_pin, &src_padded)?.unwrap_or_default();
+                let value = engine::lookup_multi_with(bm, &root_pin, &src_padded, <[u8]>::to_vec)?
+                    .unwrap_or_default();
                 engine::erase_multi(bm, &root_pin, &src_padded, seq, false)?;
                 engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq, false)?;
                 true

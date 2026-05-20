@@ -31,6 +31,11 @@ pub enum CompactReason {
 #[derive(Debug, Clone)]
 pub enum TxnOp {
     /// Single-key insert / update.
+    ///
+    /// Replay only redoes from `(key, value)`; there is no
+    /// `prev_value` field because replay never undoes (it's an
+    /// idempotent forward redo) and holt does not provide a
+    /// journal-scan audit surface.
     Insert {
         /// Owning tree root identifier.
         tree_id: u64,
@@ -40,10 +45,14 @@ pub enum TxnOp {
         key: Vec<u8>,
         /// New value bytes.
         value: Vec<u8>,
-        /// Previous value bytes (for replay reversibility).
-        prev_value: Option<Vec<u8>>,
     },
     /// Single-key erase.
+    ///
+    /// Carries only the key — replay redoes the erase from `key`
+    /// alone. The prior value is not retained on disk: the blind
+    /// `Tree::delete` walker never reads it, and the returning
+    /// `Tree::remove` walker hands it straight to the caller
+    /// without round-tripping through the WAL.
     Erase {
         /// Owning tree root identifier.
         tree_id: u64,
@@ -51,12 +60,6 @@ pub enum TxnOp {
         seq: u64,
         /// Key bytes.
         key: Vec<u8>,
-        /// Erased value bytes — `Some` when the caller used
-        /// `Tree::remove` (returning API), `None` when the caller
-        /// used `Tree::delete` (blind API). Replay only redoes
-        /// from `key`, so this field is purely audit metadata
-        /// for tooling that scans the journal after the fact.
-        value: Option<Vec<u8>>,
     },
     /// `splitBlob` — subtree moved to a new blob.
     Split {

@@ -8,8 +8,8 @@
 //! - `readers` — decode slot bodies + leaf extents off a
 //!   `BlobFrameRef`.
 //! - `writers` — allocate fresh slots / extents and populate them.
-//! - `lookup` — [`lookup`] / [`lookup_at`] / [`lookup_multi`] and
-//!   single-blob descent arms. Zero-copy: walks against
+//! - `lookup` — [`lookup`] / [`lookup_at`] / [`lookup_multi_with`]
+//!   and single-blob descent arms. Zero-copy: walks against
 //!   `BlobFrameRef` so it's safe to run under a `BufferManager`
 //!   shared read-guard.
 //! - `insert` — [`insert`] / [`insert_multi`] + `insert_at`
@@ -57,12 +57,12 @@ mod writers;
 
 pub use erase::erase_multi;
 pub use insert::insert_multi;
-pub use types::EraseOutcome;
-pub use lookup::lookup_multi;
+pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::compact_blob;
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
 pub use scan::{collect_blob_guids, collect_blob_guids_silent, refresh_blob_node_pointers};
+pub use types::EraseOutcome;
 
 // ---------- shared internals ----------
 

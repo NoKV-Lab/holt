@@ -277,6 +277,29 @@ walker path skips the leaf-extent value read, drops the prefix
 slot. All three are pure constant-factor wins (no algorithmic
 change), and they compound to the -1 % to -23 % deltas above.
 
+**v0.3.1 follow-up.** The bench numbers above are unchanged in
+v0.3.1 — the bench exercises blind `put` / `delete` and Vec-
+returning `get`, all of which v0.3.0 had already optimised. v0.3.1
+ships three additional wins that *aren't* visible on this bench
+shape but matter for adjacent workloads:
+
+- **WAL format v3** (`Insert.prev_value` / `Erase.value` slots
+  removed entirely). Bench writes are blind, so the v0.3.0 path
+  already wrote `Option::None` for those slots — saving one
+  presence byte per record. The full win lands on the *returning*
+  `Tree::insert` / `Tree::remove` paths, which v0.3.0 still
+  wrote `Some(prev)` for; v0.3.1 doesn't write the prev value to
+  the WAL at all (the walker hands it straight to the caller).
+- **`Tree::get_with` zero-copy primitive.** `Tree::get` (the
+  Vec-returning convenience this bench uses) is unchanged. Hot
+  read paths that opt in to the callback skip the per-call
+  `Vec<u8>` allocation + memcpy — sized at ~100-200 ns on the
+  M3 Pro at 2 M, ~10-20 % of the total get latency.
+- **`Tree::txn` batch encoder bypass.** Single-op writes are
+  unaffected; multi-op batches skip per-op intermediate `Vec`
+  clones that the v0.3.0 `wal_ops: Vec<TxnOp>` aggregator forced.
+  Bench doesn't exercise `txn`.
+
 The remaining **0.95×** cell (`fs_scale_put` at 2 M vs RocksDB)
 is structural — LSM write amortization (WAL append + memtable
 insert, both O(1) regardless of working-set size) genuinely wins

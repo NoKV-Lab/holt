@@ -31,7 +31,7 @@ use crate::api::errors::{Error, Result};
 
 use super::codec::{
     decode_file_header, encode_erase_record, encode_file_header, encode_insert_record,
-    encode_record, encode_rename_object_record, FileHeader, FILE_HEADER_SIZE,
+    encode_record, encode_rename_object_record, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
 };
 use super::txn_op::TxnOp;
 
@@ -153,48 +153,43 @@ impl WalWriter {
     /// `sync_data`) — bounded user-space buffering, but per-op
     /// cost stays at an in-memory copy.
     ///
-    /// Hot mutation paths (`Tree::put` / `delete` / `rename`)
-    /// use the per-variant [`Self::append_insert`] /
-    /// [`Self::append_erase`] / [`Self::append_rename_object`]
-    /// entry points instead. Those skip the `TxnOp` enum's three
-    /// `Vec` clones (key + value + prev_value) — measurable
-    /// against the bench's hot path. `append` stays the generic
-    /// entry for structural variants (Split / Merge / Compact /
-    /// MemMarker / NewTree / RmTree) where the cost doesn't
-    /// matter.
+    /// All four user-facing hot paths
+    /// (`Tree::put` / `delete` / `rename` / `txn`) use the
+    /// per-variant fast paths instead ([`Self::append_insert`] /
+    /// [`Self::append_erase`] / [`Self::append_rename_object`] /
+    /// [`Self::append_batch`]). Those skip the `TxnOp` enum's
+    /// `Vec` clones — measurable against the bench's hot path.
+    /// `append` stays as a generic test-time entry point for
+    /// exercising structural variants (Split / Merge / Compact /
+    /// MemMarker / NewTree / RmTree) end-to-end through the
+    /// writer + replay path; production code never goes through
+    /// it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);
         self.maybe_drain()
     }
 
     /// Fast-path: append an `Insert` record directly from refs.
-    /// Skips the `TxnOp::Insert` enum + 3 `Vec::to_vec` clones.
+    /// Skips the `TxnOp::Insert` enum + the two `Vec::to_vec`
+    /// clones (key + value).
     pub fn append_insert(
         &mut self,
         seq: u64,
         tree_id: u64,
         key: &[u8],
         value: &[u8],
-        prev_value: Option<&[u8]>,
     ) -> Result<()> {
-        encode_insert_record(&mut self.pending, seq, tree_id, key, value, prev_value);
+        encode_insert_record(&mut self.pending, seq, tree_id, key, value);
         self.maybe_drain()
     }
 
     /// Fast-path: append an `Erase` record directly from refs.
-    /// `value = Some(_)` for the returning [`crate::Tree::remove`]
-    /// path; `None` for blind [`crate::Tree::delete`]. Replay
-    /// ignores the value field either way (it only redoes from
-    /// `key`); the field is purely audit metadata for tools that
-    /// scan the journal after the fact.
-    pub fn append_erase(
-        &mut self,
-        seq: u64,
-        tree_id: u64,
-        key: &[u8],
-        value: Option<&[u8]>,
-    ) -> Result<()> {
-        encode_erase_record(&mut self.pending, seq, tree_id, key, value);
+    /// Carries key only; the prior value (if the caller wanted it)
+    /// is delivered through `Tree::remove`'s return path, not
+    /// through the WAL.
+    pub fn append_erase(&mut self, seq: u64, tree_id: u64, key: &[u8]) -> Result<()> {
+        encode_erase_record(&mut self.pending, seq, tree_id, key);
         self.maybe_drain()
     }
 
@@ -210,6 +205,39 @@ impl WalWriter {
     ) -> Result<()> {
         encode_rename_object_record(&mut self.pending, seq, tree_id, src_key, dst_key, force);
         self.maybe_drain()
+    }
+
+    /// Fast-path: stream a `Batch` envelope record directly from
+    /// refs. Hands the caller a [`BatchEncoder`] to push primitive
+    /// inner ops (`Insert` / `Erase` / `RenameObject`) without
+    /// constructing intermediate `TxnOp::Insert { key: Vec, value:
+    /// Vec, .. }` values — the per-op `Vec` clones that
+    /// `encode_record` would force are skipped.
+    ///
+    /// The closure is `FnOnce(&mut BatchEncoder<'_>) -> Result<()>`:
+    /// returning `Err` cleanly aborts the batch (the encoder's
+    /// `Drop` rolls back the partial record bytes so the WAL
+    /// buffer ends up exactly where `begin` found it). On `Ok`
+    /// the encoder is `finish`ed (backpatch + CRC) and the
+    /// auto-drain threshold is re-checked.
+    ///
+    /// Returns the final inner op count (= the number of
+    /// `push_*` calls that ran inside the closure). The caller
+    /// can use this to skip emitting the record at all when the
+    /// effective inner count is 0 (e.g. a batch of pure no-op
+    /// deletes) — though calling `append_batch` with zero ops
+    /// still writes a well-formed empty-Batch record, matching
+    /// the generic `encode_record(&TxnOp::Batch { ops: vec![] })`
+    /// shape.
+    pub fn append_batch<F>(&mut self, base_seq: u64, tree_id: u64, build: F) -> Result<u32>
+    where
+        F: FnOnce(&mut BatchEncoder<'_>) -> Result<()>,
+    {
+        let mut enc = BatchEncoder::begin(&mut self.pending, base_seq, tree_id);
+        build(&mut enc)?;
+        let n = enc.finish();
+        self.maybe_drain()?;
+        Ok(n)
     }
 
     fn maybe_drain(&mut self) -> Result<()> {

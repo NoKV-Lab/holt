@@ -67,7 +67,10 @@ fn put_then_get_round_trip() {
 fn put_returns_previous_value_on_update() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     assert!(tree.insert(b"k", b"v1").unwrap().is_none());
-    assert_eq!(tree.insert(b"k", b"v2").unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(
+        tree.insert(b"k", b"v2").unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
     assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
 }
 

@@ -58,18 +58,26 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// bump this and grow the header (in the reserved tail) rather
 /// than moving existing fields.
 ///
-/// v0.3.0 bumps `1 → 2`: `TxnOp::Erase.value` changed from
-/// `Vec<u8>` (always present) to `Option<Vec<u8>>` (`None` on
-/// the new blind `Tree::delete` path, `Some` on `Tree::remove`).
-/// Wire shape: the trailing `bytes(value)` became
-/// `optional_bytes(value)`. A v0.2 binary reading a v0.3 WAL
-/// would mis-decode the optional marker as a length prefix;
-/// the file-header check rejects the upgrade with a clear
-/// "format version unsupported" error rather than silently
-/// corrupting state on replay. Upgrade path: checkpoint the
-/// v0.2 tree (which truncates the WAL) before swapping in the
-/// v0.3 binary.
-pub const FORMAT_VERSION: u32 = 2;
+/// v0.3.1 bumps `2 → 3`: dropped the dead `prev_value` field
+/// from `TxnOp::Insert` and the dead `value` field from
+/// `TxnOp::Erase`. Both were "for replay reversibility" but
+/// replay never undoes — it's an idempotent forward redo that
+/// only consumes `key, value` (Insert) / `key` (Erase). Pure
+/// wire-format savings: returning `Tree::insert` / `Tree::remove`
+/// no longer serialise the prior value into the WAL (blind
+/// variants already wrote `None`); the trailing
+/// `optional_bytes` slot is gone from both record bodies.
+///
+/// A v0.3.0 binary reading a v0.3.1 WAL would mis-parse the
+/// absent slot as a length prefix; the file-header check rejects
+/// the upgrade with "format version unsupported" rather than
+/// silently corrupting state on replay. Upgrade path: checkpoint
+/// the v0.3.0 tree (truncates the WAL) before swapping in the
+/// v0.3.1 binary. The v0.2 → v0.3.0 step bumped 1 → 2 by
+/// converting `Erase.value` from required to optional; the same
+/// "checkpoint before upgrade" rule applies to anyone leapfrogging
+/// from v0.2 directly to v0.3.1.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// File-header byte size. The record stream starts at this offset.
 pub const FILE_HEADER_SIZE: usize = 32;
@@ -193,8 +201,8 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 /// Hot mutation paths in `Tree` use the per-variant
 /// [`encode_insert_record`] / [`encode_erase_record`] /
 /// [`encode_rename_object_record`] entry points instead — those
-/// skip the `TxnOp` enum construction and the three `Vec` clones
-/// it forces on the caller.
+/// skip the `TxnOp` enum construction and the `Vec` clones it
+/// forces on the caller.
 pub fn encode_record(op: &TxnOp, seq: u64, out: &mut Vec<u8>) {
     write_record(out, seq, variant_tag(op), |buf| encode_body(op, buf));
 }
@@ -228,43 +236,27 @@ where
 // These mirror the variants `Tree::put` / `delete` / `rename`
 // hit on the hot path. They take borrowed bytes rather than
 // constructing a `TxnOp` enum, so callers don't pay for the
-// three `Vec` clones (key + value + prev_value) that enum
-// construction forces.
+// `Vec` clones that enum construction forces.
 
 /// Encode an `Insert` record directly from refs. Equivalent to
 /// `encode_record(&TxnOp::Insert { ... }, seq, out)` but without
 /// the intermediate enum.
-pub fn encode_insert_record(
-    out: &mut Vec<u8>,
-    seq: u64,
-    tree_id: u64,
-    key: &[u8],
-    value: &[u8],
-    prev_value: Option<&[u8]>,
-) {
+pub fn encode_insert_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) {
     write_record(out, seq, TY_INSERT, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
         write_bytes(buf, value);
-        write_optional_bytes(buf, prev_value);
     });
 }
 
-/// Encode an `Erase` record directly from refs. `value = Some(_)`
-/// matches the `Tree::remove` (returning) call path; `None`
-/// matches the blind `Tree::delete` path that did not materialise
-/// the prior value.
-pub fn encode_erase_record(
-    out: &mut Vec<u8>,
-    seq: u64,
-    tree_id: u64,
-    key: &[u8],
-    value: Option<&[u8]>,
-) {
+/// Encode an `Erase` record directly from refs. Carries key only
+/// — replay redoes from `key` alone, and the prior value (if any)
+/// is handed straight to the `Tree::remove` caller without
+/// round-tripping through the WAL.
+pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8]) {
     write_record(out, seq, TY_ERASE, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
-        write_optional_bytes(buf, value);
     });
 }
 
@@ -283,6 +275,130 @@ pub fn encode_rename_object_record(
         write_bytes(buf, dst_key);
         buf.push(u8::from(force));
     });
+}
+
+/// Streaming `Batch` record builder. Encodes inner primitive ops
+/// directly from `&[u8]` refs into the WAL pending buffer, skipping
+/// the intermediate `TxnOp::Insert` / `TxnOp::Erase` /
+/// `TxnOp::RenameObject` enum constructions and their `Vec` clones
+/// that [`encode_record`] would force on the caller.
+///
+/// Lifecycle:
+///
+/// 1. [`BatchEncoder::begin`] writes the record header and the
+///    batch body prefix (`tree_id` + zero-placeholder inner-count).
+/// 2. The caller interleaves walker mutations with
+///    [`Self::push_insert`] / [`Self::push_erase`] /
+///    [`Self::push_rename_object`] calls. Each push appends one
+///    `inner_ty | inner_body` block to the body.
+/// 3. [`Self::finish`] backpatches the inner count + body length
+///    and appends the CRC. On a successful finish the record is
+///    fully formed in the underlying buffer.
+///
+/// If the encoder is dropped without `finish` (e.g. the caller
+/// bailed mid-batch with `?`), the partial bytes appended so far
+/// are truncated back to the encoder's start position — leaving
+/// the buffer in the same shape as if `begin` had never run.
+pub struct BatchEncoder<'buf> {
+    out: &'buf mut Vec<u8>,
+    /// Buffer offset of the record's `MAGIC` byte — used by the
+    /// `Drop` rollback path.
+    start: usize,
+    /// Buffer offset of the record-header `body_len` slot.
+    len_pos: usize,
+    /// Buffer offset where the body starts (immediately after the
+    /// record header). CRC covers `start..body_end`.
+    body_start: usize,
+    /// Buffer offset of the batch body's `count` slot (a `u32` that
+    /// holds the number of inner ops pushed).
+    count_pos: usize,
+    inner_count: u32,
+    finished: bool,
+}
+
+impl<'buf> BatchEncoder<'buf> {
+    /// Open a new `Batch` record on `out`. The header + body prefix
+    /// (tree_id, zero-placeholder count) are written immediately;
+    /// subsequent `push_*` calls extend the body.
+    pub fn begin(out: &'buf mut Vec<u8>, seq: u64, tree_id: u64) -> Self {
+        let start = out.len();
+        out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+        let len_pos = out.len();
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.push(TY_BATCH);
+        let body_start = out.len();
+        out.extend_from_slice(&tree_id.to_le_bytes());
+        let count_pos = out.len();
+        out.extend_from_slice(&[0u8; 4]);
+        Self {
+            out,
+            start,
+            len_pos,
+            body_start,
+            count_pos,
+            inner_count: 0,
+            finished: false,
+        }
+    }
+
+    /// Append one `Insert` inner op. Mirrors the wire shape that
+    /// `encode_body` writes for `TxnOp::Insert` (sans the leading
+    /// type tag, which we prepend here for batch framing).
+    pub fn push_insert(&mut self, tree_id: u64, key: &[u8], value: &[u8]) {
+        self.out.push(TY_INSERT);
+        self.out.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(self.out, key);
+        write_bytes(self.out, value);
+        self.inner_count += 1;
+    }
+
+    /// Append one `Erase` inner op.
+    pub fn push_erase(&mut self, tree_id: u64, key: &[u8]) {
+        self.out.push(TY_ERASE);
+        self.out.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(self.out, key);
+        self.inner_count += 1;
+    }
+
+    /// Append one `RenameObject` inner op.
+    pub fn push_rename_object(&mut self, tree_id: u64, src: &[u8], dst: &[u8], force: bool) {
+        self.out.push(TY_RENAME_OBJECT);
+        self.out.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(self.out, src);
+        write_bytes(self.out, dst);
+        self.out.push(u8::from(force));
+        self.inner_count += 1;
+    }
+
+    /// Backpatch the inner count + record-header `body_len` and
+    /// append the CRC footer. Returns the final inner count.
+    ///
+    /// Consumes `self` to make the "fully-formed record" state
+    /// type-enforced — after this returns, the record is committed
+    /// to the buffer and the `Drop` rollback path is suppressed.
+    pub fn finish(mut self) -> u32 {
+        let body_end = self.out.len();
+        let body_len = u32::try_from(body_end - self.body_start).expect("batch body fits in u32");
+        self.out[self.count_pos..self.count_pos + 4]
+            .copy_from_slice(&self.inner_count.to_le_bytes());
+        self.out[self.len_pos..self.len_pos + 4].copy_from_slice(&body_len.to_le_bytes());
+        let crc = crc32(&self.out[self.start..body_end]);
+        self.out.extend_from_slice(&crc.to_le_bytes());
+        self.finished = true;
+        self.inner_count
+    }
+}
+
+impl Drop for BatchEncoder<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Caller bailed mid-batch (e.g. a walker `?` propagated
+            // out). Roll back the partial record so the WAL buffer
+            // looks exactly like it did before `begin`.
+            self.out.truncate(self.start);
+        }
+    }
 }
 
 fn variant_tag(op: &TxnOp) -> u8 {
@@ -308,22 +424,18 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
             seq: _,
             key,
             value,
-            prev_value,
         } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
             write_bytes(out, value);
-            write_optional_bytes(out, prev_value.as_deref());
         }
         TxnOp::Erase {
             tree_id,
             seq: _,
             key,
-            value,
         } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
-            write_optional_bytes(out, value.as_deref());
         }
         TxnOp::Split {
             parent_blob,
@@ -416,16 +528,6 @@ fn write_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
-fn write_optional_bytes(out: &mut Vec<u8>, b: Option<&[u8]>) {
-    match b {
-        None => out.push(0),
-        Some(x) => {
-            out.push(1);
-            write_bytes(out, x);
-        }
-    }
-}
-
 // ---------- decode ----------
 
 /// Outcome of [`decode_record`].
@@ -500,25 +602,17 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
             let tree_id = read_u64(body)?;
             let key = read_bytes(body)?;
             let value = read_bytes(body)?;
-            let prev_value = read_optional_bytes(body)?;
             TxnOp::Insert {
                 tree_id,
                 seq,
                 key,
                 value,
-                prev_value,
             }
         }
         TY_ERASE => {
             let tree_id = read_u64(body)?;
             let key = read_bytes(body)?;
-            let value = read_optional_bytes(body)?;
-            TxnOp::Erase {
-                tree_id,
-                seq,
-                key,
-                value,
-            }
+            TxnOp::Erase { tree_id, seq, key }
         }
         TY_SPLIT => {
             let parent_blob = read_guid(body)?;
@@ -653,14 +747,6 @@ fn read_bytes(body: &mut &[u8]) -> Result<Vec<u8>> {
     Ok(front.to_vec())
 }
 
-fn read_optional_bytes(body: &mut &[u8]) -> Result<Option<Vec<u8>>> {
-    match read_u8(body)? {
-        0 => Ok(None),
-        1 => Ok(Some(read_bytes(body)?)),
-        _ => Err(sanity("optional-bytes presence byte out of range")),
-    }
-}
-
 fn take(buf: &[u8], n: usize) -> Result<(&[u8], &[u8])> {
     if buf.len() < n {
         return Err(sanity("body truncated"));
@@ -698,28 +784,26 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_insert_with_prev_value() {
+    fn roundtrip_insert_small() {
         roundtrip(
             TxnOp::Insert {
                 tree_id: 1,
                 seq: 42,
                 key: b"img/01.jpg".to_vec(),
                 value: b"v-new".to_vec(),
-                prev_value: Some(b"v-old".to_vec()),
             },
             42,
         );
     }
 
     #[test]
-    fn roundtrip_insert_no_prev_value() {
+    fn roundtrip_insert_large_value() {
         roundtrip(
             TxnOp::Insert {
                 tree_id: 0,
                 seq: 7,
                 key: b"new/key".to_vec(),
                 value: vec![0xAB; 200],
-                prev_value: None,
             },
             7,
         );
@@ -732,7 +816,6 @@ mod tests {
                 tree_id: 3,
                 seq: 99,
                 key: b"img/02.jpg".to_vec(),
-                value: Some(b"v".to_vec()),
             },
             99,
         );
@@ -833,14 +916,12 @@ mod tests {
             seq: 0,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
-            prev_value: None,
         };
         let mut buf = Vec::new();
         encode_record(&op, 0, &mut buf);
         // tree_id (8) + key_len (4) + key (1) + val_len (4) + val (1)
-        //   + prev_present (1) = 19 byte body
-        // Header (17) + body (19) + footer (4) = 40 bytes.
-        assert_eq!(buf.len(), 40);
+        //   = 18 byte body. Header (17) + body (18) + footer (4) = 39.
+        assert_eq!(buf.len(), 39);
     }
 
     #[test]
@@ -850,7 +931,6 @@ mod tests {
             seq: 1,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
-            prev_value: None,
         };
         let mut buf = Vec::new();
         encode_record(&op, 1, &mut buf);
@@ -885,7 +965,6 @@ mod tests {
             seq: 1,
             key: vec![0xAB; 100],
             value: vec![0xCD; 100],
-            prev_value: None,
         };
         let mut buf = Vec::new();
         encode_record(&op, 1, &mut buf);
@@ -930,7 +1009,6 @@ mod tests {
                 seq: 1,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
-                prev_value: None,
             },
             1,
             &mut buf,
@@ -940,7 +1018,6 @@ mod tests {
                 tree_id: 0,
                 seq: 2,
                 key: b"k1".to_vec(),
-                value: Some(b"v1".to_vec()),
             },
             2,
             &mut buf,
@@ -967,13 +1044,11 @@ mod tests {
                     seq: base,
                     key: b"a".to_vec(),
                     value: b"v-a".to_vec(),
-                    prev_value: None,
                 },
                 TxnOp::Erase {
                     tree_id: 0,
                     seq: base + 1,
                     key: b"b".to_vec(),
-                    value: Some(b"v-b".to_vec()),
                 },
                 TxnOp::RenameObject {
                     tree_id: 0,
@@ -1042,6 +1117,110 @@ mod tests {
             TxnOp::Batch { ops, .. } => assert!(ops.is_empty()),
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn batch_encoder_wire_matches_encode_record() {
+        // The streaming `BatchEncoder` and the generic
+        // `encode_record(&TxnOp::Batch { .. })` path must produce
+        // byte-identical records — that's what lets `Tree::txn`
+        // bypass the enum without breaking replay.
+        let base = 200u64;
+
+        // Path A: streaming encoder.
+        let mut buf_streaming = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut buf_streaming, base, 0);
+            enc.push_insert(0, b"a", b"v-a");
+            enc.push_erase(0, b"b");
+            enc.push_rename_object(0, b"c", b"d", false);
+            let n = enc.finish();
+            assert_eq!(n, 3);
+        }
+
+        // Path B: enum-and-encode.
+        let mut buf_enum = Vec::new();
+        let batch = TxnOp::Batch {
+            tree_id: 0,
+            ops: vec![
+                TxnOp::Insert {
+                    tree_id: 0,
+                    seq: base,
+                    key: b"a".to_vec(),
+                    value: b"v-a".to_vec(),
+                },
+                TxnOp::Erase {
+                    tree_id: 0,
+                    seq: base + 1,
+                    key: b"b".to_vec(),
+                },
+                TxnOp::RenameObject {
+                    tree_id: 0,
+                    seq: base + 2,
+                    src_key: b"c".to_vec(),
+                    dst_key: b"d".to_vec(),
+                    force: false,
+                },
+            ],
+        };
+        encode_record(&batch, base, &mut buf_enum);
+
+        assert_eq!(buf_streaming, buf_enum);
+
+        // Round-trips cleanly via the standard decoder.
+        let r = decode_record(&buf_streaming).unwrap();
+        assert_eq!(r.seq, base);
+        match r.op {
+            TxnOp::Batch { ops, .. } => assert_eq!(ops.len(), 3),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_encoder_empty_round_trips() {
+        let mut buf = Vec::new();
+        {
+            let enc = BatchEncoder::begin(&mut buf, 9, 0);
+            assert_eq!(enc.finish(), 0);
+        }
+        let r = decode_record(&buf).unwrap();
+        assert_eq!(r.seq, 9);
+        match r.op {
+            TxnOp::Batch { ops, .. } => assert!(ops.is_empty()),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_encoder_drop_without_finish_rolls_back() {
+        // Caller bails mid-batch (e.g. `?` propagated out of the
+        // closure). The encoder's `Drop` must truncate the partial
+        // record so the WAL buffer ends up exactly where it was.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"pre-existing bytes");
+        let before = buf.len();
+        {
+            let mut enc = BatchEncoder::begin(&mut buf, 1, 0);
+            enc.push_insert(0, b"would-be-rolled-back", b"v");
+            // Drop without calling finish().
+        }
+        assert_eq!(buf.len(), before, "Drop should truncate the partial record");
+        assert_eq!(&buf[..], b"pre-existing bytes");
+    }
+
+    #[test]
+    fn batch_encoder_finish_commits_record() {
+        // Confirm the happy path: after finish() the encoder's
+        // bytes are committed — a subsequent Drop is a no-op.
+        let mut buf = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut buf, 5, 0);
+            enc.push_insert(0, b"k", b"v");
+            let _ = enc.finish();
+        }
+        assert!(!buf.is_empty());
+        let r = decode_record(&buf).unwrap();
+        assert_eq!(r.seq, 5);
     }
 
     #[test]

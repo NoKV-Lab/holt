@@ -28,20 +28,17 @@ fn sample_ops() -> Vec<TxnOp> {
             seq: 1,
             key: b"img/01.jpg".to_vec(),
             value: vec![0xAA; 64],
-            prev_value: None,
         },
         TxnOp::Insert {
             tree_id: 0,
             seq: 2,
             key: b"img/02.jpg".to_vec(),
             value: vec![0xBB; 64],
-            prev_value: None,
         },
         TxnOp::Erase {
             tree_id: 0,
             seq: 3,
             key: b"img/01.jpg".to_vec(),
-            value: Some(vec![0xAA; 64]),
         },
         TxnOp::RenameObject {
             tree_id: 0,
@@ -105,7 +102,6 @@ fn open_existing_resumes_append_position() {
                 seq: 1,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
-                prev_value: None,
             },
             1,
         )
@@ -122,7 +118,6 @@ fn open_existing_resumes_append_position() {
                 tree_id: 0,
                 seq: 2,
                 key: b"k1".to_vec(),
-                value: Some(b"v1".to_vec()),
             },
             2,
         )
@@ -179,7 +174,6 @@ fn unflushed_records_are_lost_after_drop() {
                 seq: 1,
                 key: b"transient".to_vec(),
                 value: b"never-persisted".to_vec(),
-                prev_value: None,
             },
             1,
         )
@@ -299,7 +293,6 @@ fn replay_callback_can_short_circuit() {
                 seq: i + 1,
                 key: format!("k{i}").into_bytes(),
                 value: vec![i as u8],
-                prev_value: None,
             },
             i + 1,
         )
@@ -370,7 +363,6 @@ fn discard_pending_keeps_already_flushed_records() {
             seq: 1,
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
-            prev_value: None,
         },
         1,
     )
@@ -383,7 +375,6 @@ fn discard_pending_keeps_already_flushed_records() {
             seq: 2,
             key: b"k2".to_vec(),
             value: b"v2".to_vec(),
-            prev_value: None,
         },
         2,
     )
@@ -428,7 +419,6 @@ fn many_records_stream_round_trip() {
                     seq: i,
                     key: format!("k{i:04}").into_bytes(),
                     value: format!("v{i}").into_bytes(),
-                    prev_value: None,
                 },
                 i,
             )
@@ -470,7 +460,6 @@ fn auto_flush_keeps_user_space_buffer_bounded() {
                 seq: i + 1,
                 key: format!("k{i:06}").into_bytes(),
                 value: vec![0xAB; 32],
-                prev_value: None,
             },
             i + 1,
         )
@@ -531,7 +520,6 @@ fn appending_after_external_truncate_grows_file_again() {
             seq: 1,
             key: b"keep".to_vec(),
             value: b"v".to_vec(),
-            prev_value: None,
         },
         1,
     )
@@ -554,7 +542,6 @@ fn appending_after_external_truncate_grows_file_again() {
             seq: 2,
             key: b"after-truncate".to_vec(),
             value: b"v".to_vec(),
-            prev_value: None,
         },
         2,
     )

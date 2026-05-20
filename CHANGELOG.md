@@ -7,6 +7,118 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [Unreleased] — v0.3.1 follow-up
+
+Three breaking-but-surgical optimizations on top of v0.3.0. Each
+fixes a real cost the v0.3.0 bench narrative identified, with no
+algorithmic change.
+
+### Breaking — WAL format v3 (drops dead audit fields)
+
+`TxnOp::Insert.prev_value` and `TxnOp::Erase.value` are gone.
+Both were documented as "for replay reversibility" but replay is
+an idempotent forward redo that only consumes `(key, value)` for
+Insert and `key` for Erase — the prior-value slots were dead
+weight on every returning `Tree::insert` / `Tree::remove` (the
+blind variants already wrote `None`).
+
+**File format version bumped 2 → 3.** A v0.3.0 binary opening a
+v0.3.1 WAL fails with `Error::ReplaySanityFailed` /
+`"WAL file format version unsupported"` rather than mis-parsing
+the absent optional-bytes slot as a length prefix. **Upgrade
+path: `Tree::checkpoint()` on the v0.3.0 tree before swapping in
+the v0.3.1 binary** — checkpoint truncates the WAL to
+header-only, so the next open writes a v0.3 (= v3-format) header.
+
+Concretely:
+- WAL `Insert` record body shrinks by one `optional_bytes` slot
+  (`u8` presence tag + `u32` length + `prev_value.len()` bytes
+  on the returning path).
+- WAL `Erase` record body shrinks by one `optional_bytes` slot
+  (same shape as Insert).
+- Returning `Tree::insert` / `Tree::remove` no longer clone or
+  serialise the prior value into the WAL buffer; the caller still
+  receives it through the return path (walker `leaf_extent` read,
+  same as v0.3.0).
+
+### Breaking — `Tree::get_with` zero-copy primitive
+
+New zero-copy primitive: `tree.get_with(key, |&[u8]| -> R)`
+hands the live cache-pin slice to a closure and returns the
+closure's result. Replaces the always-copying internal lookup
+path under the hood:
+
+```rust
+// Owned `Vec<u8>` convenience — unchanged caller-side from v0.3.0.
+pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+// Zero-copy primitive — pass a closure that consumes the slice.
+pub fn get_with<R, F>(&self, key: &[u8], consume: F) -> Result<Option<R>>
+where
+    F: FnMut(&[u8]) -> R;
+```
+
+`Tree::get` is now a one-line wrapper over `get_with` (calls it
+with `<[u8]>::to_vec`); no caller-side change for any code that
+was using `tree.get(k)`. Hot read paths that don't need owned
+bytes — existence checks, in-place decode, filter pipelines,
+cache proxies — can opt in for the per-op allocation savings.
+
+The "breaking" label covers the engine-level rename: the
+internal `lookup_multi` is gone, replaced by `lookup_multi_with`
+that takes the consume closure. External callers don't touch
+that surface (it's `pub(crate)`).
+
+Closure contract: `consume` runs after the optimistic
+`validate()` succeeds — same race window as v0.3.0's
+`v.to_vec()`. Keep the closure short to avoid widening the
+window past the existing baseline; for arbitrary work, copy out
+first via `<[u8]>::to_vec`.
+
+### Performance — `txn()` batch bypasses `TxnOp` enum
+
+`Tree::txn` (the batched-multi-op API) now uses a streaming
+`BatchEncoder` that writes inner-op bytes directly from `&[u8]`
+refs into the WAL pending buffer. The v0.3.0 path constructed
+`TxnOp::Insert { key: Vec<u8>, value: Vec<u8>, .. }` (and
+similarly for `Erase` / `RenameObject`) per inner op, then
+encoded the enum-of-`Vec`s — two extra clones per op the WAL
+never needed.
+
+Mid-batch error handling is preserved: if a walker call returns
+`Err` partway through, the encoder's `Drop` rolls the partial
+record bytes off the WAL pending buffer (truncate to where
+`begin` started). On `Ok`, the encoder backpatches the inner
+count + body length and appends the CRC — byte-identical to
+what the old `encode_record(&TxnOp::Batch { .. })` path would
+have produced (verified by `batch_encoder_wire_matches_encode_record`
+in `src/journal/codec.rs::tests`).
+
+### Performance — rename's wasted `wants_prev`
+
+`Tree::rename`'s two walker calls (`erase_multi` on src,
+`insert_multi` on dst) were passing `wants_prev=true` even
+though the rename already read the src value in the pre-walker
+lookup and the dst-existence check (or `force=true`) gates the
+insert side. The walker-materialised previous values were
+dropped on the floor. Flipped to `wants_prev=false` on both;
+same change applied inside the batch-path rename arm of
+`apply_batch_walker_inline`.
+
+### Internal — codec cleanup
+
+- Dropped `write_optional_bytes` / `read_optional_bytes` helpers
+  (no callers after Insert/Erase shed their optional slots).
+- `WalWriter::append` (the generic `&TxnOp` entry) gains
+  `#[cfg_attr(not(test), allow(dead_code))]` — only test
+  fixtures exercising structural variants (Split / Merge /
+  Compact / MemMarker / NewTree / RmTree) still go through it;
+  the four user-facing hot paths all use the per-variant fast
+  paths (`append_insert` / `append_erase` /
+  `append_rename_object` / `append_batch`).
+- `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
+  Tree helpers folded into the new `apply_batch_walker_inline`.
+
 ## [0.3.0] — 2026-05-20
 
 ### Breaking — API redesign (split returning from blind)

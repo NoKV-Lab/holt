@@ -68,10 +68,7 @@ pub(super) fn read_leaf_kv(frame: BlobFrameRef<'_>, slot: u16) -> Result<(Vec<u8
 /// which needs only the existing key to decide
 /// `update / divergence / extent-grow` and never returns the prior
 /// value to the caller.
-pub(super) fn read_leaf_key_only(
-    frame: BlobFrameRef<'_>,
-    slot: u16,
-) -> Result<(Vec<u8>, Leaf)> {
+pub(super) fn read_leaf_key_only(frame: BlobFrameRef<'_>, slot: u16) -> Result<(Vec<u8>, Leaf)> {
     let body = frame
         .body_of_slot(slot)
         .ok_or(Error::node_corrupt("read_leaf_key_only: body"))?;

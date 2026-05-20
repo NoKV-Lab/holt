@@ -1,4 +1,4 @@
-//! Read-path descent — `lookup` / `lookup_at` / `lookup_multi`.
+//! Read-path descent — `lookup` / `lookup_at` / `lookup_multi_with`.
 //!
 //! All entry points take a [`BlobFrameRef`] (or a
 //! [`BufferManager`] for the multi-blob variant) so the walker
@@ -56,13 +56,28 @@ pub(super) fn lookup_at<'a>(
 /// the parent-side path is stale too. Restarting catches the
 /// new tree shape from the top.
 ///
-/// On match the value bytes are cloned out so the pin / guard can
-/// drop; on `NotFound` returns `Ok(None)`.
-pub fn lookup_multi(
+/// On match `consume` is invoked on the live cache-pin slice and
+/// its return value is wrapped into `Some(_)`; on `NotFound`
+/// returns `Ok(None)`. The closure runs after the optimistic
+/// `validate()` succeeds — same race contract as the v0.2 owned
+/// variant (`|v| v.to_vec()` recreates it byte-for-byte). Keep
+/// the closure short: it borrows directly into the cache buffer
+/// and a slow closure widens the optimistic race window.
+///
+/// `F: FnMut` rather than `FnOnce` so the restart loop can refer
+/// to the same closure across multiple iterations — the closure
+/// is invoked at most once per successful lookup (no restart);
+/// callers can treat the bound as effectively `FnOnce` for
+/// reasoning purposes.
+pub fn lookup_multi_with<R, F>(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     key: &[u8],
-) -> Result<Option<Vec<u8>>> {
+    mut consume: F,
+) -> Result<Option<R>>
+where
+    F: FnMut(&[u8]) -> R,
+{
     // Outer loop: each iteration is one full attempt; we restart
     // here when an optimistic snapshot is invalidated.
     'restart: loop {
@@ -83,7 +98,7 @@ pub fn lookup_multi(
             }
             match result {
                 Err(e) => return Err(e),
-                Ok(LookupResult::Found(v)) => return Ok(Some(v.to_vec())),
+                Ok(LookupResult::Found(v)) => return Ok(Some(consume(v))),
                 Ok(LookupResult::NotFound) => return Ok(None),
                 Ok(LookupResult::Crossing(c)) => c,
             }
@@ -108,7 +123,7 @@ pub fn lookup_multi(
             }
             match result {
                 Err(e) => return Err(e),
-                Ok(LookupResult::Found(v)) => return Ok(Some(v.to_vec())),
+                Ok(LookupResult::Found(v)) => return Ok(Some(consume(v))),
                 Ok(LookupResult::NotFound) => return Ok(None),
                 Ok(LookupResult::Crossing(c)) => {
                     current_guid = c.child_guid;
