@@ -187,6 +187,19 @@ threads. v0.3 makes the I/O side worth that structure:
 - `tests/bench_manifest_checkpoint.rs` isolates this path with
   path-shaped insert/delete/compact/checkpoint rounds and reports
   checkpoint latency percentiles plus manifest/WAL/data sizes.
+- The WAL worker tracks whether the current log has uncheckpointed
+  records, including records found when reopening a nonempty WAL.
+  Clean checkpoints now skip empty WAL flush/truncate work instead
+  of paying a `sync_data` or temp-file rename on every idle round.
+  It also tracks the durable WAL frontier, so checkpoint does not
+  re-fsync records that already passed through durable group
+  commit. A nonempty WAL discovered on reopen is treated as
+  replayable but not proven fsync-durable, so the first checkpoint
+  after replay still forces a WAL flush before backend durability.
+  Background checkpoint rounds also handle WAL-only truncate work
+  without paying an unrelated backend Sync. WAL truncate itself is
+  an in-place `ftruncate` + `sync_data`, avoiding the older
+  temp-file write, rename, and fd reopen after every checkpoint.
 
 ### P3 — CPU hot-path work
 

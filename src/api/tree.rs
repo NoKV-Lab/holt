@@ -1074,9 +1074,11 @@ impl Tree {
 
         if entries.is_empty() && snap_pending.is_empty() && !self.backend.needs_flush() {
             if let Some(journal) = &self.journal {
-                let _commit = self.commit_gate.enter_checkpoint();
-                if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
-                    journal.truncate()?;
+                if journal.needs_checkpoint() {
+                    let _commit = self.commit_gate.enter_checkpoint();
+                    if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
+                        journal.truncate()?;
+                    }
                 }
             }
             return Ok(());

@@ -155,8 +155,18 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // edge: a prior round may have retired dirty entries after a
     // successful write-through but failed the following backend
     // Sync, so there is still durable work even when dirty/pending
-    // are both empty.
+    // are both empty. A WAL-only round can skip backend Sync but
+    // must still retry truncate.
     if snap.is_empty() && merged == 0 && pending.is_empty() && !shared.bm.needs_flush() {
+        if let Some(journal) = &shared.journal {
+            if journal.needs_checkpoint() {
+                let _commit = shared.commit_gate.enter_checkpoint();
+                if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
+                    journal.truncate()?;
+                    shared.truncates.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");

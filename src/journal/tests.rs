@@ -403,6 +403,53 @@ fn empty_wal_file_after_header_only() {
 }
 
 #[test]
+fn truncate_reuses_live_wal_file_in_place() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut w = WalWriter::create(&path, 0).unwrap();
+    w.append(
+        &TxnOp::Insert {
+            tree_id: 0,
+            seq: 1,
+            key: b"before-truncate".to_vec(),
+            value: b"v".to_vec(),
+        },
+        1,
+    )
+    .unwrap();
+    w.flush().unwrap();
+    assert!(fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
+
+    w.truncate().unwrap();
+    assert_eq!(w.bytes_written(), FILE_HEADER_SIZE as u64);
+    assert_eq!(fs::metadata(&path).unwrap().len(), FILE_HEADER_SIZE as u64);
+
+    w.append(
+        &TxnOp::Insert {
+            tree_id: 0,
+            seq: 2,
+            key: b"after-truncate".to_vec(),
+            value: b"v2".to_vec(),
+        },
+        2,
+    )
+    .unwrap();
+    w.flush().unwrap();
+    drop(w);
+
+    let mut seen = Vec::new();
+    let (header, stats) = replay(&path, |op, seq, _| {
+        seen.push((seq, op.clone()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(header.tree_id, 0);
+    assert_eq!(stats.records_seen, 1);
+    assert_eq!(stats.highest_seq, Some(2));
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
 fn many_records_stream_round_trip() {
     // ~5 KB of records, ensuring the buffered append path handles
     // many writes between flushes.

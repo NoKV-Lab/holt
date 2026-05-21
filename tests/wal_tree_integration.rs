@@ -78,6 +78,50 @@ fn durable_writers_share_group_commit_syncs() {
 }
 
 #[test]
+fn clean_checkpoint_skips_empty_wal_flush() {
+    let dir = tempdir().unwrap();
+    let tree = Tree::open(TreeConfig::new(dir.path())).unwrap();
+
+    let before = tree.stats().unwrap().journal.unwrap();
+    tree.checkpoint().unwrap();
+    let after = tree.stats().unwrap().journal.unwrap();
+    assert_eq!(
+        after.syncs, before.syncs,
+        "checkpoint on a fresh tree must not fsync an empty WAL",
+    );
+
+    tree.put(b"wal-clean/k", b"v").unwrap();
+    tree.checkpoint().unwrap();
+    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+
+    let after_truncate = tree.stats().unwrap().journal.unwrap();
+    tree.checkpoint().unwrap();
+    let clean_again = tree.stats().unwrap().journal.unwrap();
+    assert_eq!(
+        clean_again.syncs, after_truncate.syncs,
+        "checkpoint after WAL truncate must stay a no-op",
+    );
+}
+
+#[test]
+fn checkpoint_reuses_durable_group_commit_wal_sync() {
+    let dir = tempdir().unwrap();
+    let tree = Tree::open(durable_cfg(dir.path())).unwrap();
+
+    tree.put(b"durable-checkpoint/k", b"v").unwrap();
+    let after_put = tree.stats().unwrap().journal.unwrap();
+    assert!(after_put.syncs > 0);
+
+    tree.checkpoint().unwrap();
+    let after_checkpoint = tree.stats().unwrap().journal.unwrap();
+    assert_eq!(
+        after_checkpoint.syncs, after_put.syncs,
+        "checkpoint must not fsync WAL records already made durable by group commit",
+    );
+    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+}
+
+#[test]
 fn persistent_put_then_reopen_via_wal_replay() {
     let dir = tempdir().unwrap();
     let cfg = durable_cfg(dir.path());

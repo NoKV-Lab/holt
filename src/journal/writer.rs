@@ -23,7 +23,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::api::errors::{Error, Result};
 
@@ -46,9 +46,6 @@ pub const AUTO_FLUSH_THRESHOLD: usize = 64 * 1024;
 /// Append-only WAL writer with explicit `flush`-for-durability.
 #[derive(Debug)]
 pub struct WalWriter {
-    /// Path of the underlying file — needed by `truncate` to
-    /// atomically replace the live log on checkpoint.
-    path: PathBuf,
     /// Underlying file handle, opened in append mode.
     file: File,
     /// Buffered bytes not yet handed to the OS.
@@ -76,7 +73,6 @@ impl WalWriter {
         // even if other code seeks around.
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Self {
-            path: path.to_path_buf(),
             file,
             pending: Vec::with_capacity(4096),
             bytes_written: FILE_HEADER_SIZE as u64,
@@ -98,7 +94,6 @@ impl WalWriter {
         let file = OpenOptions::new().append(true).open(path)?;
         let bytes_written = file.metadata()?.len();
         Ok(Self {
-            path: path.to_path_buf(),
             file,
             pending: Vec::with_capacity(4096),
             bytes_written,
@@ -137,6 +132,15 @@ impl WalWriter {
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written + self.pending.len() as u64
+    }
+
+    /// True when this WAL contains bytes beyond the fixed file
+    /// header. Used by the group-commit worker to distinguish a
+    /// genuinely clean WAL from an opened log that replay already
+    /// consumed but checkpoint has not truncated yet.
+    #[must_use]
+    pub(crate) fn has_records(&self) -> bool {
+        self.bytes_written + self.pending.len() as u64 > FILE_HEADER_SIZE as u64
     }
 
     /// Stage a single `TxnOp` for the next flush.
@@ -214,46 +218,26 @@ impl WalWriter {
         self.pending.clear();
     }
 
-    /// Atomically reset the log to a fresh, header-only file.
+    /// Reset the log to the existing header-only prefix.
     ///
     /// Used by `Tree::checkpoint` once every record up through the
     /// last `flush` is reflected in a durable blob commit: the WAL
     /// has nothing the blob doesn't already have, so we drop the
     /// records and start growing the log again from zero.
     ///
-    /// Implementation: write a fresh header to a sibling temp file
-    /// (`<path>.tmp`), `sync_data` it, atomically `rename` over
-    /// the live log, and reopen the file handle. The temp file's
-    /// pre-rename header has the **same** tree_id; `created_at`
-    /// gets refreshed to the current wall clock.
+    /// Implementation: drop the in-memory tail, `ftruncate` the
+    /// live WAL back to [`FILE_HEADER_SIZE`], then `sync_data`.
+    /// After checkpoint the old records are redundant: if a crash
+    /// leaves the old file length in place, replay is safe; if it
+    /// leaves the truncated length, backend is already durable.
+    /// Avoiding temp-file rename keeps the checkpoint tail cheap.
     ///
     /// Any `pending` records buffered since the last `flush` are
     /// dropped — call `flush()` first if they matter.
     pub fn truncate(&mut self) -> Result<()> {
         self.pending.clear();
-
-        let tmp_path = self.path.with_extension("wal.tmp");
-        {
-            let mut tmp = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            let header = FileHeader::now(self.header.tree_id);
-            let mut buf = Vec::with_capacity(FILE_HEADER_SIZE);
-            encode_file_header(&header, &mut buf);
-            tmp.write_all(&buf)?;
-            tmp.sync_data()?;
-            self.header = header;
-        }
-
-        // Atomic replace — on POSIX, `rename` is atomic, and the
-        // new fd inherits the durable state of the temp file.
-        std::fs::rename(&tmp_path, &self.path)?;
-
-        // The previous append-mode handle is now pointing at the
-        // unlinked old inode; reopen against the new file.
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
+        self.file.set_len(FILE_HEADER_SIZE as u64)?;
+        self.file.sync_data()?;
         self.bytes_written = FILE_HEADER_SIZE as u64;
 
         #[cfg(feature = "tracing")]
