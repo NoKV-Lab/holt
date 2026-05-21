@@ -3,6 +3,9 @@ fuzz/Cargo.lock
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/target/
+coverage/
+coverage.txt
+lcov.info
 *.profraw
 *.swp
 *.swo

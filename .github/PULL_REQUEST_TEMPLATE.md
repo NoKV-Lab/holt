@@ -6,6 +6,8 @@ Thanks for sending a PR! A few checks before you click "Open":
 - [ ] `cargo fmt --all --check` passes.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
 - [ ] `cargo test --workspace --lib --tests --examples` passes.
+- [ ] `cargo +nightly fuzz run atomic_model -- -runs=512` passes when fuzz-sensitive paths changed.
+- [ ] `cargo llvm-cov --workspace --all-features --lib --tests --examples --locked --fail-under-lines 88` passes when coverage-sensitive paths changed.
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` passes.
 - [ ] If you touched a `unsafe` block, the `// SAFETY: ...` comment
       still describes the invariant correctly.

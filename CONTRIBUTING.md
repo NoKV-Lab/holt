@@ -60,13 +60,32 @@ library without joining the normal workspace.
 
 ```bash
 cargo install cargo-fuzz
-cargo fuzz run atomic_model
+rustup toolchain install nightly
+cargo +nightly fuzz run atomic_model
 ```
 
 `atomic_model` drives a persistent tree against a `BTreeMap` oracle,
 including reopen/checkpoint, range scans, conditional writes, and
 atomic batches. Crash artifacts and generated corpora live under
 `fuzz/artifacts/` and `fuzz/corpus/` and are ignored by git.
+
+## Coverage
+
+Use LLVM source coverage for release-facing changes. It exercises the
+same lib + integration + example targets as CI and fails if line
+coverage drops below the current project floor.
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo llvm-cov --workspace --all-features --lib --tests --examples --locked --fail-under-lines 88
+```
+
+For a browsable report:
+
+```bash
+cargo llvm-cov report --html --output-dir coverage
+```
 
 ## Conventions
 

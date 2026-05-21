@@ -200,3 +200,86 @@ impl From<FreeError> for Error {
         Self::Free(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn node_corrupt_context_is_enriched_once() {
+        let err = Error::node_corrupt("slot decode")
+            .with_blob_guid([0xAB; 16])
+            .with_blob_guid([0xCD; 16])
+            .with_slot(7)
+            .with_slot(9);
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("node corrupt at slot decode"));
+        assert!(rendered.contains("blob=[ab, ab, ab, ab]"));
+        assert!(rendered.contains("slot=7"));
+        assert!(!rendered.contains("cd"));
+        assert!(!rendered.contains("slot=9"));
+    }
+
+    #[test]
+    fn display_covers_public_error_variants() {
+        let cases = [
+            (
+                Error::KeyTooLong { len: 70_000 }.to_string(),
+                "key too long (70000 bytes; max 65535)",
+            ),
+            (
+                Error::ValueTooLong { len: 70_001 }.to_string(),
+                "value too long (70001 bytes; max 65535)",
+            ),
+            (
+                Error::NotYetImplemented("strict prefix").to_string(),
+                "not yet implemented: strict prefix",
+            ),
+            (
+                Error::Internal("lost dirty image").to_string(),
+                "internal invariant violated: lost dirty image",
+            ),
+            (
+                Error::ReplaySanityFailed {
+                    context: "bad CRC",
+                    record_offset: 42,
+                }
+                .to_string(),
+                "WAL replay sanity-check failed at offset 42: bad CRC",
+            ),
+            (Error::NotFound.to_string(), "key not found"),
+            (
+                Error::DstExists.to_string(),
+                "destination key already exists (use force=true to overwrite)",
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn error_sources_are_exposed_for_wrapped_errors_only() {
+        let blob = Error::from(io::Error::other("disk"));
+        assert!(blob.source().is_some());
+
+        let alloc = Error::from(AllocError::OutOfSlots);
+        assert!(alloc.source().is_some());
+        assert_eq!(
+            alloc.to_string(),
+            format!("alloc: {}", AllocError::OutOfSlots)
+        );
+
+        let free = Error::from(FreeError::InvalidSlot(99));
+        assert!(free.source().is_some());
+        assert_eq!(free.to_string(), "free: free_node: invalid slot index 99");
+
+        assert!(Error::NotFound.source().is_none());
+        assert!(Error::DstExists.source().is_none());
+    }
+}
