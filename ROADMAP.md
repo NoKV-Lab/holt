@@ -246,21 +246,187 @@ still material.
   shape probes should be profile-driven and promoted only if they
   become part of the release comparison surface.
 
-### Deferred until after the performance core
+## v0.4 — Scale-stable metadata performance
 
-These are useful features, but they do not define the metadata
-engine's ceiling and should not compete with the v0.3 hot path:
+Goal: keep the v0.3 cache-resident read/list advantages while making
+large-tree writes and negative metadata probes stay flat as the
+namespace grows from millions to tens or hundreds of millions of
+records. v0.4 should be judged by scale curves, not by small-tree
+microbench wins.
 
-- Full MVCC snapshots.
-- Change feed / subscription API.
-- Column families.
-- Encryption-at-rest.
-- Compression.
-- OpenTelemetry bridge.
+The main risk at this point is not one more syscall on the durable
+path. It is shape drift: overfull hot prefixes, too many cross-blob
+hops, negative lookups walking full descents, checkpoint bursts
+competing with writers, and bulk creates paying one full ART descent
+per key. The v0.4 work is therefore workload-shaped rather than
+generic KV tuning.
+
+### P0 — Prefix shape policy and write-stability guardrails
+
+- Add explicit shape-control metrics to release benches:
+  blob fill distribution, blob-hop histogram, spillover/merge rate,
+  checkpoint dirty backlog, and WAL sync batching ratio at each scale
+  point.
+- Promote prefix/subtree boundaries deliberately. The generic API
+  should be a shape hint such as `promote_prefix(prefix)`, not an
+  S3-specific "bucket" concept. Object-store users can map one
+  bucket or tenant to a promoted prefix; filesystem users can map hot
+  directories or mount roots.
+- Make spill/merge policy backlog-aware. When writers are flooding a
+  hot prefix, the engine should prefer bounded child splits and defer
+  cosmetic merges instead of oscillating between split/compact/merge.
+- Add write-stability benches that model untar/rsync/S3-sync bursts:
+  sorted path creates, random creates under one hot prefix, mixed
+  create/delete churn, and large-prefix list while writes continue.
+
+Success criteria:
+
+- `put` and `atomic` throughput should degrade smoothly with scale:
+  no cliff when moving from 2M to larger trees.
+- Average blob hops should stay low and p99 blob hops should be
+  explainable by explicit promoted boundaries, not accidental shape
+  drift.
+- Checkpoint backlog should drain without forcing foreground writers
+  through long global waits.
+
+### P1 — Negative lookup filter, in-memory first
+
+Metadata workloads are unusually negative-heavy: `open/stat/head`
+often ask for keys that do not exist. Holt should exploit that, but
+without changing the disk format prematurely.
+
+- Add a per-cached-blob negative-lookup sidecar filter first. It must
+  never introduce false negatives: on mutation uncertainty, mark the
+  filter stale and fall back to the full walker.
+- Use the filter only at cross-blob boundaries and within hot prefixes
+  where avoiding another blob hop is measurable.
+- Rebuild filters from blob contents on cache fill. Persisting the
+  filter in the blob header is a later on-disk-format decision, not
+  the first implementation.
+
+Success criteria:
+
+- Negative point lookup latency improves on path-shaped workloads
+  without regressing positive lookups.
+- Filter memory overhead is bounded and visible in `Tree::stats`.
+
+### P2 — Explicit bulk-load path
+
+Bulk create is a metadata-specific write pattern. Treating an archive
+restore as N unrelated `put`s leaves performance on the table.
+
+- Add an explicit sorted bulk-load API or builder rather than hidden
+  timing heuristics. Callers that know they are loading a directory,
+  bucket prefix, image layer, or archive can opt in.
+- Build final ART shapes directly for sorted keys: avoid repeated
+  Node4 -> Node16 -> Node48 -> Node256 promotion and repeated descent
+  through the same prefix.
+- Commit each bulk batch as one atomic WAL envelope with bounded byte
+  and key-count limits, so crash replay and memory use stay simple.
+
+Success criteria:
+
+- Mass-create workloads improve by multiples, not percentages.
+- Point-write latency for ordinary single-key writes is unchanged.
+
+### P3 — Async checkpoint scheduler, not more io_uring flags
+
+The v0.3 Linux backend already has the useful fixed-file /
+fixed-buffer / batched-ring foundation. The next I/O gain is not
+`SQPOLL` or linked-fsync by default; those did not help Holt's short
+checkpoint batches enough to justify the complexity. The next gain is
+execution-model work:
+
+- Keep dirty-byte and dirty-age watermarks so checkpoint starts before
+  the dirty set becomes a foreground-write problem.
+- Let the I/O worker keep multiple write batches in flight when the
+  backend can absorb queue depth, while preserving the WAL-before-data
+  and data-before-manifest ordering boundaries.
+- Add foreground write throttling only as a last resort, driven by
+  dirty backlog and checkpoint lag, not by raw operation count.
+- Keep the default Unix `pwritev` path simple and auditable; Linux
+  `io_uring` should remain an internal backend optimization with the
+  same correctness contract.
+
+Success criteria:
+
+- Under sustained writes, p99 put latency should remain bounded while
+  checkpoint makes progress.
+- Idle and lightly loaded trees should not pay extra scheduler cost.
+
+## v0.5 — Stronger metadata semantics without MVCC tax
+
+Goal: add the missing semantics that real metadata servers need while
+preserving Holt's core design: path-shaped keys, opaque byte values,
+single-node embedded library, no always-on MVCC version chains.
+
+### P0 — Snapshot view for list/readdir
+
+- Add a `view` / snapshot-list path that copies the blobs needed for a
+  prefix scan into private memory, then scans the copy without holding
+  writer latches.
+- This gives stable list/readdir semantics without per-write MVCC
+  overhead. The cost is paid by the list operation proportional to the
+  prefix it asks to observe.
+- Keep ordinary `range()` as the fast best-effort iterator only if the
+  API clearly distinguishes the two modes. If the public API must stay
+  minimal, prefer one strong iterator and optimize it.
+
+### P1 — WAL tail / change feed with explicit retention
+
+- Expose a change-feed API only after WAL retention is designed.
+  Today's checkpoint path truncates WAL, so `subscribe(from_seq)`
+  cannot pretend old history is always available.
+- The first version should support live-tail subscription and bounded
+  retained segments for cache invalidation, audit, and follower-style
+  experiments.
+- Follower mode or replication should remain outside the core release
+  until the single-node durability contract has a crisp tail-retention
+  story.
+
+### P2 — Sealed immutable subtree
+
+- Add an optional `seal_prefix(prefix)` mode for image layers,
+  archives, and package indexes that become read-only after build.
+- Start with semantic enforcement and latch elision. Huge pages,
+  mmap tiers, and TLB-focused placement are later profile-driven
+  optimizations.
+
+## v0.6+ — Optional adapters and research-grade hardware work
+
+These are useful, but they should not pollute the core engine or the
+0.4/0.5 scale-stability work.
+
+- POSIX dirent/inode separation belongs in an adapter/example layer:
+  e.g. `d/<path>` for dirents and `i/<inode>` for inode metadata.
+- ACL inheritance, S3 bucket semantics, lifecycle policy, and object
+  versioning are schema conventions above Holt's opaque byte values.
+- Value compression should be an optional codec layer, not a core
+  schema-aware dictionary unless benchmarks prove opaque values are
+  the limiting factor.
+- Prefix interning changes node layout and adds read indirection; do
+  it only after path-memory profiles show it beats the existing ART
+  prefix compression.
+- NUMA, CXL.mem, ZNS, and lockless rename are server-appliance or
+  research tracks. They are valid experiments, but not release
+  blockers for an embedded metadata engine.
+
+## Non-goals for the core engine
+
+- Do not bake S3 object schemas, inode structs, ACL formats, JSON,
+  protobuf, chunk lists, or lifecycle rules into the storage core.
+  Holt stores opaque values; higher layers own schema.
+- Do not add full MVCC until a concrete workload proves copy-on-list
+  and atomic CAS batches are insufficient.
+- Do not chase io_uring flags that make the backend harder to audit
+  without moving a measured bottleneck.
+- Do not add compatibility aliases for renamed public APIs. The crate
+  is still young enough that clean API shape matters more than
+  transition glue.
 
 ## v1.0 — Production-ready
 
-- v0.3 public surface and persistence format stabilized.
+- Post-v0.5 public surface and persistence format stabilized.
 - Multi-platform stability across Linux + macOS (optional BSDs
   if anyone needs them).
 - Real production deployments + case studies.
