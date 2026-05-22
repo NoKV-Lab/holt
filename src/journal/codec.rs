@@ -463,38 +463,27 @@ fn variant_tag(op: &WalOp) -> u8 {
 #[cfg(test)]
 fn encode_body(op: &WalOp, out: &mut Vec<u8>) {
     match op {
-        WalOp::Insert {
-            tree_id,
-            seq: _,
-            key,
-            value,
-        } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
+        WalOp::Insert { key, value } => {
+            out.extend_from_slice(&0u64.to_le_bytes());
             write_bytes(out, key);
             write_bytes(out, value);
         }
-        WalOp::Erase {
-            tree_id,
-            seq: _,
-            key,
-        } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
+        WalOp::Erase { key } => {
+            out.extend_from_slice(&0u64.to_le_bytes());
             write_bytes(out, key);
         }
         WalOp::RenameObject {
-            tree_id,
-            seq: _,
             src_key,
             dst_key,
             force,
         } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
             write_bytes(out, src_key);
             write_bytes(out, dst_key);
             out.push(u8::from(*force));
         }
-        WalOp::Batch { tree_id, ops } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
+        WalOp::Batch { ops } => {
+            out.extend_from_slice(&0u64.to_le_bytes());
             let count = u32::try_from(ops.len()).expect("batch ops fit in u32");
             out.extend_from_slice(&count.to_le_bytes());
             for inner in ops {
@@ -561,7 +550,7 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     }
 
     let body = &buf[RECORD_HEADER_SIZE..body_end];
-    let op = decode_body(ty, body, seq)?;
+    let op = decode_body(ty, body)?;
 
     Ok(DecodedRecord {
         op,
@@ -570,9 +559,9 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     })
 }
 
-fn decode_body(ty: u8, body: &[u8], seq: u64) -> Result<WalOp> {
+fn decode_body(ty: u8, body: &[u8]) -> Result<WalOp> {
     let mut cursor = body;
-    let op = decode_body_into(ty, &mut cursor, seq)?;
+    let op = decode_body_into(ty, &mut cursor)?;
     if !cursor.is_empty() {
         return Err(sanity("trailing bytes after variant body"));
     }
@@ -583,39 +572,32 @@ fn decode_body(ty: u8, body: &[u8], seq: u64) -> Result<WalOp> {
 /// Doesn't enforce body-exhaustion — `decode_body` wraps with
 /// that check, and `TY_BATCH` re-enters this for each inner op
 /// (sharing the parent's cursor as the inner-frame stream).
-fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<WalOp> {
+fn decode_body_into(ty: u8, body: &mut &[u8]) -> Result<WalOp> {
     let op = match ty {
         TY_INSERT => {
-            let tree_id = read_u64(body)?;
+            let _tree_id = read_u64(body)?;
             let key = read_bytes(body)?;
             let value = read_bytes(body)?;
-            WalOp::Insert {
-                tree_id,
-                seq,
-                key,
-                value,
-            }
+            WalOp::Insert { key, value }
         }
         TY_ERASE => {
-            let tree_id = read_u64(body)?;
+            let _tree_id = read_u64(body)?;
             let key = read_bytes(body)?;
-            WalOp::Erase { tree_id, seq, key }
+            WalOp::Erase { key }
         }
         TY_RENAME_OBJECT => {
-            let tree_id = read_u64(body)?;
+            let _tree_id = read_u64(body)?;
             let src_key = read_bytes(body)?;
             let dst_key = read_bytes(body)?;
             let force = read_u8(body)? != 0;
             WalOp::RenameObject {
-                tree_id,
-                seq,
                 src_key,
                 dst_key,
                 force,
             }
         }
         TY_BATCH => {
-            let tree_id = read_u64(body)?;
+            let _tree_id = read_u64(body)?;
             let count = read_u32(body)? as usize;
             let mut ops = Vec::with_capacity(count);
             while ops.len() < count {
@@ -624,27 +606,21 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<WalOp> {
                     return Err(sanity("nested Batch is rejected"));
                 }
                 if inner_ty == TY_BATCH_INSERT_RUN {
-                    decode_insert_run(body, seq, count, &mut ops)?;
+                    decode_insert_run(body, count, &mut ops)?;
                 } else {
-                    let inner_seq = seq.wrapping_add(ops.len() as u64);
-                    let inner = decode_body_into(inner_ty, body, inner_seq)?;
+                    let inner = decode_body_into(inner_ty, body)?;
                     ops.push(inner);
                 }
             }
-            WalOp::Batch { tree_id, ops }
+            WalOp::Batch { ops }
         }
         _ => return Err(sanity("unknown WalOp variant tag")),
     };
     Ok(op)
 }
 
-fn decode_insert_run(
-    body: &mut &[u8],
-    base_seq: u64,
-    batch_count: usize,
-    ops: &mut Vec<WalOp>,
-) -> Result<()> {
-    let tree_id = read_u64(body)?;
+fn decode_insert_run(body: &mut &[u8], batch_count: usize, ops: &mut Vec<WalOp>) -> Result<()> {
+    let _tree_id = read_u64(body)?;
     let count = read_u32(body)? as usize;
     if count == 0 {
         return Err(sanity("empty BatchInsertRun is rejected"));
@@ -659,10 +635,7 @@ fn decode_insert_run(
         *body = rest;
         let (value, rest) = take(body, value_len)?;
         *body = rest;
-        let seq = base_seq.wrapping_add(ops.len() as u64);
         ops.push(WalOp::Insert {
-            tree_id,
-            seq,
             key: key.to_vec(),
             value: value.to_vec(),
         });
@@ -735,8 +708,6 @@ mod tests {
     fn roundtrip_insert_small() {
         roundtrip(
             WalOp::Insert {
-                tree_id: 1,
-                seq: 42,
                 key: b"img/01.jpg".to_vec(),
                 value: b"v-new".to_vec(),
             },
@@ -748,8 +719,6 @@ mod tests {
     fn roundtrip_insert_large_value() {
         roundtrip(
             WalOp::Insert {
-                tree_id: 0,
-                seq: 7,
                 key: b"new/key".to_vec(),
                 value: vec![0xAB; 200],
             },
@@ -761,8 +730,6 @@ mod tests {
     fn roundtrip_erase() {
         roundtrip(
             WalOp::Erase {
-                tree_id: 3,
-                seq: 99,
                 key: b"img/02.jpg".to_vec(),
             },
             99,
@@ -773,8 +740,6 @@ mod tests {
     fn roundtrip_rename_object() {
         roundtrip(
             WalOp::RenameObject {
-                tree_id: 2,
-                seq: 10,
                 src_key: b"a/b".to_vec(),
                 dst_key: b"a/c".to_vec(),
                 force: true,
@@ -824,8 +789,6 @@ mod tests {
     #[test]
     fn record_length_breakdown_is_predictable() {
         let op = WalOp::Insert {
-            tree_id: 0,
-            seq: 0,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
@@ -839,8 +802,6 @@ mod tests {
     #[test]
     fn corrupt_crc_is_caught() {
         let op = WalOp::Insert {
-            tree_id: 0,
-            seq: 1,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
@@ -858,11 +819,7 @@ mod tests {
 
     #[test]
     fn corrupt_magic_is_caught() {
-        let op = WalOp::Erase {
-            tree_id: 0,
-            seq: 5,
-            key: b"k".to_vec(),
-        };
+        let op = WalOp::Erase { key: b"k".to_vec() };
         let mut buf = Vec::new();
         encode_record(&op, 5, &mut buf);
         buf[0] ^= 0xFF;
@@ -877,8 +834,6 @@ mod tests {
     #[test]
     fn truncated_record_is_caught() {
         let op = WalOp::Insert {
-            tree_id: 0,
-            seq: 1,
             key: vec![0xAB; 100],
             value: vec![0xCD; 100],
         };
@@ -897,11 +852,7 @@ mod tests {
 
     #[test]
     fn unknown_variant_tag_is_caught() {
-        let op = WalOp::Erase {
-            tree_id: 0,
-            seq: 1,
-            key: b"k".to_vec(),
-        };
+        let op = WalOp::Erase { key: b"k".to_vec() };
         let mut buf = Vec::new();
         encode_record(&op, 1, &mut buf);
         // Overwrite the ty byte (header offset 16) with a bogus value.
@@ -926,8 +877,6 @@ mod tests {
         let mut buf = Vec::new();
         encode_record(
             &WalOp::Insert {
-                tree_id: 0,
-                seq: 1,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             },
@@ -936,8 +885,6 @@ mod tests {
         );
         encode_record(
             &WalOp::Erase {
-                tree_id: 0,
-                seq: 2,
                 key: b"k1".to_vec(),
             },
             2,
@@ -958,22 +905,13 @@ mod tests {
         // should not need explicit per-inner seq storage.
         let base = 100u64;
         let batch = WalOp::Batch {
-            tree_id: 0,
             ops: vec![
                 WalOp::Insert {
-                    tree_id: 0,
-                    seq: base,
                     key: b"a".to_vec(),
                     value: b"v-a".to_vec(),
                 },
-                WalOp::Erase {
-                    tree_id: 0,
-                    seq: base + 1,
-                    key: b"b".to_vec(),
-                },
+                WalOp::Erase { key: b"b".to_vec() },
                 WalOp::RenameObject {
-                    tree_id: 0,
-                    seq: base + 2,
                     src_key: b"c".to_vec(),
                     dst_key: b"d".to_vec(),
                     force: false,
@@ -987,32 +925,27 @@ mod tests {
         assert_eq!(r.seq, base);
         assert_eq!(r.bytes_consumed, buf.len());
         match r.op {
-            WalOp::Batch { tree_id, ops } => {
-                assert_eq!(tree_id, 0);
+            WalOp::Batch { ops } => {
                 assert_eq!(ops.len(), 3);
                 match &ops[0] {
-                    WalOp::Insert { seq, key, .. } => {
-                        assert_eq!(*seq, base);
+                    WalOp::Insert { key, value: _ } => {
                         assert_eq!(key, b"a");
                     }
                     other => panic!("expected Insert, got {other:?}"),
                 }
                 match &ops[1] {
-                    WalOp::Erase { seq, key, .. } => {
-                        assert_eq!(*seq, base + 1);
+                    WalOp::Erase { key } => {
                         assert_eq!(key, b"b");
                     }
                     other => panic!("expected Erase, got {other:?}"),
                 }
                 match &ops[2] {
                     WalOp::RenameObject {
-                        seq,
                         src_key,
                         dst_key,
                         force,
                         ..
                     } => {
-                        assert_eq!(*seq, base + 2);
                         assert_eq!(src_key, b"c");
                         assert_eq!(dst_key, b"d");
                         assert!(!force);
@@ -1026,16 +959,13 @@ mod tests {
 
     #[test]
     fn roundtrip_batch_empty() {
-        let batch = WalOp::Batch {
-            tree_id: 0,
-            ops: vec![],
-        };
+        let batch = WalOp::Batch { ops: vec![] };
         let mut buf = Vec::new();
         encode_record(&batch, 7, &mut buf);
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, 7);
         match r.op {
-            WalOp::Batch { ops, .. } => assert!(ops.is_empty()),
+            WalOp::Batch { ops } => assert!(ops.is_empty()),
             other => panic!("expected Batch, got {other:?}"),
         }
     }
@@ -1062,22 +992,13 @@ mod tests {
         // Path B: enum-and-encode.
         let mut buf_enum = Vec::new();
         let batch = WalOp::Batch {
-            tree_id: 0,
             ops: vec![
                 WalOp::Insert {
-                    tree_id: 0,
-                    seq: base,
                     key: b"a".to_vec(),
                     value: b"v-a".to_vec(),
                 },
-                WalOp::Erase {
-                    tree_id: 0,
-                    seq: base + 1,
-                    key: b"b".to_vec(),
-                },
+                WalOp::Erase { key: b"b".to_vec() },
                 WalOp::RenameObject {
-                    tree_id: 0,
-                    seq: base + 2,
                     src_key: b"c".to_vec(),
                     dst_key: b"d".to_vec(),
                     force: false,
@@ -1092,7 +1013,7 @@ mod tests {
         let r = decode_record(&buf_streaming).unwrap();
         assert_eq!(r.seq, base);
         match r.op {
-            WalOp::Batch { ops, .. } => assert_eq!(ops.len(), 3),
+            WalOp::Batch { ops } => assert_eq!(ops.len(), 3),
             other => panic!("expected Batch, got {other:?}"),
         }
     }
@@ -1136,16 +1057,12 @@ mod tests {
 
         let r = decode_record(&compact).unwrap();
         match r.op {
-            WalOp::Batch { ops, .. } => {
+            WalOp::Batch { ops } => {
                 assert_eq!(ops.len(), 3);
                 for (idx, op) in ops.iter().enumerate() {
-                    let WalOp::Insert {
-                        seq, key, value, ..
-                    } = op
-                    else {
+                    let WalOp::Insert { key, value } = op else {
                         panic!("expected insert, got {op:?}");
                     };
-                    assert_eq!(*seq, base + idx as u64);
                     assert_eq!(key, format!("k{:03}", idx + 1).as_bytes());
                     assert_eq!(value, format!("v{}", idx + 1).as_bytes());
                 }
@@ -1164,7 +1081,7 @@ mod tests {
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, 9);
         match r.op {
-            WalOp::Batch { ops, .. } => assert!(ops.is_empty()),
+            WalOp::Batch { ops } => assert!(ops.is_empty()),
             other => panic!("expected Batch, got {other:?}"),
         }
     }
@@ -1204,14 +1121,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "nested Batch is rejected")]
     fn nested_batch_encode_panics() {
-        let inner = WalOp::Batch {
-            tree_id: 0,
-            ops: vec![],
-        };
-        let outer = WalOp::Batch {
-            tree_id: 0,
-            ops: vec![inner],
-        };
+        let inner = WalOp::Batch { ops: vec![] };
+        let outer = WalOp::Batch { ops: vec![inner] };
         let mut buf = Vec::new();
         encode_record(&outer, 0, &mut buf);
     }

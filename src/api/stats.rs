@@ -8,6 +8,7 @@
 //! against concurrent writers.
 
 use crate::layout::BlobGuid;
+use crate::layout::{DATA_AREA_START, PAGE_SIZE};
 
 /// Per-blob counters captured by [`Tree::stats`](crate::Tree::stats).
 ///
@@ -83,6 +84,21 @@ pub struct TreeStats {
     pub total_compactions: u64,
     /// Sum of `tombstone_leaf_cnt` over every blob.
     pub total_tombstones: u64,
+    /// Sum of `num_ext_blobs` over every blob. In a tree-shaped
+    /// blob graph this is the number of cross-blob edges.
+    pub total_blob_edges: u64,
+    /// Number of reachable blobs with no installed `BlobNode`
+    /// children.
+    pub leaf_blob_count: u32,
+    /// Maximum cross-blob depth from the root blob. Root-only
+    /// trees report `0`.
+    pub max_blob_depth: u32,
+    /// Sum of per-blob depths, used to derive
+    /// [`Self::avg_blob_depth`].
+    pub total_blob_depth: u64,
+    /// Highest data-area occupancy among reachable blobs, in
+    /// per-mille units (`1000` = full data area).
+    pub max_blob_fill_per_mille: u32,
     /// Per-blob breakdown in BFS order from the root.
     pub blobs: Vec<BlobStats>,
     /// Number of blobs currently dirty in the BufferManager —
@@ -155,6 +171,51 @@ impl TreeStats {
             self.bm_walker_blob_hops as f64 / self.bm_walker_ops as f64
         }
     }
+
+    /// Average cross-blob graph depth across reachable blobs.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_blob_depth(&self) -> f64 {
+        if self.blob_count == 0 {
+            0.0
+        } else {
+            self.total_blob_depth as f64 / f64::from(self.blob_count)
+        }
+    }
+
+    /// Fraction of reachable blobs that are leaves in the blob graph.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn leaf_blob_ratio(&self) -> f64 {
+        if self.blob_count == 0 {
+            0.0
+        } else {
+            f64::from(self.leaf_blob_count) / f64::from(self.blob_count)
+        }
+    }
+
+    /// Average data-area occupancy across reachable blobs.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_blob_fill_ratio(&self) -> f64 {
+        if self.blob_count == 0 {
+            return 0.0;
+        }
+        let header_bytes = u64::from(self.blob_count) * DATA_AREA_START as u64;
+        let data_used = self.total_space_used.saturating_sub(header_bytes);
+        let data_capacity = u64::from(self.blob_count) * (PAGE_SIZE - DATA_AREA_START) as u64;
+        if data_capacity == 0 {
+            0.0
+        } else {
+            data_used as f64 / data_capacity as f64
+        }
+    }
+
+    /// Maximum data-area occupancy among reachable blobs.
+    #[must_use]
+    pub fn max_blob_fill_ratio(&self) -> f64 {
+        f64::from(self.max_blob_fill_per_mille) / 1000.0
+    }
 }
 
 /// Snapshot of the WAL group-commit worker's counters.
@@ -164,8 +225,8 @@ pub struct JournalStats {
     /// mutation paths.
     pub appends: u64,
     /// Number of append batches processed by the journal worker.
-    /// Under concurrent durable writers this should be lower than
-    /// [`Self::appends`].
+    /// Under concurrent `WalCommit::Sync` writers this should be
+    /// lower than [`Self::appends`].
     pub batches: u64,
     /// Number of `sync_data` calls issued by the journal worker,
     /// including explicit checkpoint flush barriers.

@@ -144,7 +144,7 @@ Durable group commit is implemented:
 - Writers encode complete WAL records into owned buffers, submit
   them to the worker, and wait outside the commit-publish critical
   section.
-- `wal_sync_on_commit=true` writers share one `sync_data` when
+- `WalCommit::Sync` writers share one `sync_data` when
   they arrive inside the short group window. `Tree::stats()` and
   Prometheus export journal appends, append batches, and sync
   counts so the batching ratio is observable.

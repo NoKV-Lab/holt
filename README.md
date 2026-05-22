@@ -104,13 +104,13 @@ layout, WAL, walker, and buffer-manager modules are not public API.
 Two storage modes; same `TreeBuilder`, one knob switches between them:
 
 ```rust
-use holt::TreeBuilder;
+use holt::{TreeBuilder, WalCommit};
 
 // File-backed production mode, Unix-only — Linux `O_DIRECT`,
 // macOS `F_NOCACHE`. The directory is created if missing.
 let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .buffer_pool_size(128)        // pinned 512 KB blobs (default 64)
-    .wal_sync_on_commit(false)    // see "Durability" below
+    .wal_commit(WalCommit::Enqueue) // default async journal acknowledgement
     .open()?;
 
 // In-memory — volatile, dies with the last handle. The path
@@ -235,6 +235,16 @@ for entry in tree.range().prefix(b"img/").delimiter(b'/') {
 ### Durability
 
 Per-op writes land in the journal worker + BufferManager cache.
+The WAL acknowledgement boundary is explicit:
+
+- **`WalCommit::Enqueue`** — default. Return after the journal
+  worker queue accepts the encoded record.
+- **`WalCommit::Write`** — return after WAL bytes reach the OS
+  page cache, with no per-op `sync_data`. This is the benchmark
+  profile matching RocksDB `WAL on, sync=false`.
+- **`WalCommit::Sync`** — return after `sync_data`; concurrent
+  writers can share one fsync through group commit.
+
 Disk-truth advances at:
 
 - **`Tree::checkpoint()`** — flush the journal (`sync_data`),
@@ -244,10 +254,6 @@ Disk-truth advances at:
 - **WAL auto-flush** — once the WAL writer's pending buffer
   crosses 64 KB it drains to the OS page cache (no `sync_data`).
   Bounds in-memory buffering even if `checkpoint` is rare.
-- **`wal_sync_on_commit = true`** — opt in to a per-op
-  durable journal acknowledgement. Concurrent writers can share one
-  `sync_data` through group commit. Default `false` matches
-  RocksDB's `sync=false`.
 
 ```rust
 tree.checkpoint()?;   // flush WAL + write through + truncate

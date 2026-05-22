@@ -136,8 +136,8 @@ impl IntoIterator for RangeBuilder {
             bm: self.bm,
             root_guid: self.root_guid,
             maintenance_gate: self.maintenance_gate,
-            stack: Vec::new(),
-            curr_key: Vec::new(),
+            stack: Vec::with_capacity(32),
+            curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             cursor_floor: 0,
             prefix: self.prefix,
             lower_bound: self.start_after.map(LowerBound::Exclusive),
@@ -249,11 +249,10 @@ fn project_range_leaf(
     } else {
         stored_key
     };
-    if !user_key.starts_with(prefix) {
-        if !prefix.is_empty() && user_key >= prefix {
-            return Ok(LeafAction::Done);
-        }
-        return Ok(LeafAction::Skip);
+    match prefix_filter_relation(user_key, prefix) {
+        PrefixFilterRelation::Match => {}
+        PrefixFilterRelation::Before => return Ok(LeafAction::Skip),
+        PrefixFilterRelation::Past => return Ok(LeafAction::Done),
     }
     if let Some(bound) = lower_bound {
         if !bound.allows(user_key) {
@@ -351,6 +350,12 @@ enum SegmentRelation {
     Continue,
     Min,
     Skip,
+}
+
+enum PrefixFilterRelation {
+    Match,
+    Before,
+    Past,
 }
 
 impl Iterator for RangeIter {
@@ -891,10 +896,9 @@ impl RangeIter {
     }
 
     fn path_is_still_valid(&self) -> bool {
-        self.stack.iter().all(|frame| {
-            let _guard = frame.pin.read();
-            frame.pin.content_version() == frame.version
-        })
+        self.stack
+            .iter()
+            .all(|frame| frame.pin.validate_content_version(frame.version))
     }
 
     fn restart_cursor(&mut self) {
@@ -914,12 +918,35 @@ impl RangeIter {
 }
 
 fn path_seek_relation(path: &[u8], target: &[u8]) -> SeekRelation {
-    if target.starts_with(path) && path.len() < target.len() {
+    let limit = path.len().min(target.len());
+    let common = simd::longest_common_prefix(path, target);
+    if common == path.len() && path.len() < target.len() {
         SeekRelation::Seeking
-    } else if path >= target {
+    } else if common == limit {
+        if path.len() >= target.len() {
+            SeekRelation::Min
+        } else {
+            SeekRelation::Skip
+        }
+    } else if path[common] >= target[common] {
         SeekRelation::Min
     } else {
         SeekRelation::Skip
+    }
+}
+
+fn prefix_filter_relation(key: &[u8], prefix: &[u8]) -> PrefixFilterRelation {
+    if prefix.is_empty() {
+        return PrefixFilterRelation::Match;
+    }
+    let limit = key.len().min(prefix.len());
+    let common = simd::longest_common_prefix(key, prefix);
+    if common == prefix.len() {
+        PrefixFilterRelation::Match
+    } else if common == limit || key[common] < prefix[common] {
+        PrefixFilterRelation::Before
+    } else {
+        PrefixFilterRelation::Past
     }
 }
 
@@ -929,13 +956,14 @@ fn segment_seek_relation(path: &[u8], segment: &[u8], target: &[u8]) -> SegmentR
         SeekRelation::Min => SegmentRelation::Min,
         SeekRelation::Seeking => {
             let remaining = &target[path.len()..];
-            let common = segment.len().min(remaining.len());
-            for i in 0..common {
-                match segment[i].cmp(&remaining[i]) {
-                    std::cmp::Ordering::Less => return SegmentRelation::Skip,
-                    std::cmp::Ordering::Greater => return SegmentRelation::Min,
-                    std::cmp::Ordering::Equal => {}
-                }
+            let limit = segment.len().min(remaining.len());
+            let common = simd::longest_common_prefix(segment, remaining);
+            if common < limit {
+                return match segment[common].cmp(&remaining[common]) {
+                    std::cmp::Ordering::Less => SegmentRelation::Skip,
+                    std::cmp::Ordering::Equal => unreachable!("lcp stopped on equal byte"),
+                    std::cmp::Ordering::Greater => SegmentRelation::Min,
+                };
             }
             if segment.len() < remaining.len() {
                 SegmentRelation::Continue

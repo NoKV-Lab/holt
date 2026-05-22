@@ -25,8 +25,9 @@
 //! - `migrate` — deep-clone primitives: [`make_blob_from_node`]
 //!   (spillover) + [`compact_blob`] (in-place repack). Share the
 //!   internal `clone_subtree` machinery.
-//! - `scan` — tree-wide BFS over reachable blobs ([`collect_blob_guids`]).
-//!   Used by [`crate::Tree::stats`] and by `compact` only for cold
+//! - `scan` — tree-wide BFS over reachable blobs
+//!   ([`collect_blob_guids`] / `collect_blob_topology_silent`). Used
+//!   by [`crate::Tree::stats`] and by `compact` only for cold
 //!   maintenance seeding when no candidate hints exist.
 //! - `merge` — parent-local single-pass walker ([`try_merge_children`])
 //!   that folds every mergeable `BlobNode` child back into its
@@ -66,7 +67,7 @@ pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, compact_blob};
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
-pub use scan::{collect_blob_guids, collect_blob_guids_silent};
+pub use scan::{collect_blob_guids, collect_blob_topology_silent};
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
 // ---------- shared internals ----------

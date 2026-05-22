@@ -37,7 +37,7 @@
 //! | Mode       | holt                                        | RocksDB                              | SQLite                                              |
 //! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|
 //! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
-//! | persistent | `TreeConfig::new(dir)`, hot BufferManager + WAL worker | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
+//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed |
 //!
 //! The `*_persist_*` groups are intentionally hot-service
 //! measurements. They do **not** claim to measure cold data-file
@@ -58,7 +58,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
-use holt::{RangeEntry, Tree, TreeConfig};
+use holt::{RangeEntry, Tree, TreeConfig, WalCommit};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
 // ---------------------------------------------------------------
@@ -148,14 +148,15 @@ fn make_holt() -> Tree {
 }
 
 /// Hot persistent holt on a temp dir. Each `put` lands in the
-/// WAL writer's buffer + BufferManager cache; the persistent
-/// data file only gets a `pwrite` at spillover or checkpoint.
-/// Matches RocksDB's `WAL=on, sync=false` and SQLite's `WAL +
-/// synchronous=NORMAL` as a hot service profile, not as a cold
+/// WAL file (OS page cache, no fsync) + BufferManager cache; the
+/// persistent data file only gets a `pwrite` at spillover or
+/// checkpoint. Matches RocksDB's `WAL=on, sync=false` and SQLite's
+/// `WAL + synchronous=OFF` as a hot service profile, not as a cold
 /// data-file I/O profile.
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let cfg = TreeConfig::new(dir.path());
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.wal_commit = WalCommit::Write;
     let tree = Tree::open(cfg).expect("holt persistent open");
     (tree, dir)
 }
@@ -202,14 +203,14 @@ fn make_sqlite_memory() -> Connection {
     conn
 }
 
-/// File-backed SQLite with WAL on and `synchronous = NORMAL` —
+/// File-backed SQLite with WAL on and `synchronous = OFF` —
 /// matches RocksDB's `WAL=on, sync=false` durability profile.
 fn make_sqlite_persistent() -> (Connection, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let conn = Connection::open(dir.path().join("bench.db")).expect("sqlite open");
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;\n\
-         PRAGMA synchronous = NORMAL;\n\
+         PRAGMA synchronous = OFF;\n\
          PRAGMA cache_size = -65536;\n\
          CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID;",
     )

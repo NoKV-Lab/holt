@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
-use holt::{RangeEntry, RecordVersion, Tree, TreeConfig};
+use holt::{RangeEntry, RecordVersion, Tree, TreeConfig, WalCommit};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_OPS: usize = 96;
@@ -310,7 +310,7 @@ fn assert_prefix_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, 
 fuzz_target!(|ops: Ops| {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_sync_on_commit = true;
+    cfg.wal_commit = WalCommit::Sync;
 
     let mut tree = Tree::open(cfg.clone()).unwrap();
     let mut model = BTreeMap::new();

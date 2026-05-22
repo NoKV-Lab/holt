@@ -69,9 +69,69 @@ cargo bench --bench main -- _list
 cargo bench --bench main -- _create_delete
 cargo bench --bench main -- _rename
 cargo bench --bench main -- _metadata_mix
+
+# Large-tree stress harness: fixed 20M preload, million-scale ops.
+# Run this explicitly; it is intentionally not part of Criterion.
+HOLT_STRESS_N=20000000 \
+HOLT_STRESS_POINT_OPS=1000000 \
+HOLT_STRESS_LIST_OPS=1000000 \
+cargo bench --bench stress -- objstore
+
+HOLT_STRESS_N=20000000 \
+HOLT_STRESS_POINT_OPS=1000000 \
+HOLT_STRESS_LIST_OPS=1000000 \
+cargo bench --bench stress -- fs
 ```
 
 HTML criterion reports land in `target/criterion/`.
+
+## Large-Tree Stress Harness
+
+`benches/stress.rs` keeps the dataset fixed at 20M keys by
+default, then runs high-pressure operation loops:
+
+- `get`: `HOLT_STRESS_POINT_OPS` random point reads
+- `put`: `HOLT_STRESS_POINT_OPS` same-size metadata updates
+- `mixed`: 50% get / 50% put over the same sampled key stream
+- `list`: `HOLT_STRESS_LIST_OPS` bounded prefix scans
+- `list_dir`: `HOLT_STRESS_LIST_OPS` delimiter rollups
+
+The stress harness prints `ns/op`, `Mops/s`, and Holt shape
+telemetry (`blobs`, cross-blob `edges`, `max_depth`, `avg_depth`,
+blob fill ratios, walker hop counters). Those shape metrics are
+the main signal for diagnosing whether 20M writes remain stable
+or start paying extra blob-hop / spillover cost.
+
+For `list_dir`, the stress harness gives RocksDB and SQLite a
+fair app-layer fast-forward implementation: after emitting one
+rolled-up prefix, it seeks to that prefix's lexicographic
+successor instead of scanning every key below the directory.
+
+Useful knobs:
+
+```sh
+# Run only Holt while tuning tree shape.
+HOLT_STRESS_ENGINES=holt cargo bench --bench stress -- objstore
+
+# Smoke-test the harness quickly.
+HOLT_STRESS_N=10000 \
+HOLT_STRESS_POINT_OPS=1000 \
+HOLT_STRESS_LIST_OPS=100 \
+cargo bench --bench stress -- fs
+
+# Change list fanout without changing the 20M preload.
+HOLT_STRESS_LIST_TAKE=1000 \
+HOLT_STRESS_DIR_TAKE=32 \
+cargo bench --bench stress -- objstore
+```
+
+Profile: single-threaded, warm-service, file-backed persistent
+engines with WAL enabled and no per-op fsync. Holt uses
+`TreeConfig::new(tempdir)` with `WalCommit::Write`; RocksDB uses
+WAL on with `sync = false`; SQLite uses a file-backed WAL database
+with `synchronous = OFF`. This is the fair persistent hot path:
+WAL bytes are written before the operation returns, but power-loss
+durability is not forced per operation.
 
 ## Methodology — apples-to-apples
 
@@ -100,14 +160,14 @@ or Criterion warmup. This is a foreground WAL/cache benchmark, not
 a cold data-file I/O benchmark:
 
 - **holt**: `TreeConfig::new(tempdir)` (FileBlobStore with
-  `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every mutation
-  submits an encoded record to the journal worker;
-  `wal_sync_on_commit` stays at its default `false`. Blobs only
-  hit disk at checkpoint.
+  `F_NOCACHE` on macOS / `O_DIRECT` on Linux) and
+  `WalCommit::Write`. Every mutation waits until its encoded WAL
+  record reaches the OS page cache; blobs only hit disk at
+  checkpoint.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 - **SQLite**: file-backed DB, `journal_mode=WAL`,
-  `synchronous=NORMAL`, 64 MB page cache.
+  `synchronous=OFF`, 64 MB page cache.
 
 Shared settings: 20 000 unique keys preloaded; bench iterates a
 seeded permutation of that set; `cargo bench` builds with
@@ -155,10 +215,10 @@ When reading those results, keep the profiles separate:
   metadata-operation semantics.
 - Hot persistent rows use disk-backed engines with WAL enabled and
   no per-op fsync.
-- The current public harness has persistent rows for point
-  get/put/mixed and plain prefix list. `metadata_mix`,
-  create/delete, rename, delimiter `list_dir`, and the scale curve
-  are memory/no-WAL unless the bench name says `persist`.
+- The Criterion harness has both memory/no-WAL rows and explicit
+  persistent rows. The large-tree stress harness is persistent by
+  default because the release story should match Holt's file-backed
+  deployment shape.
 
 Plain prefix scans (`*_list`) model `readdir` / `ListObjects` with
 a bounded prefix range. Delimiter rollup (`*_list_dir`) is the
@@ -174,16 +234,17 @@ delimiter-list API.
    optimistic per-blob latching; range scans use shared guards plus
    versioned cursor validation. The public benchmark surface
    measures single-thread latency, not multi-core throughput.
-2. **No fsync.** Both modes set `sync=off`-equivalent — durable
-   to OS page cache only. A real `fsync`-per-op workload is
-   fsync-bound and overwhelms every engine's algorithm cost.
-3. **Delim rollup uses fast-forward in holt only.** Holt's
+2. **No fsync in persistent rows.** Persistent rows use
+   `sync=off`-equivalent semantics: WAL bytes reach the OS page
+   cache before the operation returns, but no per-op `fsync` is
+   forced. Memory rows are volatile by definition.
+3. **Delimiter rollup is still an engine-specific semantic.** Holt's
    `Tree::range` ascends the descent stack past a rolled-up
    subtree after emitting its `CommonPrefix`, so the cost is
-   `O(distinct_rollups)`. RocksDB and SQLite still do the naive
-   `O(leaves_under_prefix)` scan with app-side dedup; both
-   could implement an equivalent `seek(common_prefix + 0xff)`
-   skip, but the bench's app-layer dedup doesn't.
+   `O(distinct_rollups)`. The stress harness gives RocksDB and
+   SQLite an app-layer fast-forward cursor, but the semantic is not
+   native to either engine; it is still built from ordered iteration
+   plus application-side prefix math.
 4. **Bench numbers are machine-dependent.** Don't take any
    absolute throughput claim from this README at face value —
    re-run on your hardware. The relative ordering (holt wins on

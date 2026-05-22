@@ -122,6 +122,21 @@ pub fn insert_multi_conditional(
     let mut blob_hops = 0u64;
     let mut max_cross_blob_depth = 0usize;
 
+    if let Some(outcome) = try_insert_from_optimistic_route(
+        bm,
+        root_pin,
+        route_cache,
+        key,
+        value,
+        seq,
+        wants_prev,
+        condition,
+        &mut blob_hops,
+        &mut max_cross_blob_depth,
+    )? {
+        return Ok(outcome);
+    }
+
     // Fast path for the large-tree steady state: the root blob is
     // often just a router to child blobs. Hold the root in shared
     // mode long enough to acquire the child write guard, then let
@@ -131,34 +146,6 @@ pub fn insert_multi_conditional(
     {
         let root_read = root_pin.read();
         let root_version = root_pin.content_version();
-        if let Some(route) = route_cache.and_then(|cache| cache.lookup(key, root_version)) {
-            let child_pin = bm.pin(route.child_guid)?;
-            let child_guard = child_pin.write();
-            drop(root_read);
-
-            blob_hops = 1;
-            let outcome = lock_coupled_insert_in_blob(
-                bm,
-                child_guard,
-                child_pin.as_ref(),
-                route.child_guid,
-                false,
-                key,
-                value,
-                seq,
-                wants_prev,
-                condition,
-                route.child_depth,
-                &mut blob_hops,
-                &mut max_cross_blob_depth,
-            );
-            drop(child_pin);
-            if outcome.is_ok() {
-                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
-            }
-            return outcome;
-        }
-
         let root_crossing = {
             let frame = BlobFrameRef::wrap(root_read.as_slice());
             let root_slot = frame.header().root_slot;
@@ -225,6 +212,60 @@ pub fn insert_multi_conditional(
         bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
     }
     outcome
+}
+
+/// Try the large-tree steady-state route-cache path without taking
+/// the root shared latch. The child is pinned + exclusively latched
+/// before root-version validation; a successful validation means no
+/// root writer raced with the parent-edge observation.
+#[allow(clippy::too_many_arguments)]
+fn try_insert_from_optimistic_route(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    value: &[u8],
+    seq: u64,
+    wants_prev: bool,
+    condition: InsertCondition,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
+) -> Result<Option<InsertOutcome>> {
+    let Some(cache) = route_cache else {
+        return Ok(None);
+    };
+    let root_version = root_pin.content_version();
+    let Some(route) = cache.lookup(key, root_version) else {
+        return Ok(None);
+    };
+
+    let child_pin = bm.pin(route.child_guid)?;
+    let child_guard = child_pin.write();
+    if !root_pin.validate_content_version(root_version) {
+        drop(child_guard);
+        drop(child_pin);
+        return Ok(None);
+    }
+
+    *blob_hops = 1;
+    let outcome = lock_coupled_insert_in_blob(
+        bm,
+        child_guard,
+        child_pin.as_ref(),
+        route.child_guid,
+        false,
+        key,
+        value,
+        seq,
+        wants_prev,
+        condition,
+        route.child_depth,
+        blob_hops,
+        max_cross_blob_depth,
+    )?;
+    drop(child_pin);
+    bm.note_walker_blob_hops(*blob_hops, *max_cross_blob_depth);
+    Ok(Some(outcome))
 }
 
 #[derive(Clone, Copy)]
@@ -323,29 +364,34 @@ fn try_insert_batch_from_first_blob(
 ) -> Result<InsertBatchOutcome> {
     let first_key = items[0].key;
 
-    {
-        let root_read = root_pin.read();
+    if let Some(cache) = route_cache {
         let root_version = root_pin.content_version();
-        if let Some(route) = route_cache.and_then(|cache| cache.lookup(first_key, root_version)) {
+        if let Some(route) = cache.lookup(first_key, root_version) {
             let run_len = same_child_prefix_run_len(items, route.child_depth);
             let child_pin = bm.pin(route.child_guid)?;
             let child_guard = child_pin.write();
-            drop(root_read);
-
-            let outcome = insert_batch_in_pinned_blob(
-                bm,
-                child_guard,
-                child_pin.as_ref(),
-                route.child_guid,
-                false,
-                &items[..run_len],
-                route.child_depth,
-                2,
-            );
+            if root_pin.validate_content_version(root_version) {
+                let outcome = insert_batch_in_pinned_blob(
+                    bm,
+                    child_guard,
+                    child_pin.as_ref(),
+                    route.child_guid,
+                    false,
+                    &items[..run_len],
+                    route.child_depth,
+                    2,
+                );
+                drop(child_pin);
+                return outcome;
+            }
+            drop(child_guard);
             drop(child_pin);
-            return outcome;
         }
+    }
 
+    {
+        let root_read = root_pin.read();
+        let root_version = root_pin.content_version();
         let root_crossing = {
             let frame = BlobFrameRef::wrap(root_read.as_slice());
             let root_slot = frame.header().root_slot;

@@ -15,6 +15,19 @@ use crate::store::{BlobFrameRef, BufferManager};
 use super::cast;
 use super::readers::resolve_typed;
 
+/// One reachable blob plus its cross-blob depth from the root.
+///
+/// Depth `0` is the root blob. Each [`NodeType::Blob`] crossing
+/// increments the depth by one. This is a blob-graph metric, not
+/// a per-node ART depth trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobTopologyEntry {
+    /// GUID identifying the reachable blob.
+    pub guid: BlobGuid,
+    /// Number of BlobNode crossings from the root to this blob.
+    pub depth: u32,
+}
+
 /// Return every blob GUID reachable from `root_guid` (including
 /// `root_guid` itself), in BFS order.
 ///
@@ -25,32 +38,52 @@ use super::readers::resolve_typed;
 /// Uses `BufferManager::pin`, which bumps cache hit/miss
 /// counters and refreshes `last_touched`. Callers on the
 /// observability path (`Tree::stats`, metrics scrapes) should
-/// use [`collect_blob_guids_silent`] instead to avoid the
+/// use [`collect_blob_topology_silent`] instead to avoid the
 /// scrape polluting the counters it's about to report.
 pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec<BlobGuid>> {
-    collect_blob_guids_inner(bm, root_guid, /*silent=*/ false)
+    collect_blob_topology(bm, root_guid)
+        .map(|entries| entries.into_iter().map(|entry| entry.guid).collect())
 }
 
-/// Same shape as [`collect_blob_guids`] but uses
-/// `BufferManager::pin_silent`, so the walk does not bump
-/// `cache_hits` / `cache_misses` and does not refresh
-/// `last_touched`. Used by `Tree::stats`.
-pub fn collect_blob_guids_silent(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec<BlobGuid>> {
-    collect_blob_guids_inner(bm, root_guid, /*silent=*/ true)
+/// Return every reachable blob plus its blob-graph depth from
+/// `root_guid`, in BFS order.
+fn collect_blob_topology(
+    bm: &BufferManager,
+    root_guid: BlobGuid,
+) -> Result<Vec<BlobTopologyEntry>> {
+    collect_blob_topology_inner(bm, root_guid, /*silent=*/ false)
 }
 
-fn collect_blob_guids_inner(
+/// Same as [`collect_blob_topology`] but uses
+/// `BufferManager::pin_silent`, so observability walks do not
+/// perturb cache counters or eviction recency.
+pub fn collect_blob_topology_silent(
+    bm: &BufferManager,
+    root_guid: BlobGuid,
+) -> Result<Vec<BlobTopologyEntry>> {
+    collect_blob_topology_inner(bm, root_guid, /*silent=*/ true)
+}
+
+fn collect_blob_topology_inner(
     bm: &BufferManager,
     root_guid: BlobGuid,
     silent: bool,
-) -> Result<Vec<BlobGuid>> {
-    let mut all = vec![root_guid];
-    let mut queue: Vec<BlobGuid> = vec![root_guid];
-    while let Some(guid) = queue.pop() {
+) -> Result<Vec<BlobTopologyEntry>> {
+    use std::collections::VecDeque;
+
+    let mut all = vec![BlobTopologyEntry {
+        guid: root_guid,
+        depth: 0,
+    }];
+    let mut queue: VecDeque<BlobTopologyEntry> = VecDeque::from([BlobTopologyEntry {
+        guid: root_guid,
+        depth: 0,
+    }]);
+    while let Some(entry) = queue.pop_front() {
         let pin = if silent {
-            bm.pin_silent(guid)?
+            bm.pin_silent(entry.guid)?
         } else {
-            bm.pin(guid)?
+            bm.pin(entry.guid)?
         };
         let mut found = Vec::new();
         {
@@ -60,8 +93,12 @@ fn collect_blob_guids_inner(
             scan_subtree(frame, root_slot, &mut found)?;
         }
         for child_guid in found {
-            all.push(child_guid);
-            queue.push(child_guid);
+            let child = BlobTopologyEntry {
+                guid: child_guid,
+                depth: entry.depth.saturating_add(1),
+            };
+            all.push(child);
+            queue.push_back(child);
         }
     }
     Ok(all)

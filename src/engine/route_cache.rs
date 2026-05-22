@@ -2,10 +2,11 @@
 //!
 //! This cache only remembers the first `BlobNode` crossing found
 //! from the root blob. A hit is usable only while the root blob's
-//! content version still equals the cached version; callers still
-//! hold the root shared latch while pinning/acquiring the child.
-//! That keeps the parent edge stable without re-running the root
-//! ART descent on every large-tree metadata update.
+//! content version still equals the cached version; callers either
+//! hold the root shared latch while acquiring the child or revalidate
+//! the observed root version after acquiring the child. That keeps
+//! the parent edge stable without re-running the root ART descent on
+//! every large-tree metadata update.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

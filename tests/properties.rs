@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use holt::{RangeEntry, Tree, TreeConfig};
+use holt::{RangeEntry, Tree, TreeConfig, WalCommit};
 
 /// Drain a `RangeIter` into a `Vec<(key, value)>`. Panics on any
 /// `Err` (proptest harness reports the panic up). `CommonPrefix`
@@ -205,15 +205,15 @@ proptest! {
 
     /// Persistent tree: apply ops, drop without calling
     /// `checkpoint`, reopen, verify the WAL replay rebuilds
-    /// exactly the oracle's state. `wal_sync_on_commit = true`
-    /// is required so every record is durable before drop.
+    /// exactly the oracle's state. `WalCommit::Sync` is required
+    /// so every record is durable before drop.
     #[test]
     fn persistent_round_trips_via_wal_replay(
         ops in vec(op_strategy(), 1..=100),
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = TreeConfig::new(dir.path());
-        cfg.wal_sync_on_commit = true;
+        cfg.wal_commit = WalCommit::Sync;
 
         let oracle = {
             let tree = Tree::open(cfg.clone()).unwrap();

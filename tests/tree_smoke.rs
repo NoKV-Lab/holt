@@ -860,6 +860,10 @@ fn stats_on_fresh_tree_reports_root_blob_only() {
     assert_eq!(s.blobs.len(), 1);
     assert_eq!(s.total_compactions, 0);
     assert_eq!(s.total_tombstones, 0);
+    assert_eq!(s.total_blob_edges, 0);
+    assert_eq!(s.leaf_blob_count, 1);
+    assert_eq!(s.max_blob_depth, 0);
+    assert_eq!(s.total_blob_depth, 0);
     assert_eq!(s.route_cache.entries, 0);
     assert_eq!(s.route_cache.hits, 0);
     assert_eq!(s.route_cache.misses, 0);
@@ -1136,11 +1140,21 @@ fn stats_aggregates_across_multi_blob_tree() {
     );
     assert!(s.bm_walker_blob_hops >= s.bm_walker_ops);
     assert!(s.bm_max_blob_hops >= 1);
+    assert!(s.total_blob_edges >= 1);
+    assert!(s.leaf_blob_count >= 1);
+    assert!(s.max_blob_depth >= 1);
+    assert!(s.total_blob_depth >= u64::from(s.max_blob_depth));
+    assert!(s.avg_blob_depth() > 0.0);
+    assert!(s.leaf_blob_ratio() > 0.0);
+    assert!(s.avg_blob_fill_ratio() > 0.0);
+    assert!(s.max_blob_fill_ratio() > 0.0);
     // Aggregate is just the sum of per-blob counters.
     let sum_space: u64 = s.blobs.iter().map(|b| u64::from(b.space_used)).sum();
     assert_eq!(sum_space, s.total_space_used);
     let sum_slots: u64 = s.blobs.iter().map(|b| u64::from(b.num_slots)).sum();
     assert_eq!(sum_slots, s.total_slots);
+    let sum_edges: u64 = s.blobs.iter().map(|b| u64::from(b.num_ext_blobs)).sum();
+    assert_eq!(sum_edges, s.total_blob_edges);
 }
 
 #[test]

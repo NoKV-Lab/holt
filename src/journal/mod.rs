@@ -10,8 +10,8 @@
 //!   `sync_data`-on-flush durability + 64 KB buffered auto-drain
 //!   mechanics.
 //! - [`group_commit`] — dedicated append worker; foreground
-//!   writers enqueue encoded records and durable waiters share
-//!   one `sync_data` per short batch window.
+//!   writers enqueue encoded records; sync waiters share one
+//!   `sync_data` per short batch window.
 //! - [`reader`] — forward replay scanner with graceful
 //!   torn-tail handling. Unpacks `Batch` records into per-inner
 //!   callbacks so consumers don't need a `Batch` arm.

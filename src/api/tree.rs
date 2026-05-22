@@ -59,7 +59,7 @@ use crate::journal::codec::{
 use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
-use crate::layout::{BlobGuid, PAGE_SIZE};
+use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE};
 use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::buffer_manager::WriteThroughEntry;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
@@ -70,6 +70,28 @@ const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
+
+struct BlobStatsAggregate {
+    blobs: Vec<BlobStats>,
+    total_space_used: u64,
+    total_gap_space: u64,
+    total_slots: u64,
+    total_compactions: u64,
+    total_tombstones: u64,
+    total_blob_edges: u64,
+    leaf_blob_count: u32,
+    max_blob_depth: u32,
+    total_blob_depth: u64,
+    max_blob_fill_per_mille: u32,
+}
+
+fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
+    if blob_data_capacity == 0 {
+        return 0;
+    }
+    let data_used = u64::from(space_used).saturating_sub(DATA_AREA_START as u64);
+    ((data_used.saturating_mul(1000)) / blob_data_capacity) as u32
+}
 
 /// An `holt` tree — your handle to one metadata store.
 ///
@@ -520,7 +542,7 @@ impl Tree {
                 let mut record =
                     Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
                 encode_insert_record(&mut record, seq, 0, key, value);
-                let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
+                let ack = journal.submit(record, self.cfg.wal_commit)?;
                 (outcome, ack)
             } else {
                 (outcome, None)
@@ -645,7 +667,7 @@ impl Tree {
                 }
                 let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
                 encode_erase_record(&mut record, seq, 0, key);
-                let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
+                let ack = journal.submit(record, self.cfg.wal_commit)?;
                 (outcome, ack)
             } else {
                 (outcome, None)
@@ -763,7 +785,7 @@ impl Tree {
             let mut record =
                 Vec::with_capacity(encoded_rename_object_record_len(src.len(), dst.len()));
             encode_rename_object_record(&mut record, seq, 0, src, dst, force);
-            journal.submit(record, self.cfg.wal_sync_on_commit)?
+            journal.submit(record, self.cfg.wal_commit)?
         } else {
             let erase_out = engine::erase_multi(
                 &self.store,
@@ -878,7 +900,7 @@ impl Tree {
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
                 self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
-                journal.submit(record, self.cfg.wal_sync_on_commit)?
+                journal.submit(record, self.cfg.wal_commit)?
             };
             if let Some(ack) = ack {
                 ack.wait()?;
@@ -1683,46 +1705,7 @@ impl Tree {
     /// externally if you need a quiescent snapshot.
     pub fn stats(&self) -> Result<TreeStats> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        // `Tree::stats` is an introspection path — used by users
-        // checking on the tree, and (via `holt::metrics`) by
-        // Prometheus scrapes that read `bm_cache_hits`,
-        // `bm_cache_misses`, `bm_optimistic_restarts`, etc. We
-        // walk every reachable blob to gather per-blob stats; if
-        // that walk went through `BufferManager::pin`, every
-        // hit would bump `cache_hits` and every entry's
-        // `last_touched` tick would be refreshed — the scrape
-        // would (a) inflate the very counters it's reporting
-        // and (b) hand-rescue cold entries from the eviction
-        // sweep just by looking at them. Both paths use the
-        // `_silent` variants instead.
-        let guids = engine::collect_blob_guids_silent(&self.store, self.root_guid)?;
-        let mut blobs: Vec<BlobStats> = Vec::with_capacity(guids.len());
-        let mut total_space_used: u64 = 0;
-        let mut total_gap_space: u64 = 0;
-        let mut total_slots: u64 = 0;
-        let mut total_compactions: u64 = 0;
-        let mut total_tombstones: u64 = 0;
-        for guid in &guids {
-            let pin = self.store.pin_silent(*guid)?;
-            let guard = pin.read();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let h = frame.header();
-            let s = BlobStats {
-                guid: *guid,
-                space_used: h.space_used,
-                gap_space: h.gap_space,
-                num_slots: h.num_slots,
-                num_ext_blobs: h.num_ext_blobs,
-                compact_times: h.compact_times,
-                tombstone_leaf_cnt: h.tombstone_leaf_cnt,
-            };
-            total_space_used += u64::from(s.space_used);
-            total_gap_space += u64::from(s.gap_space);
-            total_slots += u64::from(s.num_slots);
-            total_compactions += u64::from(s.compact_times);
-            total_tombstones += u64::from(s.tombstone_leaf_cnt);
-            blobs.push(s);
-        }
+        let aggregate = self.collect_blob_stats_silent()?;
         let bm_dirty_count = self.store.dirty_count();
         let bm_pending_delete_count = self.store.pending_delete_count();
         let bm_cache_hits = self.store.cache_hits();
@@ -1761,13 +1744,18 @@ impl Tree {
             evictions: ck.evictions(),
         });
         Ok(TreeStats {
-            blob_count: blobs.len() as u32,
-            total_space_used,
-            total_gap_space,
-            total_slots,
-            total_compactions,
-            total_tombstones,
-            blobs,
+            blob_count: aggregate.blobs.len() as u32,
+            total_space_used: aggregate.total_space_used,
+            total_gap_space: aggregate.total_gap_space,
+            total_slots: aggregate.total_slots,
+            total_compactions: aggregate.total_compactions,
+            total_tombstones: aggregate.total_tombstones,
+            total_blob_edges: aggregate.total_blob_edges,
+            leaf_blob_count: aggregate.leaf_blob_count,
+            max_blob_depth: aggregate.max_blob_depth,
+            total_blob_depth: aggregate.total_blob_depth,
+            max_blob_fill_per_mille: aggregate.max_blob_fill_per_mille,
+            blobs: aggregate.blobs,
             bm_dirty_count,
             bm_pending_delete_count,
             bm_cache_hits,
@@ -1784,6 +1772,73 @@ impl Tree {
             journal,
             checkpointer,
         })
+    }
+
+    fn collect_blob_stats_silent(&self) -> Result<BlobStatsAggregate> {
+        // `Tree::stats` is an introspection path — used by users
+        // checking on the tree, and (via `holt::metrics`) by
+        // Prometheus scrapes that read `bm_cache_hits`,
+        // `bm_cache_misses`, `bm_optimistic_restarts`, etc. If
+        // the walk went through `BufferManager::pin`, each scrape
+        // would inflate cache counters and refresh eviction
+        // recency. Use silent pins for both the topology pass and
+        // the per-blob header reads.
+        let topology = engine::collect_blob_topology_silent(&self.store, self.root_guid)?;
+        let blob_data_capacity = (PAGE_SIZE - DATA_AREA_START) as u64;
+        let mut aggregate = BlobStatsAggregate {
+            blobs: Vec::with_capacity(topology.len()),
+            total_space_used: 0,
+            total_gap_space: 0,
+            total_slots: 0,
+            total_compactions: 0,
+            total_tombstones: 0,
+            total_blob_edges: 0,
+            leaf_blob_count: 0,
+            max_blob_depth: 0,
+            total_blob_depth: 0,
+            max_blob_fill_per_mille: 0,
+        };
+
+        for entry in &topology {
+            let pin = self.store.pin_silent(entry.guid)?;
+            let guard = pin.read();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let h = frame.header();
+            let stats = BlobStats {
+                guid: entry.guid,
+                space_used: h.space_used,
+                gap_space: h.gap_space,
+                num_slots: h.num_slots,
+                num_ext_blobs: h.num_ext_blobs,
+                compact_times: h.compact_times,
+                tombstone_leaf_cnt: h.tombstone_leaf_cnt,
+            };
+            Self::accumulate_blob_stats(&mut aggregate, stats, entry.depth, blob_data_capacity);
+        }
+        Ok(aggregate)
+    }
+
+    fn accumulate_blob_stats(
+        aggregate: &mut BlobStatsAggregate,
+        stats: BlobStats,
+        depth: u32,
+        blob_data_capacity: u64,
+    ) {
+        aggregate.total_space_used += u64::from(stats.space_used);
+        aggregate.total_gap_space += u64::from(stats.gap_space);
+        aggregate.total_slots += u64::from(stats.num_slots);
+        aggregate.total_compactions += u64::from(stats.compact_times);
+        aggregate.total_tombstones += u64::from(stats.tombstone_leaf_cnt);
+        aggregate.total_blob_edges += u64::from(stats.num_ext_blobs);
+        if stats.num_ext_blobs == 0 {
+            aggregate.leaf_blob_count += 1;
+        }
+        aggregate.max_blob_depth = aggregate.max_blob_depth.max(depth);
+        aggregate.total_blob_depth += u64::from(depth);
+        aggregate.max_blob_fill_per_mille = aggregate
+            .max_blob_fill_per_mille
+            .max(blob_fill_per_mille(stats.space_used, blob_data_capacity));
+        aggregate.blobs.push(stats);
     }
 
     /// Run one online maintenance pass.
@@ -1983,16 +2038,7 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
     // BM-Mutex per op (replays can be thousands of ops on a
     // dirty WAL).
     let root_pin = bm.pin(root_guid)?;
-    let mut highest = 0u64;
-    let _ = replay(path, |op, seq, _off| {
-        // Track the highest seq we've **seen** before any branch
-        // can short-circuit (e.g. the `RenameObject` no-op arm).
-        // `next_seq` must advance past every record on disk, even
-        // ones whose effect was already reconciled by an earlier
-        // replay pass — otherwise the writer could re-issue an
-        // already-used seq.
-        highest = highest.max(seq);
-
+    let (_header, stats) = replay(path, |op, seq, _off| {
         // `root_dirty` tracks whether this op actually mutated
         // the BM-cached root image. No-op replays (e.g. an erase
         // for a key already absent because a prior replay pass
@@ -2000,11 +2046,11 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         // store — skipping `mark_dirty` for those is a small
         // win and matches `Tree::delete`'s same-shape branch.
         let root_dirty = match op {
-            WalOp::Insert { key, value, .. } => {
+            WalOp::Insert { key, value } => {
                 let search = engine::SearchKey::user(key);
                 engine::insert_multi(bm, &root_pin, None, search, value, seq, false)?.root_dirty
             }
-            WalOp::Erase { key, .. } => {
+            WalOp::Erase { key } => {
                 let search = engine::SearchKey::user(key);
                 engine::erase_multi(bm, &root_pin, None, search, seq, false)?.root_dirty
             }
@@ -2040,7 +2086,7 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             // `Batch` is unpacked into per-inner callbacks inside
             // `journal::reader::replay_bytes`, so it never reaches
             // this match — defensive arm only.
-            WalOp::Batch { .. } => false,
+            WalOp::Batch { ops: _ } => false,
         };
         if root_dirty {
             // Honour the walker's caller-side `mark_dirty(root,
@@ -2049,10 +2095,18 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         }
         Ok(())
     })?;
+    debug_assert!(
+        stats.records_seen > 0 || stats.highest_seq.is_none(),
+        "an empty WAL replay cannot report a highest seq",
+    );
+    debug_assert!(
+        stats.torn_tail_at.is_none() || stats.records_seen > 0 || stats.highest_seq.is_none(),
+        "a torn tail without complete records must not report a highest seq",
+    );
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything
     // ever seen in the log.
-    Ok(highest + 1)
+    Ok(stats.highest_seq.unwrap_or(0) + 1)
 }
 
 #[cfg(test)]

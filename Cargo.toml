@@ -104,3 +104,8 @@ path = "examples/s3_metadata.rs"
 name = "main"
 harness = false
 path = "benches/main.rs"
+
+[[bench]]
+name = "stress"
+harness = false
+path = "benches/stress.rs"

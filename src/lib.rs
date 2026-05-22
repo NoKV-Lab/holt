@@ -154,7 +154,7 @@ pub mod metrics;
 
 // Core handle + configuration.
 pub use api::builder::TreeBuilder;
-pub use api::config::{Storage, TreeConfig};
+pub use api::config::{Storage, TreeConfig, WalCommit};
 pub use api::errors::{Error, Result};
 pub use api::tree::Tree;
 

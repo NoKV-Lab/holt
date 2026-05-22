@@ -182,7 +182,7 @@ impl WalWriter {
     /// After this call the bytes are in the page cache; survive
     /// a process crash but not a power loss until `sync_data`
     /// (i.e. `flush`) runs.
-    fn drain_to_os(&mut self) -> Result<()> {
+    pub(crate) fn drain_to_os(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }

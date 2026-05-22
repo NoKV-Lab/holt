@@ -36,6 +36,13 @@
 //! | `holt_slots`                            | gauge   | `TreeStats::total_slots`               |
 //! | `holt_compactions`                      | gauge   | `TreeStats::total_compactions` (sum of `compact_times` across **currently reachable** blobs — can go DOWN if a blob is merged/deleted; it's a tree-shape metric, not a lifetime counter) |
 //! | `holt_tombstones`                       | gauge   | `TreeStats::total_tombstones`          |
+//! | `holt_blob_edges`                       | gauge   | `TreeStats::total_blob_edges`          |
+//! | `holt_leaf_blob_count`                  | gauge   | `TreeStats::leaf_blob_count`           |
+//! | `holt_blob_leaf_ratio`                  | gauge   | `TreeStats::leaf_blob_ratio()`         |
+//! | `holt_blob_max_depth`                   | gauge   | `TreeStats::max_blob_depth`            |
+//! | `holt_blob_avg_depth`                   | gauge   | `TreeStats::avg_blob_depth()`          |
+//! | `holt_blob_avg_fill_ratio`              | gauge   | `TreeStats::avg_blob_fill_ratio()`     |
+//! | `holt_blob_max_fill_ratio`              | gauge   | `TreeStats::max_blob_fill_ratio()`     |
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
@@ -130,6 +137,55 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Sum of `tombstone_leaf_cnt` across every reachable blob.",
         "gauge",
         stats.total_tombstones,
+    );
+    metric(
+        &mut out,
+        "holt_blob_edges",
+        "Number of cross-blob `BlobNode` edges in the reachable blob graph.",
+        "gauge",
+        stats.total_blob_edges,
+    );
+    metric(
+        &mut out,
+        "holt_leaf_blob_count",
+        "Number of reachable blobs with no `BlobNode` children.",
+        "gauge",
+        u64::from(stats.leaf_blob_count),
+    );
+    metric_f64(
+        &mut out,
+        "holt_blob_leaf_ratio",
+        "Fraction of reachable blobs that are leaves in the blob graph.",
+        "gauge",
+        stats.leaf_blob_ratio(),
+    );
+    metric(
+        &mut out,
+        "holt_blob_max_depth",
+        "Maximum cross-blob depth from the root blob.",
+        "gauge",
+        u64::from(stats.max_blob_depth),
+    );
+    metric_f64(
+        &mut out,
+        "holt_blob_avg_depth",
+        "Average cross-blob graph depth across reachable blobs.",
+        "gauge",
+        stats.avg_blob_depth(),
+    );
+    metric_f64(
+        &mut out,
+        "holt_blob_avg_fill_ratio",
+        "Average data-area occupancy across reachable blobs.",
+        "gauge",
+        stats.avg_blob_fill_ratio(),
+    );
+    metric_f64(
+        &mut out,
+        "holt_blob_max_fill_ratio",
+        "Maximum data-area occupancy among reachable blobs.",
+        "gauge",
+        stats.max_blob_fill_ratio(),
     );
     metric(
         &mut out,
@@ -364,6 +420,11 @@ mod tests {
             total_slots: 42,
             total_compactions: 7,
             total_tombstones: 5,
+            total_blob_edges: 2,
+            leaf_blob_count: 2,
+            max_blob_depth: 2,
+            total_blob_depth: 3,
+            max_blob_fill_per_mille: 750,
             blobs: Vec::new(),
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
@@ -427,6 +488,12 @@ mod tests {
         assert!(out.contains("holt_compactions 7\n"));
         assert!(out.contains("# TYPE holt_tombstones gauge\n"));
         assert!(out.contains("holt_tombstones 5\n"));
+        assert!(out.contains("holt_blob_edges 2\n"));
+        assert!(out.contains("holt_leaf_blob_count 2\n"));
+        assert!(out.contains("holt_blob_leaf_ratio 0.666667\n"));
+        assert!(out.contains("holt_blob_max_depth 2\n"));
+        assert!(out.contains("holt_blob_avg_depth 1.000000\n"));
+        assert!(out.contains("holt_blob_max_fill_ratio 0.750000\n"));
         // None of the gauges leak `_total`.
         assert!(!out.contains("holt_slots_total"));
         assert!(!out.contains("holt_compactions_total"));

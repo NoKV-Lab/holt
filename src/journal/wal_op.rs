@@ -7,12 +7,6 @@
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
 /// block in [`super::codec`]. Never renumber; only append.
-// `seq` fields are populated on decode (from the record header) and
-// verified via codec round-trip tests, but production replay consumes
-// the per-record `seq` via the callback's separate parameter rather
-// than re-reading it off the variant. Allow dead_code so the lint
-// doesn't fire on those fields in non-test builds.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum WalOp {
     /// Single-key insert / update.
@@ -22,10 +16,6 @@ pub enum WalOp {
     /// idempotent forward redo) and holt does not provide a
     /// journal-scan audit surface.
     Insert {
-        /// Owning tree root identifier.
-        tree_id: u64,
-        /// WAL sequence this op was committed at.
-        seq: u64,
         /// Key bytes.
         key: Vec<u8>,
         /// New value bytes.
@@ -39,19 +29,11 @@ pub enum WalOp {
     /// `Tree::remove` walker hands it straight to the caller
     /// without round-tripping through the WAL.
     Erase {
-        /// Owning tree root identifier.
-        tree_id: u64,
-        /// WAL sequence this op was committed at.
-        seq: u64,
         /// Key bytes.
         key: Vec<u8>,
     },
     /// Atomic in-tree rename.
     RenameObject {
-        /// Owning tree root identifier.
-        tree_id: u64,
-        /// WAL sequence.
-        seq: u64,
         /// Source key.
         src_key: Vec<u8>,
         /// Destination key.
@@ -64,13 +46,10 @@ pub enum WalOp {
     ///
     /// Emitted by [`crate::Tree::atomic`]. Inner ops are primitive
     /// variants only (`Insert` / `Erase` / `RenameObject` today);
-    /// nested `Batch`es are rejected at encode + decode. Each
-    /// inner op carries `seq = outer_seq + index`; the outer
-    /// record's header `SEQ` is the base, and the WAL allocator
-    /// reserves a contiguous range of `ops.len()` seqs per batch.
+    /// nested `Batch`es are rejected at encode + decode. The outer
+    /// record's header `SEQ` is the base, and replay derives each
+    /// inner op's sequence as `outer_seq + index`.
     Batch {
-        /// Owning tree root identifier.
-        tree_id: u64,
         /// Inner ops, applied in order.
         ops: Vec<WalOp>,
     },

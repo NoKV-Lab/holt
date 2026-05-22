@@ -89,7 +89,7 @@ matrix and `benches/RESULTS.md` for the v0.3 Linux release run.
 
 ## When PGO doesn't help
 
-- **WAL-fsync-bound workloads** (`wal_sync_on_commit = true`):
+- **WAL-fsync-bound workloads** (`WalCommit::Sync`):
   end-to-end latency is dominated by `sync_data`, so the walker
   CPU time PGO saves is rounding error.
 - **Bulk writes** that trigger spillover: dominated by 512 KB

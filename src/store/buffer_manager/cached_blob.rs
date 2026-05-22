@@ -131,6 +131,14 @@ impl CachedBlob {
         self.latch.current_version()
     }
 
+    /// Validate a previously observed content version without
+    /// taking a shared latch. Returns `false` while an exclusive
+    /// writer is active or after any exclusive writer has released.
+    #[must_use]
+    pub(crate) fn validate_content_version(&self, version: u64) -> bool {
+        self.latch.validate(version)
+    }
+
     /// Exclusive write access - blocks until idle, then runs
     /// alone. Bumps the version on release so concurrent
     /// optimistic readers detect the change and restart.

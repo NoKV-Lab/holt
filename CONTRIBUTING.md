@@ -119,7 +119,7 @@ cargo llvm-cov report --html --output-dir coverage
   generator + oracle in lockstep.
 - **WAL integration tests** (`tests/wal_tree_integration.rs` and
   `src/journal/tests.rs`) cover the crash-and-replay invariants.
-  The `durable_cfg` helper enables `wal_sync_on_commit` for tests
+  The `durable_cfg` helper enables `WalCommit::Sync` for tests
   that simulate a crash without a checkpoint.
 
 ### Commits

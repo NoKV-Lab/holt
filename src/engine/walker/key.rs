@@ -66,10 +66,13 @@ impl<'a> SearchKey<'a> {
     #[inline]
     pub(crate) fn eq_slice(self, other: &[u8]) -> bool {
         if !self.virtual_terminator {
-            return self.bytes == other;
+            return self.bytes.len() == other.len()
+                && simd::longest_common_prefix(self.bytes, other) == self.bytes.len();
         }
-        other.len() == self.bytes.len() + 1
-            && other[..self.bytes.len()] == *self.bytes
+        if other.len() != self.bytes.len() + 1 {
+            return false;
+        }
+        simd::longest_common_prefix(self.bytes, &other[..self.bytes.len()]) == self.bytes.len()
             && other[self.bytes.len()] == 0
     }
 
@@ -82,12 +85,14 @@ impl<'a> SearchKey<'a> {
             return false;
         }
         if !self.virtual_terminator || depth + other.len() <= self.bytes.len() {
-            return self.bytes[depth..depth + other.len()] == *other;
+            return simd::longest_common_prefix(&self.bytes[depth..depth + other.len()], other)
+                == other.len();
         }
 
         if depth < self.bytes.len() {
             let raw_len = self.bytes.len() - depth;
-            return other[..raw_len] == self.bytes[depth..] && other[raw_len] == 0;
+            return simd::longest_common_prefix(&self.bytes[depth..], &other[..raw_len]) == raw_len
+                && other[raw_len] == 0;
         }
         other[0] == 0
     }

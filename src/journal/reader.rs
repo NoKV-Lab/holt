@@ -24,13 +24,9 @@ use super::wal_op::WalOp;
 
 /// Outcome of a successful scan.
 ///
-/// All three fields are populated on every replay; the journal
-/// internal tests verify each. Production callers consume the
-/// per-record `seq` via the callback rather than re-reading
-/// `highest_seq` post-hoc, hence the `#[allow(dead_code)]` —
-/// the fields are part of the replay contract even though the
-/// `Tree::open` path doesn't currently read them.
-#[allow(dead_code)]
+/// The callback receives the sequence for each record it handles;
+/// this summary is the file-level replay boundary used by reopen
+/// and tests.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayStats {
     /// Number of records the callback was invoked for.
@@ -88,7 +84,7 @@ where
                 // sees a `WalOp::Batch`, just the inner primitive
                 // ops with derived seqs (`base + i`, mirroring the
                 // encoder's contiguous seq reservation).
-                if let WalOp::Batch { ops, .. } = &r.op {
+                if let WalOp::Batch { ops } = &r.op {
                     for (i, inner) in ops.iter().enumerate() {
                         let inner_seq = r.seq.wrapping_add(i as u64);
                         callback(inner, inner_seq, offset as u64)
