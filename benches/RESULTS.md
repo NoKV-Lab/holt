@@ -1,4 +1,4 @@
-# holt v0.3.0 benchmark results
+# holt benchmark results
 
 End-to-end Criterion microbenchmarks comparing **holt** against
 **RocksDB** (`rocksdb` crate, bundled `librocksdb-sys`) and
@@ -7,9 +7,9 @@ surface is intentionally small: one harness, three workload
 shapes, and operation mixes that reflect metadata engines rather
 than generic key/value stores.
 
-This file is the v0.3.0 release snapshot. Post-release
-`[Unreleased]` API work, such as key-only range scans, should be
-rerun before replacing the quoted release rows.
+The Criterion tables below are the v0.3.0 Linux release snapshot.
+The 50 M large-tree stress section is a v0.3.1 local macOS
+snapshot. Keep those environments separate when quoting numbers.
 
 ## Reproducing
 
@@ -174,6 +174,79 @@ inside the ART walker and fast-forwards past rolled-up subtrees.
 | fs | 100 k | **768** | 1,984 | 1,339 | 2.6x | 1.7x |
 | fs | 500 k | **1,264** | 2,081 | 1,844 | 1.6x | 1.5x |
 | fs | 2 M | **1,796** | 1,969 | 2,199 | 1.1x | 1.2x |
+
+## Large-tree stress: 50 M keys
+
+This is a local stress snapshot, not the Linux v0.3.0 release
+baseline above. It was run on an Apple M3 Pro macOS development
+machine, so Linux `io_uring` is not active. The profile is still
+the same fair hot-persistent comparison: all three engines are
+file-backed with WAL enabled, no per-op fsync, and a warm service
+after preload.
+
+Command shape:
+
+```bash
+TMPDIR="/Volumes/mac Ds - Data/tmp/holt-stress-50m" \
+HOLT_STRESS_N=50000000 \
+HOLT_STRESS_POINT_OPS=2000000 \
+HOLT_STRESS_LIST_OPS=500000 \
+HOLT_STRESS_LIST_TAKE=100 \
+HOLT_STRESS_DIR_TAKE=8 \
+cargo bench --bench stress -- objstore
+
+TMPDIR="/Volumes/mac Ds - Data/tmp/holt-stress-50m" \
+HOLT_STRESS_N=50000000 \
+HOLT_STRESS_POINT_OPS=2000000 \
+HOLT_STRESS_LIST_OPS=500000 \
+HOLT_STRESS_LIST_TAKE=100 \
+HOLT_STRESS_DIR_TAKE=8 \
+cargo bench --bench stress -- fs
+```
+
+### Object-store metadata stress
+
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| get | **2,282** | 155,025 | 283,215 | 68.0x | 124.1x |
+| put | 4,957 | **3,891** | 264,627 | 0.78x | 53.4x |
+| mixed | **3,982** | 4,162 | 73,826 | 1.05x | 18.5x |
+| list keys, take 100 | 10,302 | 15,028 | **8,864** | 1.46x | 0.86x |
+| list records, take 100 | **12,156** | n/a | n/a | n/a | n/a |
+| list_dir, take 8 | **3,558** | 22,866 | 11,964 | 6.4x | 3.4x |
+
+Holt shape after 50 M preload + 3 M point mutations:
+
+| blobs | edges | max depth | avg depth | avg hops | max hops | avg fill | max fill |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 39,952 | 39,951 | 4 | 2.90 | 2.78 | 5 | 0.381 | 0.970 |
+
+### Filesystem metadata stress
+
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| get | **1,822** | 66,632 | 174,126 | 36.6x | 95.6x |
+| put | 3,958 | **3,905** | 226,390 | 0.99x | 57.2x |
+| mixed | **3,072** | 4,962 | 127,024 | 1.6x | 41.3x |
+| list keys, take 100 | 10,292 | 12,980 | **8,340** | 1.3x | 0.81x |
+| list records, take 100 | **12,053** | n/a | n/a | n/a | n/a |
+| list_dir, take 8 | **3,437** | 15,335 | 10,976 | 4.5x | 3.2x |
+
+Holt shape after 50 M preload + 3 M point mutations:
+
+| blobs | edges | max depth | avg depth | avg hops | max hops | avg fill | max fill |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 34,846 | 34,845 | 4 | 2.71 | 2.51 | 5 | 0.317 | 0.944 |
+
+The 50 M run is useful because it stresses tree shape, route cache
+coverage, and cross-blob traversal beyond the Criterion scale
+curve. The good signal is that Holt's tree height stays bounded
+(`max_depth=4`, `max_hops=5`) after 50 M preloaded records and 3 M
+foreground point mutations. The honest limitation is that point
+put is only competitive with RocksDB here, not a clear win. The
+strong stress result is read scalability and metadata-native
+`list_dir`; plain key-only `list` is not Holt's strongest cell and
+SQLite is faster on this local warm-cache run.
 
 ## Interpretation
 

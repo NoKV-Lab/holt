@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.3 released).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.3.1 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> published version in your `Cargo.toml` (`holt = "=0.3.0"`) until 1.0
+> published version in your `Cargo.toml` (`holt = "=0.3.1"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -87,7 +87,7 @@ Add holt to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-holt = "=0.3.0"
+holt = "=0.3.1"
 ```
 
 The supported user surface is deliberately small:

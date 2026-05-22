@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-23
+
 ### Added
 
 - Added lightweight conditional-write API for metadata-style
