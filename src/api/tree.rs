@@ -84,8 +84,9 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
 ///   exclusively for the blobs they touch. Persistent trees enter
 ///   the writer-shared `commit_gate` while publishing dirty state
-///   and the journal record; durable fsync waiting happens after
-///   that gate through the group-commit worker.
+///   and the journal record. `WalCommit::Write` appends directly;
+///   `WalCommit::Sync` waits for the journal worker after leaving
+///   the gate.
 /// - **Maintenance** (`compact`, background merge) takes short
 ///   exclusive windows on `maintenance_gate` while folding/deleting
 ///   cross-blob edges. Blob-local compaction runs on the shared

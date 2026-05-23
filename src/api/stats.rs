@@ -218,18 +218,17 @@ impl TreeStats {
     }
 }
 
-/// Snapshot of the WAL group-commit worker's counters.
+/// Snapshot of WAL append and sync counters.
 #[derive(Debug, Clone, Copy)]
 pub struct JournalStats {
     /// Number of WAL append requests submitted by foreground
     /// mutation paths.
     pub appends: u64,
-    /// Number of append batches processed by the journal worker.
-    /// Under concurrent `WalCommit::Write` / `WalCommit::Sync`
-    /// writers this should be lower than [`Self::appends`].
+    /// Number of WAL write groups: foreground `Write` appends plus
+    /// worker batches for `Enqueue` / `Sync`.
     pub batches: u64,
-    /// Number of `sync_data` calls issued by the journal worker,
-    /// including explicit checkpoint flush barriers.
+    /// Number of `sync_data` calls issued by WAL flush paths,
+    /// including explicit checkpoint barriers.
     pub syncs: u64,
 }
 

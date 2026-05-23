@@ -9,10 +9,9 @@
 //! - [`writer`] — append-only WAL file with
 //!   `sync_data`-on-flush durability + 64 KB buffered auto-drain
 //!   mechanics.
-//! - [`group_commit`] — dedicated append worker; foreground
-//!   writers enqueue encoded records; write waiters share
-//!   append/drain batches and sync waiters share one `sync_data`
-//!   per short batch window.
+//! - [`group_commit`] — WAL append coordinator. `Write` appends
+//!   directly; `Enqueue` and `Sync` use the worker, with `Sync`
+//!   waiters sharing one `sync_data` per short batch window.
 //! - [`reader`] — forward replay scanner with graceful
 //!   torn-tail handling. Unpacks `Batch` records into per-inner
 //!   callbacks so consumers don't need a `Batch` arm.

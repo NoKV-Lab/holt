@@ -7,8 +7,8 @@
 //! 2. Encoded records are appended into an in-memory buffer.
 //!    When the buffer crosses [`AUTO_FLUSH_THRESHOLD`] (64 KB),
 //!    the writer transparently drains it to the OS via `write_all`
-//!    (no `sync_data`). The higher-level group-commit worker
-//!    controls which append waiters share a durability flush.
+//!    (no `sync_data`). Higher layers decide whether the append is
+//!    direct, queued, or followed by a durability flush.
 //! 3. [`WalWriter::flush`] drains whatever is still pending and
 //!    runs `sync_data` so every record so far is durable past a
 //!    power failure. This is the **durability boundary**.
@@ -17,9 +17,9 @@
 //!    what's been auto-drained to page cache survives a process
 //!    crash but not a power loss until you `flush`").
 //!
-//! The group-commit worker calls [`WalWriter::truncate`] when
-//! `Tree::checkpoint` proves every WAL record is reflected in the
-//! durable blob image.
+//! The journal coordinator calls [`WalWriter::truncate`] after
+//! checkpoint proves every WAL record is reflected in the durable
+//! blob image.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -135,7 +135,7 @@ impl WalWriter {
     }
 
     /// True when this WAL contains bytes beyond the fixed file
-    /// header. Used by the group-commit worker to distinguish a
+    /// header. Used by the journal coordinator to distinguish a
     /// genuinely clean WAL from an opened log that replay already
     /// consumed but checkpoint has not truncated yet.
     #[must_use]
@@ -153,8 +153,7 @@ impl WalWriter {
     ///
     /// Generic test-time entry point for exercising enum encoding
     /// end-to-end through the writer + replay path. Production
-    /// hot paths encode records before handing them to the
-    /// group-commit journal worker.
+    /// hot paths encode records before handing them to the journal.
     #[cfg(test)]
     pub fn append(&mut self, op: &WalOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);
@@ -163,9 +162,8 @@ impl WalWriter {
 
     /// Append one already-encoded WAL record.
     ///
-    /// Used by the group-commit worker: foreground threads encode
-    /// into owned buffers, then the worker serially appends those
-    /// bytes to this writer and optionally flushes the whole batch.
+    /// Used by the journal coordinator after callers encode into
+    /// owned buffers.
     pub(crate) fn append_encoded(&mut self, record: &[u8]) -> Result<()> {
         self.pending.extend_from_slice(record);
         self.maybe_drain()

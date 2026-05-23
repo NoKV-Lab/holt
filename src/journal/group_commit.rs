@@ -1,12 +1,11 @@
-//! Group-commit journal worker.
+//! WAL append coordinator.
 //!
 //! `WalWriter` owns the file format and append/truncate mechanics.
-//! This module owns concurrency: foreground writers enqueue fully
-//! encoded WAL records, then wait outside the tree's commit-publish
-//! critical section when their selected WAL boundary requires an
-//! acknowledgement. `WalCommit::Write` and `WalCommit::Sync` both
-//! use the worker so concurrent foreground writers share append
-//! batches instead of contending on the WAL writer mutex.
+//! This module owns concurrency around the WAL file. `Enqueue` and
+//! `Sync` records go through the worker; `Write` records use a
+//! foreground append fast path. The tree already serializes publish
+//! order with `commit_gate`, so synchronous no-fsync WAL append can
+//! avoid a channel hop and scheduler round trip.
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::collections::VecDeque;
@@ -30,7 +29,7 @@ enum JournalCommand {
     Append {
         bytes: Vec<u8>,
         seq: u64,
-        commit: WalCommit,
+        sync: bool,
         ack: Option<AckTx>,
     },
     Flush {
@@ -46,16 +45,15 @@ enum JournalCommand {
 struct AppendRequest {
     bytes: Vec<u8>,
     seq: u64,
-    commit: WalCommit,
+    sync: bool,
     ack: Option<AckTx>,
 }
 
 /// Completion handle for one acknowledged journal append.
 ///
-/// `WalCommit::Write` waits until its batch has been drained to
-/// the OS page cache. `WalCommit::Sync` waits until its batch has
-/// reached the `sync_data` durability boundary. `Enqueue` returns
-/// without an acknowledgement handle.
+/// `WalCommit::Sync` waits until its batch has reached the
+/// `sync_data` durability boundary. `Enqueue` returns without an
+/// acknowledgement handle.
 pub(crate) struct JournalAck {
     rx: AckRx,
 }
@@ -70,13 +68,14 @@ impl JournalAck {
 
 /// WAL append coordinator.
 ///
-/// All WAL records are serialized by the background worker. `Write`
-/// waiters share append/drain batches; `Sync` waiters additionally
-/// share one `sync_data` when they arrive inside the short group
-/// window.
+/// `Enqueue` records are serialized by the background worker.
+/// `Write` records are appended directly by the foreground writer,
+/// and `Sync` waiters share one `sync_data` when they arrive inside
+/// the short group window.
 pub(crate) struct Journal {
     tx: Sender<JournalCommand>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    writer: Arc<Mutex<WalWriter>>,
     appends: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
     syncs: Arc<AtomicU64>,
@@ -123,6 +122,7 @@ impl Journal {
         Ok(Self {
             tx,
             handle: Mutex::new(Some(handle)),
+            writer,
             appends: Arc::new(AtomicU64::new(0)),
             batches,
             syncs,
@@ -134,7 +134,17 @@ impl Journal {
     }
 
     /// Submit one fully encoded WAL record.
+    ///
+    /// `WalCommit::Write` takes the foreground fast path. The tree
+    /// calls this while holding `commit_gate`, so the direct append
+    /// preserves mutation/WAL order without routing through the
+    /// worker.
     pub(crate) fn submit(&self, bytes: Vec<u8>, commit: WalCommit) -> Result<Option<JournalAck>> {
+        if matches!(commit, WalCommit::Write) {
+            self.append_write_direct(&bytes)?;
+            return Ok(None);
+        }
+
         let needs_ack = !matches!(commit, WalCommit::Enqueue);
         let (ack, rx) = if needs_ack {
             let (ack, rx) = bounded(1);
@@ -147,13 +157,29 @@ impl Journal {
             .send(JournalCommand::Append {
                 bytes,
                 seq,
-                commit,
+                sync: matches!(commit, WalCommit::Sync),
                 ack,
             })
             .map_err(|_| Error::Internal("journal worker stopped before append"))?;
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.wal_work.fetch_max(seq, Ordering::Release);
         Ok(rx.map(|rx| JournalAck { rx }))
+    }
+
+    fn append_write_direct(&self, bytes: &[u8]) -> Result<()> {
+        let seq = self.next_work.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
+            writer.append_encoded(bytes)?;
+            writer.drain_to_os()?;
+        }
+        self.appends.fetch_add(1, Ordering::Relaxed);
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.wal_work.fetch_max(seq, Ordering::Release);
+        Ok(())
     }
 
     /// Drain every append submitted before this call and force the
@@ -249,14 +275,14 @@ fn run_worker(
             JournalCommand::Append {
                 bytes,
                 seq,
-                commit,
+                sync,
                 ack,
             } => {
                 process_append_batch(
                     AppendRequest {
                         bytes,
                         seq,
-                        commit,
+                        sync,
                         ack,
                     },
                     &rx,
@@ -300,7 +326,7 @@ fn process_append_batch(
     durable_work: &AtomicU64,
 ) {
     let mut batch = vec![first];
-    let mut needs_sync = matches!(batch[0].commit, WalCommit::Sync);
+    let mut needs_sync = batch[0].sync;
     let mut bytes = batch[0].bytes.len();
     let mut deadline = needs_sync.then(|| Instant::now() + GROUP_COMMIT_WINDOW);
 
@@ -330,19 +356,18 @@ fn process_append_batch(
             JournalCommand::Append {
                 bytes: record,
                 seq,
-                commit,
+                sync,
                 ack,
             } => {
                 bytes += record.len();
-                let record_needs_sync = matches!(commit, WalCommit::Sync);
-                needs_sync |= record_needs_sync;
-                if record_needs_sync && deadline.is_none() {
+                needs_sync |= sync;
+                if sync && deadline.is_none() {
                     deadline = Some(Instant::now() + GROUP_COMMIT_WINDOW);
                 }
                 batch.push(AppendRequest {
                     bytes: record,
                     seq,
-                    commit,
+                    sync,
                     ack,
                 });
             }
@@ -377,11 +402,6 @@ fn write_append_batch(
         syncs.fetch_add(1, Ordering::Relaxed);
         let durable_seq = batch.iter().map(|req| req.seq).max().unwrap_or(0);
         durable_work.fetch_max(durable_seq, Ordering::AcqRel);
-    } else if batch
-        .iter()
-        .any(|req| matches!(req.commit, WalCommit::Write))
-    {
-        writer.drain_to_os()?;
     }
     Ok(())
 }
@@ -471,15 +491,14 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        let ack = journal
-            .submit(vec![1, 3, 5, 7], WalCommit::Write)
-            .unwrap()
-            .expect("write-ack append returns an ack");
-        ack.wait().unwrap();
+        let ack = journal.submit(vec![1, 3, 5, 7], WalCommit::Write).unwrap();
+        assert!(ack.is_none());
 
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
         assert!(journal.needs_flush());
         assert_eq!(journal.stats().syncs, 0);
+        assert_eq!(journal.stats().appends, 1);
+        assert_eq!(journal.stats().batches, 1);
     }
 
     #[test]
