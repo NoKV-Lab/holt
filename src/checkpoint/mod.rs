@@ -104,31 +104,16 @@ pub struct CheckpointConfig {
     /// Maximum interval between planner rounds. Smaller values
     /// = lower checkpoint latency, more wake-ups per second.
     ///
-    /// **Default 100 ms** — tuned from local checkpoint cadence
-    /// sweeps. The sweep showed:
-    ///
-    /// | interval | peak WAL (paced, vs disabled) | writer overhead |
-    /// |---:|---:|---:|
-    /// |   50 ms | 0%   | unchanged |
-    /// |  100 ms | 23%  | unchanged |
-    /// |  200 ms | 47%  | unchanged |
-    /// |  500 ms | 54%  | unchanged |
-    /// | 1000 ms | 100% | unchanged |
-    ///
-    /// 100 ms keeps the WAL bounded (4× tighter than 200 ms) at
-    /// the cost of 10 wake-ups/sec; tighter intervals see
-    /// diminishing returns on peak WAL but double the wake-up
-    /// rate. Tune up for low-write workloads where the extra
-    /// wake-ups cost more than the WAL bytes they save.
+    /// Default 500 ms. The background checkpointer stays active
+    /// by default, but avoids chasing every short write burst.
     pub idle_interval: Duration,
     /// Trigger an early round when the BufferManager's dirty
     /// blob count reaches this. Heuristic for "the dirty set is
     /// large enough that the next round is worth running before
     /// `idle_interval` elapses".
     ///
-    /// Default 16 — chosen for "many child-blob trees but not
-    /// pathological". For a single-root workload the dirty
-    /// count is usually ≤ 1, so the timer dominates.
+    /// Default 512. This bounds dirty growth without forcing an
+    /// early checkpoint for a handful of hot blobs.
     pub dirty_blob_threshold: usize,
     /// Drain queued parent-merge candidates at the start of each
     /// round. The queue is populated by foreground spillovers and
@@ -162,8 +147,8 @@ impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            idle_interval: Duration::from_millis(100),
-            dirty_blob_threshold: 16,
+            idle_interval: Duration::from_millis(500),
+            dirty_blob_threshold: 512,
             auto_merge: true,
             eviction_interval: Duration::from_secs(1),
             eviction_idle_ticks: 1024,

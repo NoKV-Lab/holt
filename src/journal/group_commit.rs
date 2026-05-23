@@ -7,7 +7,7 @@
 //! order with `commit_gate`, so synchronous no-fsync WAL append can
 //! avoid a channel hop and scheduler round trip.
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,11 @@ use crate::api::errors::{Error, Result};
 use super::writer::WalWriter;
 
 const GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
+const ENQUEUE_BATCH_WINDOW: Duration = Duration::from_micros(10);
 const GROUP_COMMIT_MAX_BYTES: usize = 256 * 1024;
+// Large enough to absorb metadata bursts without making async WAL
+// enqueue a foreground backpressure point.
+const JOURNAL_QUEUE_DEPTH: usize = 65_536;
 
 type AckTx = Sender<Result<()>>;
 type AckRx = Receiver<Result<()>>;
@@ -90,7 +94,7 @@ impl Journal {
         let writer = WalWriter::open_or_create(path, tree_id)?;
         let initial_wal_work = u64::from(writer.has_records());
         let writer = Arc::new(Mutex::new(writer));
-        let (tx, rx) = bounded::<JournalCommand>(1024);
+        let (tx, rx) = bounded::<JournalCommand>(JOURNAL_QUEUE_DEPTH);
         let batches = Arc::new(AtomicU64::new(0));
         let syncs = Arc::new(AtomicU64::new(0));
         // Existing WAL bytes are replayable, but we cannot prove
@@ -331,28 +335,25 @@ fn process_append_batch(
     let mut batch = vec![first];
     let mut needs_sync = batch[0].sync;
     let mut bytes = batch[0].bytes.len();
-    let mut deadline = needs_sync.then(|| Instant::now() + GROUP_COMMIT_WINDOW);
+    let mut deadline = Instant::now()
+        + if needs_sync {
+            GROUP_COMMIT_WINDOW
+        } else {
+            ENQUEUE_BATCH_WINDOW
+        };
 
     loop {
         if bytes >= GROUP_COMMIT_MAX_BYTES {
             break;
         }
 
-        let next = match deadline {
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                match rx.recv_timeout(deadline - now) {
-                    Ok(cmd) => cmd,
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            None => match rx.try_recv() {
-                Ok(cmd) => cmd,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            },
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let next = match rx.recv_timeout(deadline - now) {
+            Ok(cmd) => cmd,
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         };
 
         match next {
@@ -363,9 +364,10 @@ fn process_append_batch(
                 ack,
             } => {
                 bytes += record.len();
+                let was_sync = needs_sync;
                 needs_sync |= sync;
-                if sync && deadline.is_none() {
-                    deadline = Some(Instant::now() + GROUP_COMMIT_WINDOW);
+                if sync && !was_sync {
+                    deadline = Instant::now() + GROUP_COMMIT_WINDOW;
                 }
                 batch.push(AppendRequest {
                     bytes: record,
