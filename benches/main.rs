@@ -1,5 +1,5 @@
-//! Criterion benchmarks comparing holt against RocksDB **and**
-//! SQLite across three realistic shapes of metadata workload.
+//! Criterion benchmarks comparing holt against RocksDB, SQLite,
+//! and sled across three realistic shapes of metadata workload.
 //!
 //! ## Scenarios
 //!
@@ -34,14 +34,17 @@
 //! for the memory variant, and "hot WAL, no per-op fsync" for the
 //! persistent variant:
 //!
-//! | Mode       | holt                                        | RocksDB                              | SQLite                                              |
-//! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|
-//! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
-//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed |
+//! | Mode       | holt                                        | RocksDB                              | SQLite                                              | sled |
+//! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|------|
+//! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` | temp DB, high-throughput, no background flush |
+//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed | temp-dir DB, high-throughput, no background flush |
 //!
 //! The `*_persist_*` groups are intentionally hot-service
 //! measurements. They do **not** claim to measure cold data-file
 //! I/O after reopen.
+//! sled does not expose the same WAL/no-WAL/fsync matrix, so sled
+//! rows are embedded-KV peer context rather than strict durability
+//! equivalence.
 //!
 //! ## Running
 //!
@@ -60,6 +63,7 @@ use tempfile::TempDir;
 
 use holt::{RangeEntry, Tree, TreeConfig, WalCommit};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use sled::{Batch as SledBatch, Db as SledDb, Mode as SledMode};
 
 // ---------------------------------------------------------------
 // Workload configuration
@@ -218,6 +222,28 @@ fn make_sqlite_persistent() -> (Connection, TempDir) {
     (conn, dir)
 }
 
+fn make_sled_memory() -> SledDb {
+    sled::Config::new()
+        .temporary(true)
+        .mode(SledMode::HighThroughput)
+        .cache_capacity(64 * 1024 * 1024)
+        .flush_every_ms(None)
+        .open()
+        .expect("sled memory open")
+}
+
+fn make_sled_persistent() -> (SledDb, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sled::Config::new()
+        .path(dir.path())
+        .mode(SledMode::HighThroughput)
+        .cache_capacity(64 * 1024 * 1024)
+        .flush_every_ms(None)
+        .open()
+        .expect("sled persistent open");
+    (db, dir)
+}
+
 fn preload_holt(tree: &Tree, pairs: &[(Vec<u8>, Vec<u8>)]) {
     for (k, v) in pairs {
         tree.put(k, v).expect("holt put");
@@ -246,6 +272,12 @@ fn preload_sqlite(conn: &Connection, pairs: &[(Vec<u8>, Vec<u8>)]) {
         }
     }
     tx.commit().expect("commit");
+}
+
+fn preload_sled(db: &SledDb, pairs: &[(Vec<u8>, Vec<u8>)]) {
+    for (k, v) in pairs {
+        db.insert(k, v.as_slice()).expect("sled insert");
+    }
 }
 
 // ---------------------------------------------------------------
@@ -297,6 +329,17 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             });
         });
 
+        let db = make_sled_memory();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 1);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                black_box(db.get(black_box(k)).unwrap());
+            });
+        });
+
         group.finish();
     }
 
@@ -340,6 +383,18 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
                     .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
                     .unwrap();
                 stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+                black_box(());
+            });
+        });
+
+        let db = make_sled_memory();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 2);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                db.insert(black_box(k), black_box(v.as_slice())).unwrap();
                 black_box(());
             });
         });
@@ -410,6 +465,23 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             });
         });
 
+        let db = make_sled_memory();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 3);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    black_box(db.get(black_box(k)).unwrap());
+                } else {
+                    db.insert(black_box(k), black_box(v.as_slice())).unwrap();
+                    black_box(());
+                }
+            });
+        });
+
         group.finish();
     }
 }
@@ -466,6 +538,17 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
             });
         });
 
+        let (db, _dir) = make_sled_persistent();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 11);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                black_box(db.get(black_box(k)).unwrap());
+            });
+        });
+
         group.finish();
     }
 
@@ -511,6 +594,18 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                     .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
                     .unwrap();
                 stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+                black_box(());
+            });
+        });
+
+        let (db, _dir) = make_sled_persistent();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 12);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                db.insert(black_box(k), black_box(v.as_slice())).unwrap();
                 black_box(());
             });
         });
@@ -578,6 +673,23 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                         .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
                         .unwrap();
                     stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+                    black_box(());
+                }
+            });
+        });
+
+        let (db, _dir) = make_sled_persistent();
+        preload_sled(&db, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 13);
+        group.bench_function("sled", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    black_box(db.get(black_box(k)).unwrap());
+                } else {
+                    db.insert(black_box(k), black_box(v.as_slice())).unwrap();
                     black_box(());
                 }
             });
@@ -726,6 +838,20 @@ fn bench_scale_get_workload(
                 });
             },
         );
+
+        let db = make_sled_memory();
+        preload_sled(&db, &pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 40);
+        group.bench_with_input(
+            BenchmarkId::new("sled", format_n(n)),
+            &key_count,
+            |b, &kc| {
+                b.iter(|| {
+                    let (k, _) = &pairs[(rng.next_u32() as usize) % kc];
+                    black_box(db.get(black_box(k)).unwrap());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -788,6 +914,21 @@ fn bench_scale_put_workload(
                         .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
                         .unwrap();
                     stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+                    black_box(());
+                });
+            },
+        );
+
+        let db = make_sled_memory();
+        preload_sled(&db, &pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 41);
+        group.bench_with_input(
+            BenchmarkId::new("sled", format_n(n)),
+            &key_count,
+            |b, &kc| {
+                b.iter(|| {
+                    let (k, v) = &pairs[(rng.next_u32() as usize) % kc];
+                    db.insert(black_box(k), black_box(v.as_slice())).unwrap();
                     black_box(());
                 });
             },
@@ -898,6 +1039,22 @@ fn bench_list_plain(
         });
     });
 
+    let db = make_sled_memory();
+    preload_sled(&db, pairs);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for item in db.scan_prefix(black_box(prefix)) {
+                let (k, v) = item.unwrap();
+                out.push((k.to_vec(), v.to_vec()));
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
     group.finish();
 }
 
@@ -966,6 +1123,22 @@ fn bench_list_plain_persistent(
                 })
                 .unwrap();
             let out: Vec<(Vec<u8>, Vec<u8>)> = rows.collect::<Result<_, _>>().unwrap();
+            black_box(out);
+        });
+    });
+
+    let (db, _dir) = make_sled_persistent();
+    preload_sled(&db, pairs);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for item in db.scan_prefix(black_box(prefix)) {
+                let (k, v) = item.unwrap();
+                out.push((k.to_vec(), v.to_vec()));
+                if out.len() >= take {
+                    break;
+                }
+            }
             black_box(out);
         });
     });
@@ -1070,6 +1243,32 @@ fn bench_list_delim(
         });
     });
 
+    let db = make_sled_memory();
+    preload_sled(&db, pairs);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(take);
+            let mut last_common: Option<Vec<u8>> = None;
+            for item in db.scan_prefix(black_box(prefix)) {
+                let (k, _v) = item.unwrap();
+                let rest = &k[prefix.len()..];
+                let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+                    k[..=prefix.len() + idx].to_vec()
+                } else {
+                    k.to_vec()
+                };
+                if last_common.as_deref() != Some(emit.as_slice()) {
+                    last_common = Some(emit.clone());
+                    out.push(emit);
+                    if out.len() >= take {
+                        break;
+                    }
+                }
+            }
+            black_box(out);
+        });
+    });
+
     group.finish();
 }
 
@@ -1151,6 +1350,16 @@ fn bench_metadata_create_delete(
         });
     });
 
+    let db = make_sled_memory();
+    preload_sled(&db, pairs);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            db.insert(black_box(spec.create_key), black_box(value.as_slice()))
+                .unwrap();
+            db.remove(black_box(spec.create_key)).unwrap();
+        });
+    });
+
     group.finish();
 }
 
@@ -1189,6 +1398,14 @@ fn bench_metadata_rename(
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             sqlite_rename_roundtrip(&conn, src, spec.rename_dst);
+        });
+    });
+
+    let db = make_sled_memory();
+    preload_sled(&db, pairs);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            sled_rename_roundtrip(&db, src, spec.rename_dst);
         });
     });
 
@@ -1338,6 +1555,42 @@ fn bench_metadata_mix(
         });
     });
 
+    let db = make_sled_memory();
+    preload_sled(&db, pairs);
+    let mut rng = StdRng::seed_from_u64(SEED + 71);
+    group.bench_function("sled", |b| {
+        b.iter(|| {
+            let r = rng.next_u32();
+            let (k, v) = &pairs[(r as usize) % key_count];
+            match r % 100 {
+                0..=44 => {
+                    black_box(db.get(black_box(k)).unwrap());
+                }
+                45..=64 => {
+                    db.insert(black_box(k), black_box(v.as_slice())).unwrap();
+                    black_box(());
+                }
+                65..=74 => {
+                    black_box(sled_list_plain(&db, spec.list_prefix, spec.list_take));
+                }
+                75..=84 => {
+                    black_box(sled_list_dir(
+                        &db,
+                        spec.dir_prefix,
+                        spec.delimiter,
+                        spec.dir_take,
+                    ));
+                }
+                85..=94 => {
+                    db.insert(black_box(spec.create_key), black_box(v.as_slice()))
+                        .unwrap();
+                    db.remove(black_box(spec.create_key)).unwrap();
+                }
+                _ => sled_rename_roundtrip(&db, rename_src, spec.rename_dst),
+            }
+        });
+    });
+
     group.finish();
 }
 
@@ -1391,6 +1644,40 @@ fn rocksdb_list_dir(db: &DB, prefix: &[u8], delim: u8, take: usize) -> usize {
         if !k.starts_with(prefix) {
             break;
         }
+        let rest = &k[prefix.len()..];
+        let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+            k[..=prefix.len() + idx].to_vec()
+        } else {
+            k.to_vec()
+        };
+        if last_common.as_deref() != Some(emit.as_slice()) {
+            last_common = Some(emit);
+            seen += 1;
+            if seen >= take {
+                break;
+            }
+        }
+    }
+    seen
+}
+
+fn sled_list_plain(db: &SledDb, prefix: &[u8], take: usize) -> usize {
+    let mut seen = 0;
+    for item in db.scan_prefix(prefix) {
+        let (_k, _v) = item.unwrap();
+        seen += 1;
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn sled_list_dir(db: &SledDb, prefix: &[u8], delim: u8, take: usize) -> usize {
+    let mut seen = 0;
+    let mut last_common: Option<Vec<u8>> = None;
+    for item in db.scan_prefix(prefix) {
+        let (k, _v) = item.unwrap();
         let rest = &k[prefix.len()..];
         let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
             k[..=prefix.len() + idx].to_vec()
@@ -1466,6 +1753,20 @@ fn rocksdb_rename(db: &DB, wo: &WriteOptions, src: &[u8], dst: &[u8]) {
     batch.delete(src);
     batch.put(dst, value);
     db.write_opt(batch, wo).unwrap();
+}
+
+fn sled_rename_roundtrip(db: &SledDb, src: &[u8], dst: &[u8]) {
+    sled_rename(db, src, dst);
+    sled_rename(db, dst, src);
+}
+
+fn sled_rename(db: &SledDb, src: &[u8], dst: &[u8]) {
+    let value = db.get(src).unwrap().expect("rename source exists");
+    assert!(db.get(dst).unwrap().is_none(), "rename destination absent");
+    let mut batch = SledBatch::default();
+    batch.remove(src);
+    batch.insert(dst, value);
+    db.apply_batch(batch).unwrap();
 }
 
 fn sqlite_rename_roundtrip(conn: &Connection, src: &[u8], dst: &[u8]) {

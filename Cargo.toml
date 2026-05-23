@@ -61,6 +61,7 @@ rocksdb = { version = "0.24", default-features = false }
 # a system SQLite — keeps the bench comparator apples-to-apples
 # across machines.
 rusqlite = { version = "0.39", features = ["bundled"] }
+sled = "0.34"
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
 [features]

@@ -1,9 +1,9 @@
 # Benchmarks
 
 Criterion-based microbenchmarks comparing **holt** against
-**RocksDB** and **SQLite** across three shapes of metadata
-workload — `kv` (anti-pattern baseline), `objstore`, and `fs`
-(holt's design target).
+**RocksDB**, **SQLite**, and **sled** across three shapes of
+metadata workload — `kv` (anti-pattern baseline), `objstore`,
+and `fs` (holt's design target).
 
 ## Scenarios
 
@@ -26,12 +26,14 @@ metadata engine actually serves beyond blind point overwrite:
 - `*_list` — marker-aware prefix range scan, `take(100)` entries
 - `*_list_dir` — S3-style delimiter rollup, take 8 distinct
   `CommonPrefix` entries (holt does the dedup in the engine;
-  RocksDB + SQLite get the same logic done at the bench's app
-  layer, since neither has a native `?delimiter=` API)
+  RocksDB, SQLite, and sled get the same logic done at the
+  bench's app layer, since they do not expose a native
+  `?delimiter=` API)
 - `*_create_delete` — create a scratch metadata entry, then
   delete it to keep the benchmark state bounded
 - `*_rename` — atomic rename round-trip. Holt uses `Tree::rename`;
-  RocksDB uses `WriteBatch`; SQLite uses an explicit transaction.
+  RocksDB and sled use write batches; SQLite uses an explicit
+  transaction.
 - `*_metadata_mix` — weighted objstore/fs metadata mix:
   45% stat/get, 20% metadata update, 10% plain list, 10%
   delimiter list-dir, 10% create+delete, 5% rename round-trip.
@@ -115,12 +117,16 @@ For `list_dir`, the stress harness gives RocksDB and SQLite a
 fair app-layer fast-forward implementation: after emitting one
 rolled-up prefix, it seeks to that prefix's lexicographic
 successor instead of scanning every key below the directory.
+sled uses the same app-layer fast-forward shape when selected.
 
 Useful knobs:
 
 ```sh
 # Run only Holt while tuning tree shape.
 HOLT_STRESS_ENGINES=holt cargo bench --bench stress -- objstore
+
+# Add sled as a Rust embedded-KV peer.
+HOLT_STRESS_ENGINES=holt,rocksdb,sled cargo bench --bench stress -- objstore
 
 # Smoke-test the harness quickly.
 HOLT_STRESS_N=10000 \
@@ -141,6 +147,10 @@ WAL on with `sync = false`; SQLite uses a file-backed WAL database
 with `synchronous = OFF`. This is the fair persistent hot path:
 WAL bytes are written before the operation returns, but power-loss
 durability is not forced per operation.
+sled can be selected as an embedded-KV peer, but its flush controls
+do not map exactly to this WAL-on/no-fsync matrix; the harness runs
+it in high-throughput mode with background flush disabled during
+the timed section.
 
 ## Concurrent Harness
 
@@ -172,12 +182,15 @@ study.
 
 ## Methodology — apples-to-apples
 
-Two comparison modes, each with all three engines tuned to the
-same durability profile:
+Two comparison modes, with Holt/RocksDB/SQLite tuned to the same
+durability profile. sled is included as a Rust embedded-KV peer,
+but its flush/durability knobs are not an exact match, so sled rows
+should keep that caveat attached.
 
 ### Memory / no-WAL mode (`*_get` / `*_put` / `*_mixed`)
 
-Engine algorithm cost only — durability disabled across the board:
+Engine algorithm cost only — durability disabled where the engine
+exposes that mode:
 
 - **holt**: `TreeConfig::memory()` with `memory_flush_on_write =
   false`. Mutations stay in the BufferManager-pinned blobs.
@@ -185,6 +198,9 @@ Engine algorithm cost only — durability disabled across the board:
   64 MB memtable, compression disabled.
 - **SQLite**: `:memory:` DB, `journal_mode=MEMORY`,
   `synchronous=OFF`, 64 MB page cache, `WITHOUT ROWID` schema.
+- **sled**: temporary DB, `Mode::HighThroughput`, 64 MB cache,
+  `flush_every_ms(None)`. sled does not expose a direct
+  `disable_wal` equivalent.
 
 ### Hot persistent mode (`*_persist_get` / `*_persist_put` / `*_persist_mixed`)
 
@@ -205,6 +221,10 @@ a cold data-file I/O benchmark:
   Each `put` appends to the WAL (buffered) plus the memtable.
 - **SQLite**: file-backed DB, `journal_mode=WAL`,
   `synchronous=OFF`, 64 MB page cache.
+- **sled**: temp-dir DB, `Mode::HighThroughput`, 64 MB cache,
+  `flush_every_ms(None)`. Its foreground acknowledgement semantics
+  are not identical to the WAL-on engines above; treat the row as
+  peer context rather than a strict durability-equivalent cell.
 
 Shared settings: 20 000 unique keys preloaded; bench iterates a
 seeded permutation of that set; `cargo bench` builds with
@@ -266,6 +286,8 @@ and full-record `list_records` separately. Delimiter rollup
 rolled-up subtree; RocksDB and SQLite use generic ordered
 iteration plus app-layer dedup because neither exposes a native
 delimiter-list API.
+sled is reported the same way as RocksDB here: ordered iteration
+plus app-layer prefix math.
 
 ## Caveats
 
@@ -276,14 +298,16 @@ delimiter-list API.
 2. **No fsync in persistent rows.** Persistent rows use
    `sync=off`-equivalent semantics: WAL bytes reach the OS page
    cache before the operation returns, but no per-op `fsync` is
-   forced. Memory rows are volatile by definition.
+   forced. Memory rows are volatile by definition. sled does not
+   expose the same WAL/no-WAL split, so sled rows are not strict
+   durability-equivalent cells.
 3. **Delimiter rollup is still an engine-specific semantic.** Holt's
    `Tree::range` ascends the descent stack past a rolled-up
    subtree after emitting its `CommonPrefix`, so the cost is
-   `O(distinct_rollups)`. The stress harness gives RocksDB and
-   SQLite an app-layer fast-forward cursor, but the semantic is not
-   native to either engine; it is still built from ordered iteration
-   plus application-side prefix math.
+   `O(distinct_rollups)`. The stress harness gives RocksDB,
+   SQLite, and sled an app-layer fast-forward cursor, but the
+   semantic is not native to those engines; it is still built from
+   ordered iteration plus application-side prefix math.
 4. **Bench numbers are machine-dependent.** Don't take any
    absolute throughput claim from this README at face value —
    re-run on your hardware. The relative ordering (holt wins on

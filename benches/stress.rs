@@ -25,6 +25,7 @@ use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig, WalCommit};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use rusqlite::{params, Connection, OptionalExtension};
+use sled::{Db as SledDb, Mode as SledMode};
 use tempfile::TempDir;
 
 const DEFAULT_N_KEYS: usize = 20_000_000;
@@ -200,6 +201,9 @@ fn main() {
     if cfg.selected("sqlite") {
         run_sqlite(&cfg, &samples);
     }
+    if cfg.selected("sled") {
+        run_sled(&cfg, &samples);
+    }
 }
 
 fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
@@ -362,6 +366,46 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     );
 }
 
+fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
+    let sled_dir = TempDir::new().expect("sled tempdir");
+    let db = make_sled_persistent(&sled_dir);
+    preload_sled(&db, cfg.workload, cfg.n_keys);
+
+    report("sled", "get", samples.len(), time_get_sled(&db, samples));
+    report("sled", "put", samples.len(), time_put_sled(&db, samples));
+    report(
+        "sled",
+        "mixed",
+        samples.len(),
+        time_mixed_sled(&db, samples),
+    );
+    report(
+        "sled",
+        "list",
+        cfg.list_ops,
+        time_repeated(cfg.list_ops, || {
+            black_box(sled_list_plain(
+                &db,
+                cfg.workload.list_prefix(),
+                cfg.list_take,
+            ));
+        }),
+    );
+    report(
+        "sled",
+        "list_dir",
+        cfg.list_ops,
+        time_repeated(cfg.list_ops, || {
+            black_box(sled_list_dir(
+                &db,
+                cfg.workload.dir_prefix(),
+                cfg.workload.delimiter(),
+                cfg.dir_take,
+            ));
+        }),
+    );
+}
+
 fn make_samples(workload: Workload, n_keys: usize, ops: usize) -> Vec<OpSample> {
     assert!(n_keys > 0, "HOLT_STRESS_N must be > 0");
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -430,6 +474,18 @@ fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
         }
     }
     tx.commit().expect("sqlite preload commit");
+}
+
+fn preload_sled(db: &SledDb, workload: Workload, n_keys: usize) {
+    progress("sled", "preload", 0, n_keys);
+    for i in 0..n_keys {
+        let key = workload.key(i, n_keys);
+        let value = workload.value(i, 0);
+        db.insert(key, value).expect("sled preload insert");
+        if should_progress(i + 1, n_keys) {
+            progress("sled", "preload", i + 1, n_keys);
+        }
+    }
 }
 
 fn time_get_holt(tree: &Tree, samples: &[OpSample]) -> Duration {
@@ -519,6 +575,30 @@ fn time_mixed_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
             put_stmt
                 .execute(params![sample.key.as_slice(), sample.value.as_slice()])
                 .expect("sqlite put");
+        }
+    })
+}
+
+fn time_get_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
+    time_samples(samples, |sample| {
+        black_box(db.get(black_box(&sample.key)).expect("sled get"));
+    })
+}
+
+fn time_put_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
+    time_samples(samples, |sample| {
+        db.insert(black_box(&sample.key), black_box(sample.value.as_slice()))
+            .expect("sled put");
+    })
+}
+
+fn time_mixed_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
+    time_samples_indexed(samples, |i, sample| {
+        if i & 1 == 0 {
+            black_box(db.get(black_box(&sample.key)).expect("sled get"));
+        } else {
+            db.insert(black_box(&sample.key), black_box(sample.value.as_slice()))
+                .expect("sled put");
         }
     })
 }
@@ -684,6 +764,42 @@ fn sqlite_list_dir(
     seen
 }
 
+fn sled_list_plain(db: &SledDb, prefix: &[u8], take: usize) -> usize {
+    let mut seen = 0usize;
+    for item in db.scan_prefix(prefix) {
+        let (_k, _v) = item.expect("sled list");
+        seen += 1;
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn sled_list_dir(db: &SledDb, prefix: &[u8], delim: u8, take: usize) -> usize {
+    let mut seen = 0usize;
+    let mut cursor = prefix.to_vec();
+    let upper = prefix_upper(prefix);
+    while cursor.as_slice() < upper.as_slice() {
+        let found = db.range(cursor.as_slice()..upper.as_slice()).next();
+        let Some(item) = found else {
+            break;
+        };
+        let (key, _value) = item.expect("sled list_dir");
+        let next_seek = delimiter_successor(&key, prefix.len(), delim);
+        seen += 1;
+        if seen >= take {
+            break;
+        }
+        if let Some(next) = next_seek {
+            cursor = next;
+        } else {
+            cursor = key_successor(&key);
+        }
+    }
+    seen
+}
+
 fn delimiter_successor(key: &[u8], prefix_len: usize, delim: u8) -> Option<Vec<u8>> {
     let rest = &key[prefix_len..];
     let idx = rest.iter().position(|b| *b == delim)?;
@@ -728,6 +844,16 @@ fn make_sqlite_persistent(dir: &TempDir) -> Connection {
     )
     .expect("sqlite pragmas + schema");
     conn
+}
+
+fn make_sled_persistent(dir: &TempDir) -> SledDb {
+    sled::Config::new()
+        .path(dir.path())
+        .mode(SledMode::HighThroughput)
+        .cache_capacity(256 * 1024 * 1024)
+        .flush_every_ms(None)
+        .open()
+        .expect("sled open")
 }
 
 fn print_holt_shape(label: &str, tree: &Tree) {
