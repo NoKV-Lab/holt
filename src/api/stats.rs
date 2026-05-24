@@ -99,6 +99,10 @@ pub struct TreeStats {
     /// Highest data-area occupancy among reachable blobs, in
     /// per-mille units (`1000` = full data area).
     pub max_blob_fill_per_mille: u32,
+    /// Non-root blobs below the shape-control fill band.
+    pub underfilled_child_blobs: u32,
+    /// Non-root blobs above the shape-control fill band.
+    pub overfull_child_blobs: u32,
     /// Per-blob breakdown in BFS order from the root.
     pub blobs: Vec<BlobStats>,
     /// Number of blobs currently dirty in the BufferManager —

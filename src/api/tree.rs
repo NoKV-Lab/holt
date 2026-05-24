@@ -38,6 +38,8 @@ use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
 const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
+const SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE: u32 = 350;
+const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 
@@ -53,6 +55,8 @@ struct BlobStatsAggregate {
     max_blob_depth: u32,
     total_blob_depth: u64,
     max_blob_fill_per_mille: u32,
+    underfilled_child_blobs: u32,
+    overfull_child_blobs: u32,
 }
 
 fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
@@ -1756,6 +1760,8 @@ impl Tree {
             max_blob_depth: aggregate.max_blob_depth,
             total_blob_depth: aggregate.total_blob_depth,
             max_blob_fill_per_mille: aggregate.max_blob_fill_per_mille,
+            underfilled_child_blobs: aggregate.underfilled_child_blobs,
+            overfull_child_blobs: aggregate.overfull_child_blobs,
             blobs: aggregate.blobs,
             bm_dirty_count,
             bm_pending_delete_count,
@@ -1800,6 +1806,8 @@ impl Tree {
             max_blob_depth: 0,
             total_blob_depth: 0,
             max_blob_fill_per_mille: 0,
+            underfilled_child_blobs: 0,
+            overfull_child_blobs: 0,
         };
 
         for entry in &topology {
@@ -1838,9 +1846,15 @@ impl Tree {
         }
         aggregate.max_blob_depth = aggregate.max_blob_depth.max(depth);
         aggregate.total_blob_depth += u64::from(depth);
-        aggregate.max_blob_fill_per_mille = aggregate
-            .max_blob_fill_per_mille
-            .max(blob_fill_per_mille(stats.space_used, blob_data_capacity));
+        let fill_per_mille = blob_fill_per_mille(stats.space_used, blob_data_capacity);
+        aggregate.max_blob_fill_per_mille = aggregate.max_blob_fill_per_mille.max(fill_per_mille);
+        if depth != 0 {
+            if fill_per_mille < SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE {
+                aggregate.underfilled_child_blobs += 1;
+            } else if fill_per_mille > SHAPE_OVERFULL_CHILD_FILL_PER_MILLE {
+                aggregate.overfull_child_blobs += 1;
+            }
+        }
         aggregate.blobs.push(stats);
     }
 

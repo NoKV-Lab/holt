@@ -43,6 +43,8 @@
 //! | `holt_blob_avg_depth`                   | gauge   | `TreeStats::avg_blob_depth()`          |
 //! | `holt_blob_avg_fill_ratio`              | gauge   | `TreeStats::avg_blob_fill_ratio()`     |
 //! | `holt_blob_max_fill_ratio`              | gauge   | `TreeStats::max_blob_fill_ratio()`     |
+//! | `holt_blob_underfilled_children`         | gauge   | `TreeStats::underfilled_child_blobs`    |
+//! | `holt_blob_overfull_children`            | gauge   | `TreeStats::overfull_child_blobs`       |
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
@@ -188,6 +190,20 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Maximum data-area occupancy among reachable blobs.",
         "gauge",
         stats.max_blob_fill_ratio(),
+    );
+    metric(
+        &mut out,
+        "holt_blob_underfilled_children",
+        "Non-root blobs below the shape-control fill band.",
+        "gauge",
+        u64::from(stats.underfilled_child_blobs),
+    );
+    metric(
+        &mut out,
+        "holt_blob_overfull_children",
+        "Non-root blobs above the shape-control fill band.",
+        "gauge",
+        u64::from(stats.overfull_child_blobs),
     );
     metric(
         &mut out,
@@ -441,6 +457,8 @@ mod tests {
             max_blob_depth: 2,
             total_blob_depth: 3,
             max_blob_fill_per_mille: 750,
+            underfilled_child_blobs: 1,
+            overfull_child_blobs: 2,
             blobs: Vec::new(),
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
@@ -512,6 +530,8 @@ mod tests {
         assert!(out.contains("holt_blob_max_depth 2\n"));
         assert!(out.contains("holt_blob_avg_depth 1.000000\n"));
         assert!(out.contains("holt_blob_max_fill_ratio 0.750000\n"));
+        assert!(out.contains("holt_blob_underfilled_children 1\n"));
+        assert!(out.contains("holt_blob_overfull_children 2\n"));
         // None of the gauges leak `_total`.
         assert!(!out.contains("holt_slots_total"));
         assert!(!out.contains("holt_compactions_total"));
