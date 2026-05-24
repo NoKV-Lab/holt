@@ -38,11 +38,11 @@ pub struct BlobTopologyEntry {
 /// blob bytes are copied. The returned vector's first element is
 /// always `root_guid`.
 ///
-/// Uses `BufferManager::pin`, which bumps cache hit/miss
-/// counters and refreshes `last_touched`. Callers on the
-/// observability path (`Tree::stats`, metrics scrapes) should
-/// use [`collect_blob_topology_silent`] instead to avoid the
-/// scrape polluting the counters it's about to report.
+/// Uses `BufferManager::pin_scan`, which bumps cache hit/miss
+/// counters without promoting blobs in the eviction policy. Callers
+/// on the observability path (`Tree::stats`, metrics scrapes)
+/// should use [`collect_blob_topology_silent`] instead to avoid
+/// polluting the counters they're about to report.
 pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec<BlobGuid>> {
     collect_blob_topology(bm, root_guid)
         .map(|entries| entries.into_iter().map(|entry| entry.guid).collect())
@@ -142,7 +142,7 @@ fn collect_blob_topology_inner(
         let pin = if silent {
             bm.pin_silent(entry.guid)?
         } else {
-            bm.pin(entry.guid)?
+            bm.pin_scan(entry.guid)?
         };
         let mut found = Vec::new();
         {

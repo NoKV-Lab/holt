@@ -140,6 +140,7 @@ struct StressConfig {
     dir_take: usize,
     buffer_pool_size: usize,
     wal_sync: bool,
+    reopen_after_preload: bool,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -177,6 +178,10 @@ impl StressConfig {
             wal_sync: env::var("HOLT_STRESS_WAL_SYNC")
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_WAL_SYNC", s))
+                .unwrap_or(false),
+            reopen_after_preload: env::var("HOLT_STRESS_REOPEN_AFTER_PRELOAD")
+                .as_deref()
+                .map(|s| parse_bool_env("HOLT_STRESS_REOPEN_AFTER_PRELOAD", s))
                 .unwrap_or(false),
             engines,
             ops,
@@ -217,8 +222,8 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled",
-        cfg.wal_sync
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={}",
+        cfg.wal_sync, cfg.reopen_after_preload
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -241,11 +246,16 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     let mut tree_cfg = TreeConfig::new(dir.path());
     tree_cfg.wal_sync = cfg.wal_sync;
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
-    let tree = Tree::open(tree_cfg).expect("holt open");
+    let mut tree = Tree::open(tree_cfg.clone()).expect("holt open");
     preload_holt(&tree, cfg.workload, cfg.n_keys);
     print_holt_shape("preload", &tree);
     tree.checkpoint().expect("holt preload checkpoint");
     print_holt_shape("ready", &tree);
+    if cfg.reopen_after_preload {
+        drop(tree);
+        tree = Tree::open(tree_cfg).expect("holt reopen");
+        print_holt_shape("reopened", &tree);
+    }
 
     if cfg.selected_op("get") {
         report("holt", "get", samples.len(), time_get_holt(&tree, samples));
@@ -309,8 +319,13 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
 
 fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     let rocksdb_dir = TempDir::new().expect("rocksdb tempdir");
-    let db = make_rocksdb(&rocksdb_dir);
+    let mut db = make_rocksdb(&rocksdb_dir);
     preload_rocksdb(&db, cfg.workload, cfg.n_keys);
+    if cfg.reopen_after_preload {
+        db.flush().expect("rocksdb preload flush before reopen");
+        drop(db);
+        db = make_rocksdb(&rocksdb_dir);
+    }
     let wo = rocksdb_write_opts();
 
     if cfg.selected_op("get") {
@@ -370,8 +385,14 @@ fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
 
 fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     let sqlite_dir = TempDir::new().expect("sqlite tempdir");
-    let conn = make_sqlite_persistent(&sqlite_dir);
+    let mut conn = make_sqlite_persistent(&sqlite_dir);
     preload_sqlite(&conn, cfg.workload, cfg.n_keys);
+    if cfg.reopen_after_preload {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("sqlite preload checkpoint before reopen");
+        drop(conn);
+        conn = make_sqlite_persistent(&sqlite_dir);
+    }
 
     if cfg.selected_op("get") {
         report(
@@ -432,8 +453,13 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
 
 fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
     let sled_dir = TempDir::new().expect("sled tempdir");
-    let db = make_sled_persistent(&sled_dir);
+    let mut db = make_sled_persistent(&sled_dir);
     preload_sled(&db, cfg.workload, cfg.n_keys);
+    if cfg.reopen_after_preload {
+        db.flush().expect("sled preload flush before reopen");
+        drop(db);
+        db = make_sled_persistent(&sled_dir);
+    }
 
     if cfg.selected_op("get") {
         report("sled", "get", samples.len(), time_get_sled(&db, samples));
@@ -937,7 +963,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -947,6 +973,8 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.max_blob_fill_ratio(),
         s.underfilled_child_blobs,
         s.overfull_child_blobs,
+        s.bm_cache_hits,
+        s.bm_cache_misses,
         s.bm_avg_blob_hops(),
         s.bm_max_blob_hops,
         s.bm_spillovers,

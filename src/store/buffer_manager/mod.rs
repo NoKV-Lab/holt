@@ -162,6 +162,13 @@ pub(crate) struct WriteThroughEntry {
     pub(crate) expected_seq: u64,
 }
 
+#[derive(Clone, Copy)]
+enum PinAccess {
+    Point,
+    Scan,
+    Silent,
+}
+
 /// LRU-bounded blob cache; see the module docs.
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
@@ -503,37 +510,34 @@ impl BufferManager {
         }
     }
 
-    /// Internal: look up `guid` in the cache. On a hit, stamps
-    /// the entry's `last_touched` with the current clock tick so
-    /// the eviction thread treats this hit as fresh. Bumps the
-    /// `cache_hits` / `cache_misses` telemetry counter accordingly.
-    fn get_cached(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
+    /// Internal: look up `guid` in the cache under a declared
+    /// access pattern.
+    ///
+    /// `Point` is the hot get/put path and refreshes LRU recency.
+    /// `Scan` counts cache telemetry but deliberately does not
+    /// promote the entry, so a large range/list walk cannot rescue
+    /// blobs that point lookups would otherwise evict. `Silent` is
+    /// for observability and does not count or promote.
+    fn get_cached_with_access(&self, guid: BlobGuid, access: PinAccess) -> Option<Arc<CachedBlob>> {
         let Some(entry) = self.cache.get(&guid) else {
-            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            if !matches!(access, PinAccess::Silent) {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         };
         let arc = Arc::clone(entry.value());
-        // Drop the shard read guard before touching the atomic —
-        // not strictly required (the atomic is independent) but
-        // keeps shard occupancy short.
         drop(entry);
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        arc.last_touched.store(tick, Ordering::Relaxed);
-        self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        Some(arc)
-    }
-
-    /// Internal: same as [`Self::get_cached`] but **does not** bump
-    /// `cache_hits` / `cache_misses` and **does not** refresh the
-    /// entry's `last_touched` tick. Used by introspection paths
-    /// (`Tree::stats`, metrics scrapes) that need to read blob
-    /// state without polluting the very counters they're about
-    /// to report or skewing the LRU sweep's view of which entries
-    /// are cold.
-    fn get_cached_silent(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
-        let entry = self.cache.get(&guid)?;
-        let arc = Arc::clone(entry.value());
-        drop(entry);
+        match access {
+            PinAccess::Point => {
+                let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+                arc.last_touched.store(tick, Ordering::Relaxed);
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            PinAccess::Scan => {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            PinAccess::Silent => {}
+        }
         Some(arc)
     }
 
@@ -564,24 +568,35 @@ impl BufferManager {
     /// `last_touched` so it doesn't look cold to the eviction
     /// thread on its very next sweep.
     fn insert_into_cache(&self, guid: BlobGuid, contents: &AlignedBlobBuf) {
-        self.insert_owned_into_cache(guid, contents.clone());
+        self.insert_owned_into_cache(guid, contents.clone(), PinAccess::Point);
     }
 
     /// Internal: insert a freshly-loaded owned blob into the cache
     /// without cloning its 512 KB payload. Used on store read
     /// misses so an allocator-provided registered buffer can become
     /// the cached image directly.
-    fn insert_owned_into_cache(&self, guid: BlobGuid, contents: AlignedBlobBuf) {
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+    fn insert_owned_into_cache(
+        &self,
+        guid: BlobGuid,
+        contents: AlignedBlobBuf,
+        access: PinAccess,
+    ) -> Arc<CachedBlob> {
+        let hot_tick =
+            matches!(access, PinAccess::Point).then(|| self.clock.fetch_add(1, Ordering::Relaxed));
         let inserted = self.cache.entry(guid).or_insert_with(|| {
             let entry = Arc::new(CachedBlob::new(contents));
-            entry.last_touched.store(tick, Ordering::Relaxed);
+            entry
+                .last_touched
+                .store(hot_tick.unwrap_or(0), Ordering::Relaxed);
             entry
         });
-        // Re-stamp even on existing entries — a concurrent thread
-        // may have populated the slot while we read from store;
-        // either way "just observed" is "freshly touched".
-        inserted.value().last_touched.store(tick, Ordering::Relaxed);
+        let entry = Arc::clone(inserted.value());
+        if let Some(tick) = hot_tick {
+            // Re-stamp only hot point inserts. A scan miss racing
+            // with an already-cached entry must not demote or
+            // promote that entry; it should behave like a scan hit.
+            entry.last_touched.store(tick, Ordering::Relaxed);
+        }
         drop(inserted);
 
         // Inline overflow eviction. With the background eviction
@@ -603,7 +618,11 @@ impl BufferManager {
         let mut retries_left = RETRY_BUDGET;
         let mut entry_spins = self.cache.len();
         while self.cache.len() > self.capacity {
-            if self.try_evict_lru() {
+            let evicted = match access {
+                PinAccess::Point => self.try_evict_lru(),
+                PinAccess::Scan | PinAccess::Silent => self.try_evict_scan_cold(),
+            };
+            if evicted {
                 // Made progress — refresh the per-entry budget
                 // (we only want to bound the total work, not
                 // give up after one stuck victim).
@@ -617,6 +636,7 @@ impl BufferManager {
             retries_left -= 1;
             entry_spins = entry_spins.saturating_sub(1);
         }
+        entry
     }
 
     /// Internal: walk the cache for the entry with the oldest
@@ -640,6 +660,14 @@ impl BufferManager {
     /// in persistent mode the WAL truncate gate stuck closed
     /// forever. Matches `try_evict_cold`'s guard for the bg sweep.
     fn try_evict_lru(&self) -> bool {
+        self.try_evict_lru_until(u64::MAX)
+    }
+
+    fn try_evict_scan_cold(&self) -> bool {
+        self.try_evict_lru_until(0)
+    }
+
+    fn try_evict_lru_until(&self, max_last_touched: u64) -> bool {
         // Snapshot the dirty + pending-delete key sets under one
         // lock acquisition each, then scan the cache against the
         // snapshots. Holding the locks across the whole cache walk
@@ -667,6 +695,9 @@ impl BufferManager {
                 continue;
             }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
+            if tick > max_last_touched {
+                continue;
+            }
             match victim {
                 None => victim = Some((guid, tick)),
                 Some((_, vmin)) if tick < vmin => {
@@ -725,35 +756,15 @@ impl BufferManager {
     /// - [`CachedBlob::read`] for blocking shared access.
     /// - [`CachedBlob::write`] for exclusive write access.
     pub fn pin(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        if let Some(entry) = self.get_cached(guid) {
-            return Ok(entry);
-        }
-        // Cache miss — load from inner store, then take a second
-        // lookup so the cache, not our scratch buffer, owns the
-        // canonical entry.
-        let mut scratch = self.store.alloc_blob_buf_uninit();
-        self.store.read_blob(guid, &mut scratch)?;
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        self.insert_owned_into_cache(guid, scratch);
-        // Almost always cached now; if another thread evicted it
-        // in the gap, fall back to a fresh insert with our scratch.
-        if let Some(entry) = self.get_cached(guid) {
-            return Ok(entry);
-        }
-        // Pathological: insert raced with eviction. Build an
-        // entry directly from scratch and force-insert it.
-        let mut scratch = self.store.alloc_blob_buf_uninit();
-        self.store.read_blob(guid, &mut scratch)?;
-        let entry = Arc::new(CachedBlob::new(scratch));
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        entry.last_touched.store(tick, Ordering::Relaxed);
-        self.cache.insert(guid, Arc::clone(&entry));
-        Ok(entry)
+        self.pin_with_access(guid, PinAccess::Point)
+    }
+
+    /// Pin for range/list scans. Hits and misses remain visible in
+    /// cache telemetry, but scan access does not refresh LRU
+    /// recency. This keeps large directory/object-list walks from
+    /// evicting hot point-read blobs.
+    pub(crate) fn pin_scan(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        self.pin_with_access(guid, PinAccess::Scan)
     }
 
     /// Like [`Self::pin`] but does not bump `cache_hits` /
@@ -764,19 +775,19 @@ impl BufferManager {
     /// report or rescue cold entries from the eviction sweep
     /// just by looking at them.
     ///
-    /// **Miss-path behaviour**: a `pin_silent` miss still loads
-    /// the blob from the inner store and inserts it into the
-    /// cache (via `insert_into_cache`, which stamps
-    /// `last_touched` like any other insert) — the alternative
-    /// (return `Err`) would surprise callers and the load is
-    /// the only sane way to fulfil the pin contract. The miss
-    /// itself is just not reflected in `cache_misses`. Hot
-    /// scrape paths should expect most calls to be hits.
+    /// A miss still loads the blob because the pin contract must
+    /// return a usable cache entry. The inserted entry is cold, so
+    /// stats/maintenance walks do not promote blobs just by
+    /// inspecting them.
     pub fn pin_silent(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        self.pin_with_access(guid, PinAccess::Silent)
+    }
+
+    fn pin_with_access(&self, guid: BlobGuid, access: PinAccess) -> Result<Arc<CachedBlob>> {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        if let Some(entry) = self.get_cached_silent(guid) {
+        if let Some(entry) = self.get_cached_with_access(guid, access) {
             return Ok(entry);
         }
         let mut scratch = self.store.alloc_blob_buf_uninit();
@@ -784,21 +795,7 @@ impl BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.insert_owned_into_cache(guid, scratch);
-        if let Some(entry) = self.get_cached_silent(guid) {
-            return Ok(entry);
-        }
-        let mut scratch = self.store.alloc_blob_buf_uninit();
-        self.store.read_blob(guid, &mut scratch)?;
-        let entry = Arc::new(CachedBlob::new(scratch));
-        // We still stamp last_touched on the truly-pathological
-        // race-with-eviction fallback path — the entry is being
-        // freshly inserted, the tick reflects that creation, not
-        // a "touch" by the scrape.
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        entry.last_touched.store(tick, Ordering::Relaxed);
-        self.cache.insert(guid, Arc::clone(&entry));
-        Ok(entry)
+        Ok(self.insert_owned_into_cache(guid, scratch, access))
     }
 
     // ---------- dirty tracking ----------
@@ -819,7 +816,7 @@ impl BufferManager {
     /// checkpointer-side drains the map via
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, seq: u64) {
-        let cached = self.get_cached_silent(guid);
+        let cached = self.get_cached_with_access(guid, PinAccess::Silent);
         self.mark_dirty_with_hint(guid, seq, cached.as_deref());
     }
 
@@ -875,7 +872,7 @@ impl BufferManager {
             let mut state = shard.lock().unwrap();
             for (guid, seq) in &mut state.dirty {
                 if let Some(hinted_seq) = self
-                    .get_cached_silent(*guid)
+                    .get_cached_with_access(*guid, PinAccess::Silent)
                     .and_then(|entry| entry.take_dirty_hint())
                 {
                     *seq = (*seq).min(hinted_seq);
@@ -884,7 +881,7 @@ impl BufferManager {
             let snap = std::mem::take(&mut state.dirty);
             for (guid, seq) in snap {
                 if state.pending_deletes.contains_key(&guid) {
-                    if let Some(entry) = self.get_cached_silent(guid) {
+                    if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
                         entry.clear_dirty_hint();
                     }
                     continue;
@@ -913,7 +910,7 @@ impl BufferManager {
             return;
         }
         for (guid, t) in entries {
-            let cached = self.get_cached_silent(guid);
+            let cached = self.get_cached_with_access(guid, PinAccess::Silent);
             if let Some(entry) = &cached {
                 let _ = entry.dirty_hint_needs_map_publish(t);
             }
@@ -1120,7 +1117,7 @@ impl BufferManager {
     /// writers don't block on long-running (especially io_uring)
     /// I/O.
     pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
-        let entry = self.get_cached(guid)?;
+        let entry = self.get_cached_with_access(guid, PinAccess::Silent)?;
         let buf = entry.read();
         let mut out = self.store.alloc_blob_buf_uninit();
         out.as_mut_slice().copy_from_slice(buf.as_slice());
@@ -1135,7 +1132,7 @@ impl BufferManager {
     /// blob is known to be clean from the buffer manager's point of
     /// view and can be copied directly from the store.
     pub(crate) fn snapshot_blob_image(&self, guid: BlobGuid) -> Result<AlignedBlobBuf> {
-        if let Some(entry) = self.get_cached_silent(guid) {
+        if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
             let buf = entry.read();
             let mut out = self.store.alloc_blob_buf_uninit();
             out.as_mut_slice().copy_from_slice(buf.as_slice());
@@ -1192,7 +1189,7 @@ impl BufferManager {
         let still_dirty = state.dirty.contains_key(&guid) || state.flushing.contains_key(&guid);
         drop(state);
         if !still_dirty {
-            if let Some(entry) = self.get_cached_silent(guid) {
+            if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
                 entry.clear_dirty_hint();
             }
         }
@@ -1254,7 +1251,7 @@ impl BufferManager {
 impl BlobStore for BufferManager {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         // Cache hit?
-        if let Some(entry) = self.get_cached(guid) {
+        if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Point) {
             let buf = entry.read();
             dst.as_mut_slice().copy_from_slice(buf.as_slice());
             return Ok(());
@@ -1269,7 +1266,7 @@ impl BlobStore for BufferManager {
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
         // store in the same call so durability is unchanged.
-        if let Some(entry) = self.get_cached(guid) {
+        if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
             let mut buf = entry.write();
             buf.as_mut_slice().copy_from_slice(src.as_slice());
             entry.clear_dirty_hint();
@@ -1288,7 +1285,7 @@ impl BlobStore for BufferManager {
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
         for (guid, src) in writes {
-            if let Some(entry) = self.get_cached(*guid) {
+            if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
                 let mut buf = entry.write();
                 buf.as_mut_slice().copy_from_slice(src.as_slice());
                 entry.clear_dirty_hint();
@@ -1364,6 +1361,108 @@ mod tests {
         // Second read: hit, no growth in cache size.
         bm.read_blob([0xAB; 16], &mut dst).unwrap();
         assert_eq!(bm.cached_count(), 1);
+    }
+
+    #[test]
+    fn pin_miss_is_not_counted_as_a_hit() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0xCD; 16];
+        inner.write_blob(guid, &make_buf(9)).unwrap();
+
+        let bm = BufferManager::new(inner, 4);
+        let first = bm.pin(guid).unwrap();
+        assert_eq!(first.read().as_slice()[100], 9);
+        drop(first);
+        assert_eq!(bm.cache_misses(), 1);
+        assert_eq!(bm.cache_hits(), 0);
+
+        let second = bm.pin(guid).unwrap();
+        assert_eq!(second.read().as_slice()[100], 9);
+        assert_eq!(bm.cache_misses(), 1);
+        assert_eq!(bm.cache_hits(), 1);
+    }
+
+    #[test]
+    fn scan_misses_do_not_evict_hot_point_blob() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..5u8 {
+            let mut guid = [0u8; 16];
+            guid[0] = i;
+            inner.write_blob(guid, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 2);
+        let hot = [0u8; 16];
+        drop(bm.pin(hot).unwrap());
+
+        for i in 1..5u8 {
+            let mut guid = [0u8; 16];
+            guid[0] = i;
+            drop(bm.pin_scan(guid).unwrap());
+        }
+
+        assert_eq!(bm.cached_count(), 2);
+        assert!(
+            bm.cache.contains_key(&hot),
+            "scan-loaded blobs must stay colder than point-read blobs",
+        );
+    }
+
+    #[test]
+    fn scan_miss_may_overshoot_instead_of_evicting_only_hot_blob() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..2u8 {
+            let mut guid = [0u8; 16];
+            guid[0] = i;
+            inner.write_blob(guid, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 1);
+        let hot = [0u8; 16];
+        let mut scan = [0u8; 16];
+        scan[0] = 1;
+
+        drop(bm.pin(hot).unwrap());
+        drop(bm.pin_scan(scan).unwrap());
+
+        assert!(
+            bm.cache.contains_key(&hot),
+            "scan miss must not evict the only point-hot blob",
+        );
+        assert_eq!(
+            bm.cached_count(),
+            2,
+            "scan access may briefly exceed capacity to avoid hot-cache pollution",
+        );
+    }
+
+    #[test]
+    fn scan_hits_do_not_refresh_lru_recency() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..3u8 {
+            let mut guid = [0u8; 16];
+            guid[0] = i;
+            inner.write_blob(guid, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 2);
+        let first = [0u8; 16];
+        let mut second = [0u8; 16];
+        second[0] = 1;
+        let mut third = [0u8; 16];
+        third[0] = 2;
+
+        drop(bm.pin(first).unwrap());
+        drop(bm.pin(second).unwrap());
+        drop(bm.pin_scan(first).unwrap());
+        drop(bm.pin(third).unwrap());
+
+        assert!(
+            !bm.cache.contains_key(&first),
+            "a scan hit must not make the oldest point blob look hot",
+        );
+        assert!(bm.cache.contains_key(&second));
+        assert!(bm.cache.contains_key(&third));
     }
 
     #[test]

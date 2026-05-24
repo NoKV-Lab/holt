@@ -44,6 +44,7 @@ mod merge;
 mod migrate;
 mod range;
 mod readers;
+mod route;
 mod scan;
 mod spillover;
 #[cfg(test)]

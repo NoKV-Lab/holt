@@ -9,6 +9,7 @@ use super::cast;
 use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
 use super::readers::{ntype_of, read_leaf_key_ref, read_prefix};
+use super::route::{pin_route_parent, route_pin_not_found, validate_route_edge};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
@@ -133,15 +134,23 @@ pub fn insert_multi_conditional(
         let root_version = root_pin.content_version();
         let root_crossing = {
             let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_guid = frame.header().blob_guid;
             let root_slot = frame.header().root_slot;
             match lookup_at(frame, root_slot, key, 0)? {
-                LookupResult::Crossing(crossing) => Some(crossing),
+                LookupResult::Crossing(crossing) => Some((root_guid, crossing)),
                 LookupResult::Found(_) | LookupResult::NotFound => None,
             }
         };
-        if let Some(crossing) = root_crossing {
+        if let Some((root_guid, crossing)) = root_crossing {
             if let Some(cache) = route_cache {
-                cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                cache.learn(
+                    key,
+                    root_guid,
+                    0,
+                    root_version,
+                    crossing.child_guid,
+                    crossing.child_depth,
+                );
                 bm.mark_route_resident(crossing.child_guid);
             }
             let child_pin = bm.pin(crossing.child_guid)?;
@@ -199,10 +208,10 @@ pub fn insert_multi_conditional(
     outcome
 }
 
-/// Try the large-tree steady-state route-cache path without taking
-/// the root shared latch. The child is pinned + exclusively latched
-/// before root-version validation; a successful validation means no
-/// root writer raced with the parent-edge observation.
+/// Try the large-tree steady-state route-cache path without a full
+/// root descent. The cached parent edge is validated under the
+/// parent's shared latch before the child is pinned + exclusively
+/// latched.
 #[allow(clippy::too_many_arguments)]
 fn try_insert_from_optimistic_route(
     bm: &BufferManager,
@@ -218,19 +227,41 @@ fn try_insert_from_optimistic_route(
     let Some(cache) = route_cache else {
         return Ok(None);
     };
-    let root_version = root_pin.content_version();
-    let Some(route) = cache.lookup(key, root_version) else {
+    let Some(route) = cache.lookup(key) else {
         return Ok(None);
     };
 
-    let child_pin = bm.pin(route.child_guid)?;
+    let parent_pin = match pin_route_parent(bm, root_pin, route) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let parent_guard = parent_pin.read();
+    let parent_version = parent_pin.content_version();
+    if parent_version != route.parent_version {
+        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+        if !validate_route_edge(frame, key, route)? {
+            drop(parent_guard);
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        cache.refresh_parent_version(key, route, parent_version);
+    }
+    let child_pin = match bm.pin(route.child_guid) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            drop(parent_guard);
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
     child_pin.prefetch_header();
     let child_guard = child_pin.write();
-    if !root_pin.validate_content_version(root_version) {
-        drop(child_guard);
-        drop(child_pin);
-        return Ok(None);
-    }
+    drop(parent_guard);
 
     *blob_hops = 1;
     let outcome = lock_coupled_insert_in_blob(
@@ -348,28 +379,8 @@ fn try_insert_batch_from_first_blob(
     let first_key = items[0].key;
 
     if let Some(cache) = route_cache {
-        let root_version = root_pin.content_version();
-        if let Some(route) = cache.lookup(first_key, root_version) {
-            let run_len = same_child_prefix_run_len(items, route.child_depth);
-            let child_pin = bm.pin(route.child_guid)?;
-            child_pin.prefetch_header();
-            let child_guard = child_pin.write();
-            if root_pin.validate_content_version(root_version) {
-                let outcome = insert_batch_in_pinned_blob(
-                    bm,
-                    child_guard,
-                    child_pin.as_ref(),
-                    route.child_guid,
-                    false,
-                    &items[..run_len],
-                    route.child_depth,
-                    2,
-                );
-                drop(child_pin);
-                return outcome;
-            }
-            drop(child_guard);
-            drop(child_pin);
+        if let Some(outcome) = try_insert_batch_from_route(bm, root_pin, cache, first_key, items)? {
+            return Ok(outcome);
         }
     }
 
@@ -378,16 +389,19 @@ fn try_insert_batch_from_first_blob(
         let root_version = root_pin.content_version();
         let root_crossing = {
             let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_guid = frame.header().blob_guid;
             let root_slot = frame.header().root_slot;
             match lookup_at(frame, root_slot, first_key, 0)? {
-                LookupResult::Crossing(crossing) => Some(crossing),
+                LookupResult::Crossing(crossing) => Some((root_guid, crossing)),
                 LookupResult::Found(_) | LookupResult::NotFound => None,
             }
         };
-        if let Some(crossing) = root_crossing {
+        if let Some((root_guid, crossing)) = root_crossing {
             if let Some(cache) = route_cache {
                 cache.learn(
                     first_key,
+                    root_guid,
+                    0,
                     root_version,
                     crossing.child_guid,
                     crossing.child_depth,
@@ -422,6 +436,62 @@ fn try_insert_batch_from_first_blob(
         frame.header().blob_guid
     };
     insert_batch_in_pinned_blob(bm, guard, root_pin.as_ref(), root_guid, true, items, 0, 1)
+}
+
+fn try_insert_batch_from_route(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    cache: &RouteCache,
+    first_key: SearchKey<'_>,
+    items: &[InsertBatchItem<'_>],
+) -> Result<Option<InsertBatchOutcome>> {
+    let Some(route) = cache.lookup(first_key) else {
+        return Ok(None);
+    };
+    let run_len = same_child_prefix_run_len(items, route.child_depth);
+    let parent_pin = match pin_route_parent(bm, root_pin, route) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            cache.invalidate(first_key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let parent_guard = parent_pin.read();
+    let parent_version = parent_pin.content_version();
+    if parent_version != route.parent_version {
+        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+        if !validate_route_edge(frame, first_key, route)? {
+            drop(parent_guard);
+            cache.invalidate(first_key, route);
+            return Ok(None);
+        }
+        cache.refresh_parent_version(first_key, route, parent_version);
+    }
+    let child_pin = match bm.pin(route.child_guid) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            drop(parent_guard);
+            cache.invalidate(first_key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    child_pin.prefetch_header();
+    let child_guard = child_pin.write();
+    drop(parent_guard);
+    let outcome = insert_batch_in_pinned_blob(
+        bm,
+        child_guard,
+        child_pin.as_ref(),
+        route.child_guid,
+        false,
+        &items[..run_len],
+        route.child_depth,
+        2,
+    );
+    drop(child_pin);
+    outcome.map(Some)
 }
 
 fn same_child_prefix_run_len(items: &[InsertBatchItem<'_>], child_depth: usize) -> usize {

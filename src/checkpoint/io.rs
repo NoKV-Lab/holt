@@ -267,6 +267,7 @@ mod tests {
     use crossbeam_channel::bounded;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct CountingBatchStore {
         inner: MemoryBlobStore,

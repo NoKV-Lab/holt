@@ -28,6 +28,9 @@ const _: () = assert!(DATA_AREA_START == 0xB000);
 /// 128-bit blob identifier (stored as 16 bytes).
 pub type BlobGuid = [u8; 16];
 
+/// Fixed GUID of the root blob in single-tree mode.
+pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
+
 /// On-disk header for a 512 KB blob frame.
 ///
 /// 4096 bytes fixed. Field positions are chosen for natural

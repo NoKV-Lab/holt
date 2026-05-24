@@ -1,12 +1,10 @@
-//! Small root-to-child route cache for path-shaped metadata keys.
+//! Small parent-validated route cache for path-shaped metadata keys.
 //!
-//! This cache only remembers the first `BlobNode` crossing found
-//! from the root blob. A hit is usable only while the root blob's
-//! content version still equals the cached version; callers either
-//! hold the root shared latch while acquiring the child or revalidate
-//! the observed root version after acquiring the child. That keeps
-//! the parent edge stable without re-running the root ART descent on
-//! every large-tree metadata update.
+//! A hit is only a candidate. Callers must pin the cached parent,
+//! hold its shared latch, verify the parent content version, and
+//! then pin the child before using the shortcut. That keeps the
+//! cached parent->child edge stable while still allowing deeper
+//! prefix anchors than the root-only path.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -31,13 +29,18 @@ pub(crate) struct RouteCacheSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouteHit {
+    pub(crate) parent_guid: BlobGuid,
+    pub(crate) parent_depth: usize,
+    pub(crate) parent_version: u64,
     pub(crate) child_guid: BlobGuid,
     pub(crate) child_depth: usize,
 }
 
 #[derive(Debug, Clone)]
 struct RouteEntry {
-    root_version: u64,
+    parent_guid: BlobGuid,
+    parent_depth: usize,
+    parent_version: u64,
     child_guid: BlobGuid,
     child_depth: usize,
 }
@@ -49,7 +52,7 @@ struct RouteEntries {
     lengths: Vec<usize>,
 }
 
-/// A tiny associative cache for top-level path routes.
+/// A tiny associative cache for path-prefix routes.
 #[derive(Debug)]
 pub(crate) struct RouteCache {
     entries: RwLock<RouteEntries>,
@@ -97,12 +100,13 @@ impl RouteCache {
         }
     }
 
-    /// Return a cached first-blob crossing for `key` if the key is
-    /// under a cached prefix and the entry was learned from the same
-    /// root blob version the caller is currently holding stable.
+    /// Return the longest cached crossing candidate for `key`.
+    ///
+    /// The caller validates the parent token before trusting the
+    /// child edge. Lookup deliberately does not remove stale entries:
+    /// invalidation is detected under the parent's shared latch.
     #[must_use]
-    pub(crate) fn lookup(&self, key: SearchKey<'_>, root_version: u64) -> Option<RouteHit> {
-        let mut stale = false;
+    pub(crate) fn lookup(&self, key: SearchKey<'_>) -> Option<RouteHit> {
         {
             let entries = self.entries.read().unwrap();
 
@@ -114,33 +118,80 @@ impl RouteCache {
             for &len in &entries.lengths {
                 if let Some(prefix) = key.user_prefix(len) {
                     if let Some(entry) = entries.map.get(prefix) {
-                        if entry.root_version == root_version {
-                            self.hits.fetch_add(1, Ordering::Relaxed);
-                            return Some(RouteHit {
-                                child_guid: entry.child_guid,
-                                child_depth: entry.child_depth,
-                            });
-                        }
-                        stale = true;
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(RouteHit {
+                            parent_guid: entry.parent_guid,
+                            parent_depth: entry.parent_depth,
+                            parent_version: entry.parent_version,
+                            child_guid: entry.child_guid,
+                            child_depth: entry.child_depth,
+                        });
                     }
                 }
             }
-        }
-        if stale {
-            self.invalidations.fetch_add(1, Ordering::Relaxed);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
-    /// Learn a root crossing just observed under a stable root read
+    /// Drop a caller-detected stale route candidate.
+    pub(crate) fn invalidate(&self, key: SearchKey<'_>, route: RouteHit) {
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
+        let Some(prefix) = key.user_prefix(route.child_depth) else {
+            return;
+        };
+        let mut entries = self.entries.write().unwrap();
+        let Some(entry) = entries.map.get(prefix) else {
+            return;
+        };
+        if entry.parent_guid != route.parent_guid
+            || entry.parent_depth != route.parent_depth
+            || entry.parent_version != route.parent_version
+            || entry.child_guid != route.child_guid
+            || entry.child_depth != route.child_depth
+        {
+            return;
+        }
+        entries.map.remove(prefix);
+        entries.order.retain(|known| known.as_slice() != prefix);
+        rebuild_prefix_lengths(&mut entries);
+    }
+
+    /// Refresh the parent version after the caller revalidated that
+    /// the cached parent edge still points at the same child.
+    pub(crate) fn refresh_parent_version(
+        &self,
+        key: SearchKey<'_>,
+        route: RouteHit,
+        parent_version: u64,
+    ) {
+        let Some(prefix) = key.user_prefix(route.child_depth) else {
+            return;
+        };
+        let mut entries = self.entries.write().unwrap();
+        let Some(entry) = entries.map.get_mut(prefix) else {
+            return;
+        };
+        if entry.parent_guid == route.parent_guid
+            && entry.parent_depth == route.parent_depth
+            && entry.parent_version == route.parent_version
+            && entry.child_guid == route.child_guid
+            && entry.child_depth == route.child_depth
+        {
+            entry.parent_version = parent_version;
+        }
+    }
+
+    /// Learn a crossing just observed under a stable parent read
     /// latch. Entries whose prefix would include the virtual
     /// terminator or exceed the inline budget are deliberately not
     /// cached; those shapes do not have useful route locality.
     pub(crate) fn learn(
         &self,
         key: SearchKey<'_>,
-        root_version: u64,
+        parent_guid: BlobGuid,
+        parent_depth: usize,
+        parent_version: u64,
         child_guid: BlobGuid,
         child_depth: usize,
     ) {
@@ -153,23 +204,27 @@ impl RouteCache {
 
         let mut entries = self.entries.write().unwrap();
         if let Some(entry) = entries.map.get_mut(prefix) {
-            entry.root_version = root_version;
+            entry.parent_guid = parent_guid;
+            entry.parent_depth = parent_depth;
+            entry.parent_version = parent_version;
             entry.child_guid = child_guid;
             entry.child_depth = child_depth;
             self.learns.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if has_dominating_prefix(&entries, prefix, root_version, child_guid) {
+        if has_dominating_prefix(&entries, prefix, parent_guid, parent_depth, child_guid) {
             self.learns.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
         let entry = RouteEntry {
-            root_version,
+            parent_guid,
+            parent_depth,
+            parent_version,
             child_guid,
             child_depth,
         };
-        prune_dominated_prefixes(&mut entries, prefix, root_version, child_guid);
+        prune_dominated_prefixes(&mut entries, prefix, parent_guid, parent_depth, child_guid);
         remember_prefix_len(&mut entries.lengths, prefix.len());
         self.learns.fetch_add(1, Ordering::Relaxed);
         if entries.map.len() < ROUTE_CACHE_CAPACITY {
@@ -189,7 +244,8 @@ impl RouteCache {
 fn has_dominating_prefix(
     entries: &RouteEntries,
     prefix: &[u8],
-    root_version: u64,
+    parent_guid: BlobGuid,
+    parent_depth: usize,
     child_guid: BlobGuid,
 ) -> bool {
     for &len in &entries.lengths {
@@ -197,7 +253,10 @@ fn has_dominating_prefix(
             continue;
         }
         if let Some(entry) = entries.map.get(&prefix[..len]) {
-            if entry.root_version == root_version && entry.child_guid == child_guid {
+            if entry.parent_guid == parent_guid
+                && entry.parent_depth == parent_depth
+                && entry.child_guid == child_guid
+            {
                 return true;
             }
         }
@@ -208,7 +267,8 @@ fn has_dominating_prefix(
 fn prune_dominated_prefixes(
     entries: &mut RouteEntries,
     prefix: &[u8],
-    root_version: u64,
+    parent_guid: BlobGuid,
+    parent_depth: usize,
     child_guid: BlobGuid,
 ) {
     let mut removed = false;
@@ -216,7 +276,9 @@ fn prune_dominated_prefixes(
         let dominated = known.len() > prefix.len()
             && known.starts_with(prefix)
             && entries.map.get(known.as_slice()).is_some_and(|entry| {
-                entry.root_version == root_version && entry.child_guid == child_guid
+                entry.parent_guid == parent_guid
+                    && entry.parent_depth == parent_depth
+                    && entry.child_guid == child_guid
             });
         if dominated {
             entries.map.remove(known.as_slice());
@@ -250,67 +312,102 @@ fn remember_prefix_len(lengths: &mut Vec<usize>, len: usize) {
 mod tests {
     use super::*;
 
+    const PARENT: BlobGuid = [1; 16];
+    const OTHER_PARENT: BlobGuid = [2; 16];
     const CHILD: BlobGuid = [7; 16];
 
     #[test]
-    fn learns_and_matches_longest_prefix_for_same_root_version() {
+    fn learns_and_matches_longest_prefix() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-01/a"), 3, [1; 16], 10);
-        cache.learn(SearchKey::user(b"bucket-01/path/file"), 3, CHILD, 15);
+        cache.learn(SearchKey::user(b"bucket-01/a"), PARENT, 0, 3, [1; 16], 10);
+        cache.learn(
+            SearchKey::user(b"bucket-01/path/file"),
+            PARENT,
+            0,
+            3,
+            CHILD,
+            15,
+        );
 
         let hit = cache
-            .lookup(SearchKey::user(b"bucket-01/path/other"), 3)
+            .lookup(SearchKey::user(b"bucket-01/path/other"))
             .unwrap();
+        assert_eq!(hit.parent_guid, PARENT);
+        assert_eq!(hit.parent_depth, 0);
+        assert_eq!(hit.parent_version, 3);
         assert_eq!(hit.child_guid, CHILD);
         assert_eq!(hit.child_depth, 15);
     }
 
     #[test]
-    fn root_version_mismatch_misses() {
+    fn invalidate_removes_only_matching_stale_route() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-01/path/file"), 3, CHILD, 15);
+        cache.learn(
+            SearchKey::user(b"bucket-01/path/file"),
+            PARENT,
+            0,
+            3,
+            CHILD,
+            15,
+        );
+        cache.learn(
+            SearchKey::user(b"bucket-02/path/file"),
+            OTHER_PARENT,
+            0,
+            4,
+            [9; 16],
+            15,
+        );
+
+        let stale = cache
+            .lookup(SearchKey::user(b"bucket-01/path/other"))
+            .unwrap();
+        cache.invalidate(SearchKey::user(b"bucket-01/path/other"), stale);
 
         assert!(cache
-            .lookup(SearchKey::user(b"bucket-01/path/other"), 4)
-            .is_none());
-    }
-
-    #[test]
-    fn new_root_version_invalidates_only_stale_route() {
-        let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-01/path/file"), 3, CHILD, 15);
-        cache.learn(SearchKey::user(b"bucket-02/path/file"), 4, [9; 16], 15);
-
-        assert!(cache
-            .lookup(SearchKey::user(b"bucket-01/path/other"), 4)
+            .lookup(SearchKey::user(b"bucket-01/path/other"))
             .is_none());
         let hit = cache
-            .lookup(SearchKey::user(b"bucket-02/path/other"), 4)
+            .lookup(SearchKey::user(b"bucket-02/path/other"))
             .unwrap();
         assert_eq!(hit.child_guid, [9; 16]);
         let stats = cache.stats();
-        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.entries, 1);
         assert_eq!(stats.invalidations, 1);
     }
 
     #[test]
     fn does_not_cache_prefix_past_user_key() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"abc"), 1, CHILD, 4);
+        cache.learn(SearchKey::user(b"abc"), PARENT, 0, 1, CHILD, 4);
 
-        assert!(cache.lookup(SearchKey::user(b"abc"), 1).is_none());
+        assert!(cache.lookup(SearchKey::user(b"abc")).is_none());
     }
 
     #[test]
     fn shorter_route_dominates_same_child_longer_route() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 10);
-        cache.learn(SearchKey::user(b"bucket-00/path/deeper/file"), 1, CHILD, 15);
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            10,
+        );
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/deeper/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
 
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
         let hit = cache
-            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 1)
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"))
             .unwrap();
         assert_eq!(hit.child_guid, CHILD);
         assert_eq!(hit.child_depth, 10);
@@ -319,13 +416,27 @@ mod tests {
     #[test]
     fn shorter_route_prunes_same_child_longer_route() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-00/path/deeper/file"), 1, CHILD, 15);
-        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 10);
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/deeper/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            10,
+        );
 
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
         let hit = cache
-            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 1)
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"))
             .unwrap();
         assert_eq!(hit.child_guid, CHILD);
         assert_eq!(hit.child_depth, 10);
@@ -334,13 +445,20 @@ mod tests {
     #[test]
     fn stats_track_hits_misses_and_replacements() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 15);
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
 
         assert!(cache
-            .lookup(SearchKey::user(b"bucket-00/path/other"), 1)
+            .lookup(SearchKey::user(b"bucket-00/path/other"))
             .is_some());
         assert!(cache
-            .lookup(SearchKey::user(b"bucket-01/path/other"), 1)
+            .lookup(SearchKey::user(b"bucket-01/path/other"))
             .is_none());
 
         let stats = cache.stats();
@@ -351,7 +469,14 @@ mod tests {
 
         for i in 0..=ROUTE_CACHE_CAPACITY {
             let key = format!("bucket-{i:03}/path/file");
-            cache.learn(SearchKey::user(key.as_bytes()), 1, [i as u8; 16], 15);
+            cache.learn(
+                SearchKey::user(key.as_bytes()),
+                PARENT,
+                0,
+                1,
+                [i as u8; 16],
+                15,
+            );
         }
 
         let stats = cache.stats();
@@ -360,38 +485,132 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_stale_route_version_mismatches() {
+    fn stats_count_stale_invalidations() {
         let cache = RouteCache::new();
-        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 15);
-        assert!(cache
-            .lookup(SearchKey::user(b"bucket-00/path/other"), 2)
-            .is_none());
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
+        let hit = cache
+            .lookup(SearchKey::user(b"bucket-00/path/other"))
+            .unwrap();
+        cache.invalidate(SearchKey::user(b"bucket-00/path/other"), hit);
 
         let stats = cache.stats();
-        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.entries, 0);
         assert_eq!(stats.invalidations, 1);
     }
 
     #[test]
-    fn stale_longer_route_does_not_mask_valid_shorter_route() {
+    fn refresh_parent_version_keeps_stable_edge_cached() {
+        let cache = RouteCache::new();
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
+        let hit = cache
+            .lookup(SearchKey::user(b"bucket-00/path/other"))
+            .unwrap();
+        cache.refresh_parent_version(SearchKey::user(b"bucket-00/path/other"), hit, 7);
+
+        let refreshed = cache
+            .lookup(SearchKey::user(b"bucket-00/path/again"))
+            .unwrap();
+        assert_eq!(refreshed.parent_version, 7);
+        assert_eq!(cache.stats().invalidations, 0);
+    }
+
+    #[test]
+    fn stale_longer_route_can_be_removed_to_expose_shorter_route() {
         let cache = RouteCache::new();
         cache.learn(
             SearchKey::user(b"bucket-00/path/deeper/file"),
+            PARENT,
+            0,
             1,
             [1; 16],
             21,
         );
-        cache.learn(SearchKey::user(b"bucket-00/path/file"), 2, CHILD, 15);
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            OTHER_PARENT,
+            0,
+            2,
+            CHILD,
+            15,
+        );
+
+        let stale = cache
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"))
+            .unwrap();
+        assert_eq!(stale.child_guid, [1; 16]);
+        cache.invalidate(SearchKey::user(b"bucket-00/path/deeper/other"), stale);
 
         let hit = cache
-            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 2)
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"))
             .unwrap();
         assert_eq!(hit.child_guid, CHILD);
         assert_eq!(hit.child_depth, 15);
 
         let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.invalidations, 1);
+    }
+
+    #[test]
+    fn different_parent_token_does_not_prune_longer_route() {
+        let cache = RouteCache::new();
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/deeper/file"),
+            PARENT,
+            0,
+            1,
+            [1; 16],
+            21,
+        );
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            OTHER_PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
+
+        let stats = cache.stats();
         assert_eq!(stats.entries, 2);
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.invalidations, 0);
+    }
+
+    #[test]
+    fn different_parent_depth_does_not_prune_longer_route() {
+        let cache = RouteCache::new();
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/deeper/file"),
+            PARENT,
+            12,
+            1,
+            [1; 16],
+            21,
+        );
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/file"),
+            PARENT,
+            0,
+            1,
+            CHILD,
+            15,
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 2);
     }
 }

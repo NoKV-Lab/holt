@@ -30,7 +30,7 @@ use crate::journal::codec::{
 use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
-use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE};
+use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob, WriteThroughEntry};
 
@@ -120,10 +120,10 @@ pub struct Tree {
     /// `get` never take this lock; they coordinate via the
     /// per-blob `HybridLatch` inside the BM.
     rename_lock: Arc<Mutex<()>>,
-    /// Root-to-first-child route cache for path-shaped large
-    /// trees. Entries are validated against the root blob's latch
-    /// version before use, so stale routes fall back to a normal
-    /// root descent.
+    /// Parent-validated route cache for path-shaped large trees.
+    /// Entries cache prefix anchors at BlobNode crossings and are
+    /// validated against the parent blob's latch version before
+    /// use.
     route_cache: Arc<engine::RouteCache>,
     /// Tree-wide structural-maintenance gate.
     ///
@@ -169,10 +169,6 @@ impl std::fmt::Debug for Tree {
             .finish_non_exhaustive()
     }
 }
-
-/// Fixed GUID of the root blob (single-tree mode). A future
-/// multi-tenant manifest could allocate per-tree root GUIDs.
-pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
 fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
     let body_prefix_len = 8 + 4; // tree_id + inner_count
@@ -497,7 +493,7 @@ impl Tree {
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
                 let mut record =
-                    Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
+                    journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
                 encode_insert_record(&mut record, seq, 0, key, value);
                 let ack = journal.submit(record, self.cfg.wal_sync)?;
                 (outcome, ack)
@@ -597,7 +593,7 @@ impl Tree {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
-                let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
+                let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
                 encode_erase_record(&mut record, seq, 0, key);
                 let ack = journal.submit(record, self.cfg.wal_sync)?;
                 (outcome, ack)
@@ -716,7 +712,7 @@ impl Tree {
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             let mut record =
-                Vec::with_capacity(encoded_rename_object_record_len(src.len(), dst.len()));
+                journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
             encode_rename_object_record(&mut record, seq, 0, src, dst, force);
             journal.submit(record, self.cfg.wal_sync)?
         } else {
@@ -827,7 +823,7 @@ impl Tree {
         if let Some(journal) = &self.journal {
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
-                let mut record = Vec::with_capacity(encoded_batch_record_len(&pending));
+                let mut record = journal.record_buffer(encoded_batch_record_len(&pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
                 self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
@@ -1685,9 +1681,11 @@ impl Tree {
         //    that entry's WAL record stays recoverable. Same
         //    logic for pending_delete_count.
         if let Some(journal) = &self.journal {
-            let _commit = self.commit_gate.enter_checkpoint();
-            if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
-                journal.truncate()?;
+            if journal.needs_checkpoint() {
+                let _commit = self.commit_gate.enter_checkpoint();
+                if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
+                    journal.truncate()?;
+                }
             }
         }
         Ok(())

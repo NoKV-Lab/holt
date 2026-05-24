@@ -154,6 +154,15 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 # Exercise per-operation WAL sync.
 HOLT_STRESS_WAL_SYNC=true \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
+
+# Reopen after preload+checkpoint before timing. This starts Holt
+# with an empty BufferManager except for the root pin, and similarly
+# reopens RocksDB/SQLite/sled. Use it for cold-cache or constrained
+# buffer-pool read studies, not for the default hot-service table.
+HOLT_STRESS_REOPEN_AFTER_PRELOAD=1 \
+HOLT_STRESS_BUFFER_POOL=16 \
+HOLT_STRESS_OPS=get \
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 ```
 
 Profile: single-threaded, warm-service, file-backed persistent

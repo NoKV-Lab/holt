@@ -19,6 +19,8 @@ use super::writer::WalWriter;
 const GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
 const ENQUEUE_BATCH_WINDOW: Duration = Duration::from_micros(10);
 const GROUP_COMMIT_MAX_BYTES: usize = 256 * 1024;
+const RECORD_BUFFER_POOL_LIMIT: usize = 1024;
+const RECORD_BUFFER_RETAIN_MAX: usize = 64 * 1024;
 // Large enough to absorb metadata bursts without making async WAL
 // enqueue a foreground backpressure point.
 const JOURNAL_QUEUE_DEPTH: usize = 65_536;
@@ -50,6 +52,15 @@ struct AppendRequest {
     ack: Option<AckTx>,
 }
 
+#[derive(Clone, Copy)]
+struct WorkerState<'a> {
+    writer: &'a Arc<Mutex<WalWriter>>,
+    record_pool: &'a Mutex<Vec<Vec<u8>>>,
+    batches: &'a AtomicU64,
+    syncs: &'a AtomicU64,
+    durable_work: &'a AtomicU64,
+}
+
 /// Completion handle for one acknowledged journal append.
 ///
 /// Synchronous appends wait until their batch has reached the
@@ -78,6 +89,7 @@ pub(crate) struct Journal {
     appends: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
     syncs: Arc<AtomicU64>,
+    record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     next_work: Arc<AtomicU64>,
     wal_work: Arc<AtomicU64>,
     durable_work: Arc<AtomicU64>,
@@ -101,9 +113,11 @@ impl Journal {
         } else {
             initial_wal_work - 1
         };
+        let record_pool = Arc::new(Mutex::new(Vec::new()));
         let durable_work = Arc::new(AtomicU64::new(initial_durable_work));
         let worker_batches = Arc::clone(&batches);
         let worker_syncs = Arc::clone(&syncs);
+        let worker_record_pool = Arc::clone(&record_pool);
         let worker_durable_work = Arc::clone(&durable_work);
         let worker_writer = Arc::clone(&writer);
         let handle = thread::Builder::new()
@@ -114,6 +128,7 @@ impl Journal {
                     rx,
                     worker_batches,
                     worker_syncs,
+                    worker_record_pool,
                     worker_durable_work,
                 );
             })
@@ -124,6 +139,7 @@ impl Journal {
             appends: Arc::new(AtomicU64::new(0)),
             batches,
             syncs,
+            record_pool,
             next_work: Arc::new(AtomicU64::new(initial_wal_work)),
             wal_work: Arc::new(AtomicU64::new(initial_wal_work)),
             durable_work,
@@ -151,6 +167,21 @@ impl Journal {
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.wal_work.fetch_max(seq, Ordering::Release);
         Ok(rx.map(|rx| JournalAck { rx }))
+    }
+
+    /// Return a scratch buffer for one encoded WAL record.
+    pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
+        if min_capacity <= RECORD_BUFFER_RETAIN_MAX {
+            if let Ok(mut pool) = self.record_pool.try_lock() {
+                while let Some(mut buf) = pool.pop() {
+                    if buf.capacity() >= min_capacity {
+                        buf.clear();
+                        return buf;
+                    }
+                }
+            }
+        }
+        Vec::with_capacity(min_capacity)
     }
 
     /// Highest WAL work id published by append paths.
@@ -232,9 +263,18 @@ fn run_worker(
     rx: Receiver<JournalCommand>,
     batches: Arc<AtomicU64>,
     syncs: Arc<AtomicU64>,
+    record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     durable_work: Arc<AtomicU64>,
 ) {
     let mut backlog = VecDeque::new();
+    let mut append_batch = Vec::with_capacity(256);
+    let state = WorkerState {
+        writer: &writer,
+        record_pool: &record_pool,
+        batches: &batches,
+        syncs: &syncs,
+        durable_work: &durable_work,
+    };
 
     loop {
         let cmd = match backlog.pop_front() {
@@ -261,10 +301,8 @@ fn run_worker(
                     },
                     &rx,
                     &mut backlog,
-                    &writer,
-                    &batches,
-                    &syncs,
-                    &durable_work,
+                    &mut append_batch,
+                    state,
                 );
             }
             JournalCommand::Flush { up_to, ack } => {
@@ -294,12 +332,11 @@ fn process_append_batch(
     first: AppendRequest,
     rx: &Receiver<JournalCommand>,
     backlog: &mut VecDeque<JournalCommand>,
-    writer: &Arc<Mutex<WalWriter>>,
-    batches: &AtomicU64,
-    syncs: &AtomicU64,
-    durable_work: &AtomicU64,
+    batch: &mut Vec<AppendRequest>,
+    state: WorkerState<'_>,
 ) {
-    let mut batch = vec![first];
+    debug_assert!(batch.is_empty());
+    batch.push(first);
     let mut needs_sync = batch[0].sync;
     let mut bytes = batch[0].bytes.len();
     let mut deadline = Instant::now()
@@ -350,19 +387,18 @@ fn process_append_batch(
         }
     }
 
-    batches.fetch_add(1, Ordering::Relaxed);
-    let result = write_append_batch(&batch, writer, needs_sync, syncs, durable_work);
-    notify_append_batch(batch, &result);
+    state.batches.fetch_add(1, Ordering::Relaxed);
+    let result = write_append_batch(batch.as_slice(), needs_sync, state);
+    notify_append_batch(batch, &result, state.record_pool);
 }
 
 fn write_append_batch(
     batch: &[AppendRequest],
-    writer: &Arc<Mutex<WalWriter>>,
     needs_sync: bool,
-    syncs: &AtomicU64,
-    durable_work: &AtomicU64,
+    state: WorkerState<'_>,
 ) -> Result<()> {
-    let mut writer = writer
+    let mut writer = state
+        .writer
         .lock()
         .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
     for req in batch {
@@ -371,21 +407,38 @@ fn write_append_batch(
 
     if needs_sync {
         writer.flush()?;
-        syncs.fetch_add(1, Ordering::Relaxed);
+        state.syncs.fetch_add(1, Ordering::Relaxed);
         let durable_seq = batch.iter().map(|req| req.seq).max().unwrap_or(0);
-        durable_work.fetch_max(durable_seq, Ordering::AcqRel);
+        state.durable_work.fetch_max(durable_seq, Ordering::AcqRel);
     }
     Ok(())
 }
 
-fn notify_append_batch(batch: Vec<AppendRequest>, result: &Result<()>) {
-    for req in batch {
-        if let Some(ack) = req.ack {
+fn notify_append_batch(
+    batch: &mut Vec<AppendRequest>,
+    result: &Result<()>,
+    record_pool: &Mutex<Vec<Vec<u8>>>,
+) {
+    for mut req in batch.drain(..) {
+        if let Some(ack) = req.ack.take() {
             let _ = ack.send(match result {
                 Ok(()) => Ok(()),
                 Err(Error::Internal(msg)) => Err(Error::Internal(msg)),
                 Err(_) => Err(Error::Internal("journal worker failed")),
             });
+        }
+        recycle_record_buffer(record_pool, req.bytes);
+    }
+}
+
+fn recycle_record_buffer(record_pool: &Mutex<Vec<Vec<u8>>>, mut buf: Vec<u8>) {
+    if buf.capacity() > RECORD_BUFFER_RETAIN_MAX {
+        return;
+    }
+    buf.clear();
+    if let Ok(mut pool) = record_pool.try_lock() {
+        if pool.len() < RECORD_BUFFER_POOL_LIMIT {
+            pool.push(buf);
         }
     }
 }
@@ -470,6 +523,23 @@ mod tests {
         assert_eq!(journal.stats().syncs, 1);
         assert_eq!(journal.stats().appends, 1);
         assert!(journal.stats().batches >= 1);
+    }
+
+    #[test]
+    fn encoded_record_buffers_are_recycled_after_worker_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
+
+        let mut record = journal.record_buffer(64);
+        let capacity = record.capacity();
+        assert!(capacity >= 64);
+        record.extend_from_slice(&[1; 32]);
+
+        journal.submit(record, false).unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
+
+        let reused = journal.record_buffer(16);
+        assert!(reused.capacity() >= capacity);
     }
 
     #[test]

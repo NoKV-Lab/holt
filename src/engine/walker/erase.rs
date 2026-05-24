@@ -10,6 +10,7 @@ use super::lookup::lookup_at;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
+use super::route::{pin_route_parent, route_pin_not_found, validate_route_edge};
 use super::types::{EraseCondition, EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
@@ -81,45 +82,39 @@ pub fn erase_multi_conditional(
     let mut blob_hops = 0u64;
     let mut max_cross_blob_depth = 0usize;
 
+    if let Some(outcome) = try_erase_from_route(
+        bm,
+        root_pin,
+        route_cache,
+        key,
+        seq,
+        condition,
+        &mut blob_hops,
+        &mut max_cross_blob_depth,
+    )? {
+        return Ok(outcome);
+    }
+
     {
         let root_read = root_pin.read();
         let root_version = root_pin.content_version();
-        if let Some(route) = route_cache.and_then(|cache| cache.lookup(key, root_version)) {
-            let child_pin = bm.pin(route.child_guid)?;
-            child_pin.prefetch_header();
-            let child_guard = child_pin.write();
-            drop(root_read);
-
-            blob_hops = 1;
-            let outcome = lock_coupled_erase_in_blob(
-                bm,
-                child_guard,
-                child_pin.as_ref(),
-                route.child_guid,
-                false,
-                key,
-                seq,
-                condition,
-                route.child_depth,
-                &mut blob_hops,
-                &mut max_cross_blob_depth,
-            );
-            drop(child_pin);
-            if outcome.is_ok() {
-                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
-            }
-            return outcome;
-        }
-
         let root_lookup = {
             let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_guid = frame.header().blob_guid;
             let root_slot = frame.header().root_slot;
-            lookup_at(frame, root_slot, key, 0)?
+            (root_guid, lookup_at(frame, root_slot, key, 0)?)
         };
         match root_lookup {
-            LookupResult::Crossing(crossing) => {
+            (root_guid, LookupResult::Crossing(crossing)) => {
                 if let Some(cache) = route_cache {
-                    cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                    cache.learn(
+                        key,
+                        root_guid,
+                        0,
+                        root_version,
+                        crossing.child_guid,
+                        crossing.child_depth,
+                    );
                     bm.mark_route_resident(crossing.child_guid);
                 }
                 let child_pin = bm.pin(crossing.child_guid)?;
@@ -147,14 +142,14 @@ pub fn erase_multi_conditional(
                 }
                 return outcome;
             }
-            LookupResult::NotFound => {
+            (_, LookupResult::NotFound) => {
                 bm.note_walker_blob_hops(1, 0);
                 return Ok(EraseOutcome {
                     root_dirty: false,
                     mutated: false,
                 });
             }
-            LookupResult::Found(_) => {}
+            (_, LookupResult::Found(_)) => {}
         }
     }
 
@@ -180,6 +175,77 @@ pub fn erase_multi_conditional(
         bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
     }
     outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_erase_from_route(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    seq: u64,
+    condition: EraseCondition,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
+) -> Result<Option<EraseOutcome>> {
+    let Some(cache) = route_cache else {
+        return Ok(None);
+    };
+    let Some(route) = cache.lookup(key) else {
+        return Ok(None);
+    };
+
+    let parent_pin = match pin_route_parent(bm, root_pin, route) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let parent_guard = parent_pin.read();
+    let parent_version = parent_pin.content_version();
+    if parent_version != route.parent_version {
+        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+        if !validate_route_edge(frame, key, route)? {
+            drop(parent_guard);
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        cache.refresh_parent_version(key, route, parent_version);
+    }
+    let child_pin = match bm.pin(route.child_guid) {
+        Ok(pin) => pin,
+        Err(e) if route_pin_not_found(&e) => {
+            drop(parent_guard);
+            cache.invalidate(key, route);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    child_pin.prefetch_header();
+    let child_guard = child_pin.write();
+    drop(parent_guard);
+
+    *blob_hops = 1;
+    let outcome = lock_coupled_erase_in_blob(
+        bm,
+        child_guard,
+        child_pin.as_ref(),
+        route.child_guid,
+        false,
+        key,
+        seq,
+        condition,
+        route.child_depth,
+        blob_hops,
+        max_cross_blob_depth,
+    );
+    drop(child_pin);
+    if outcome.is_ok() {
+        bm.note_walker_blob_hops(*blob_hops, *max_cross_blob_depth);
+    }
+    outcome.map(Some)
 }
 
 #[derive(Debug, Clone, Copy)]

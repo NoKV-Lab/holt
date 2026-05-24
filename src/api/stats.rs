@@ -38,30 +38,30 @@ pub struct BlobStats {
     pub tombstone_leaf_cnt: u32,
 }
 
-/// Root-route-cache counters captured by [`Tree::stats`](crate::Tree::stats).
+/// Prefix-route-cache counters captured by [`Tree::stats`](crate::Tree::stats).
 ///
-/// The route cache is a small root-to-first-blob crossing accelerator
-/// for path-shaped large trees. These counters diagnose whether
-/// writes are using stable cached prefixes or churning through
-/// learned routes.
+/// The route cache is a small parent-validated BlobNode crossing
+/// accelerator for path-shaped large trees. These counters diagnose
+/// whether point reads and writes are using stable cached anchors or
+/// churning through stale routes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RouteCacheStats {
     /// Number of cached route entries currently resident.
     pub entries: usize,
     /// Cumulative successful route-cache lookups.
     pub hits: u64,
-    /// Cumulative route-cache lookup misses, including root-version
-    /// mismatches and keys not covered by any cached prefix.
+    /// Cumulative route-cache lookup misses for keys not covered by
+    /// any cached prefix.
     pub misses: u64,
     /// Cumulative learned routes. Updating an existing cached prefix
     /// counts as a learn because the route was refreshed from a live
-    /// root descent.
+    /// parent descent.
     pub learns: u64,
     /// Cumulative capacity replacements after the route cache filled.
     pub evictions: u64,
-    /// Cumulative stale route probes caused by root-version
-    /// changes. Stale entries are refreshed by the next successful
-    /// learn or replaced by capacity pressure.
+    /// Cumulative stale route probes caused by parent-version
+    /// changes. Stale entries are removed and can be relearned by a
+    /// later descent.
     pub invalidations: u64,
 }
 

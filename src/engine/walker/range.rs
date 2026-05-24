@@ -1533,7 +1533,7 @@ impl RangeIter {
                             )
                         };
                         self.stack[idx].next = 1;
-                        let child_pin = self.bm.pin(child_guid)?;
+                        let child_pin = self.bm.pin_scan(child_guid)?;
                         child_pin.prefetch_header();
                         let child_can_rollup = {
                             let guard = child_pin.read();
@@ -1627,7 +1627,7 @@ impl RangeIter {
     }
 
     fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
-        let child_pin = self.bm.pin(child_guid)?;
+        let child_pin = self.bm.pin_scan(child_guid)?;
         child_pin.prefetch_header();
         self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)
     }
