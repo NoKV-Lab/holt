@@ -61,10 +61,16 @@ impl AlignedBlobBuf {
         }
     }
 
-    /// Allocate an uninitialized buffer. Caller must fill before
-    /// reading (typical use: io_uring read fills it from disk).
+    /// Allocate an uninitialized buffer.
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer's bytes are uninitialized. The caller
+    /// must initialize all `PAGE_SIZE` bytes before any operation
+    /// reads the buffer contents, including [`Self::as_slice`],
+    /// [`Clone::clone`], or `BlobStore::write_blob`.
     #[must_use]
-    pub fn uninit() -> Self {
+    pub(crate) unsafe fn uninit() -> Self {
         let layout = Self::layout();
         let raw = unsafe { alloc(layout) };
         let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
@@ -74,12 +80,18 @@ impl AlignedBlobBuf {
         }
     }
 
-    /// Allocate an uninitialized frame from `pool`. Returns `None`
-    /// when every fixed slot is currently leased; callers should
-    /// fall back to [`Self::uninit`] in that case.
+    /// Allocate an uninitialized frame from `pool`.
+    ///
+    /// Returns `None` when every fixed slot is currently leased;
+    /// callers should fall back to [`Self::uninit`] in that case.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::uninit`]: initialize every byte
+    /// before any operation reads the buffer contents.
     #[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
     #[must_use]
-    pub(crate) fn pooled_uninit(pool: &BlobBufPool) -> Option<Self> {
+    pub(crate) unsafe fn pooled_uninit(pool: &BlobBufPool) -> Option<Self> {
         let index = pool.inner.alloc_slot()?;
         let ptr = pool.inner.ptr_for_index(index);
         Some(Self {
@@ -96,7 +108,9 @@ impl AlignedBlobBuf {
     #[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
     #[must_use]
     pub(crate) fn pooled_zeroed(pool: &BlobBufPool) -> Option<Self> {
-        let mut out = Self::pooled_uninit(pool)?;
+        // SAFETY: `fill(0)` initializes the full PAGE_SIZE buffer
+        // before the value escapes this function.
+        let mut out = unsafe { Self::pooled_uninit(pool)? };
         out.as_mut_slice().fill(0);
         Some(out)
     }
@@ -190,13 +204,23 @@ impl Default for AlignedBlobBuf {
 impl Clone for AlignedBlobBuf {
     fn clone(&self) -> Self {
         let mut out = match &self.owner {
-            BlobBufOwner::Heap => Self::uninit(),
+            // SAFETY: copy_from_slice below initializes the full
+            // PAGE_SIZE buffer before `out` is returned.
+            BlobBufOwner::Heap => unsafe { Self::uninit() },
             #[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
             BlobBufOwner::Pool { pool, .. } => {
                 let wrapper = BlobBufPool {
                     inner: Arc::clone(pool),
                 };
-                Self::pooled_uninit(&wrapper).unwrap_or_else(Self::uninit)
+                // SAFETY: copy_from_slice below initializes the full
+                // PAGE_SIZE buffer before `out` is returned.
+                if let Some(buf) = unsafe { Self::pooled_uninit(&wrapper) } {
+                    buf
+                } else {
+                    // SAFETY: copy_from_slice below initializes the
+                    // full PAGE_SIZE buffer before `out` is returned.
+                    unsafe { Self::uninit() }
+                }
             }
         };
         out.as_mut_slice().copy_from_slice(self.as_slice());
@@ -262,9 +286,11 @@ mod tests {
         assert!(a.fixed_buffer_index().is_some());
         assert!(b.fixed_buffer_index().is_some());
         assert_ne!(a.fixed_buffer_index(), b.fixed_buffer_index());
-        assert!(AlignedBlobBuf::pooled_uninit(&pool).is_none());
+        // SAFETY: no buffer is returned in this exhausted-pool case.
+        assert!(unsafe { AlignedBlobBuf::pooled_uninit(&pool) }.is_none());
         drop(a);
-        assert!(AlignedBlobBuf::pooled_uninit(&pool).is_some());
+        // SAFETY: the test does not read from the returned buffer.
+        assert!(unsafe { AlignedBlobBuf::pooled_uninit(&pool) }.is_some());
     }
 
     #[test]
@@ -276,7 +302,9 @@ mod tests {
                 scope.spawn(move || {
                     for _ in 0..1000 {
                         let mut b = loop {
-                            if let Some(b) = AlignedBlobBuf::pooled_uninit(&pool) {
+                            // SAFETY: the loop writes before dropping,
+                            // and never reads the buffer contents.
+                            if let Some(b) = unsafe { AlignedBlobBuf::pooled_uninit(&pool) } {
                                 break b;
                             }
                             std::hint::spin_loop();
@@ -287,16 +315,24 @@ mod tests {
             }
         });
         let leased: Vec<_> = (0..8)
-            .map(|_| AlignedBlobBuf::pooled_uninit(&pool).unwrap())
+            .map(|_| {
+                // SAFETY: leased buffers are used only to exhaust
+                // the pool and are never read.
+                unsafe { AlignedBlobBuf::pooled_uninit(&pool) }.unwrap()
+            })
             .collect();
-        assert!(AlignedBlobBuf::pooled_uninit(&pool).is_none());
+        // SAFETY: no buffer is returned in this exhausted-pool case.
+        assert!(unsafe { AlignedBlobBuf::pooled_uninit(&pool) }.is_none());
         drop(leased);
-        assert!(AlignedBlobBuf::pooled_uninit(&pool).is_some());
+        // SAFETY: the test does not read from the returned buffer.
+        assert!(unsafe { AlignedBlobBuf::pooled_uninit(&pool) }.is_some());
     }
 
     #[test]
     fn uninit_is_writable() {
-        let mut b = AlignedBlobBuf::uninit();
+        // SAFETY: the test initializes every byte with fill() before
+        // reading through as_slice().
+        let mut b = unsafe { AlignedBlobBuf::uninit() };
         b.as_mut_slice().fill(0x42);
         assert!(b.as_slice().iter().all(|&x| x == 0x42));
     }

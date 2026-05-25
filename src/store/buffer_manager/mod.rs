@@ -189,6 +189,7 @@ enum PinAccess {
 /// Frequency-aware blob cache; see the module docs.
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
+    alloc_uninit: Arc<dyn Fn() -> AlignedBlobBuf + Send + Sync>,
     capacity: usize,
     route_resident_budget: usize,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
@@ -280,9 +281,31 @@ impl BufferManager {
     /// clamped to 1.
     #[must_use]
     pub fn new(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
+        Self::new_with_uninit_allocator(store, capacity, || {
+            // SAFETY: BufferManager's uninitialized allocations are
+            // filled by read_blob or a full-frame copy before read.
+            unsafe { AlignedBlobBuf::uninit() }
+        })
+    }
+
+    /// Construct with a crate-private uninitialized-frame allocator.
+    ///
+    /// File-backed trees use this to preserve Linux fixed-buffer
+    /// allocation without exposing an uninitialized constructor in
+    /// the public BlobStore trait.
+    #[must_use]
+    pub(crate) fn new_with_uninit_allocator<F>(
+        store: Arc<dyn BlobStore>,
+        capacity: usize,
+        alloc_uninit: F,
+    ) -> Self
+    where
+        F: Fn() -> AlignedBlobBuf + Send + Sync + 'static,
+    {
         let capacity = capacity.max(1);
         Self {
             store,
+            alloc_uninit: Arc::new(alloc_uninit),
             capacity,
             route_resident_budget: route_resident_budget(capacity),
             cache: DashMap::new(),
@@ -311,6 +334,10 @@ impl BufferManager {
             eviction_skips_route_resident: AtomicU64::new(0),
             admission_protects: AtomicU64::new(0),
         }
+    }
+
+    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
+        (self.alloc_uninit)()
     }
 
     /// Current logical clock value. Read by the eviction
@@ -897,7 +924,9 @@ impl BufferManager {
         if let Some(entry) = self.get_cached_with_access(guid, access) {
             return Ok(entry);
         }
-        let mut scratch = self.store.alloc_blob_buf_uninit();
+        // SAFETY: read_blob fills the full PAGE_SIZE frame before
+        // `scratch` is inserted into the cache or read.
+        let mut scratch = self.alloc_blob_buf_uninit();
         self.store.read_blob(guid, &mut scratch)?;
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
@@ -1249,7 +1278,9 @@ impl BufferManager {
     pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
         let entry = self.get_cached_with_access(guid, PinAccess::Silent)?;
         let buf = entry.read();
-        let mut out = self.store.alloc_blob_buf_uninit();
+        // SAFETY: copy_from_slice below writes the full PAGE_SIZE
+        // frame before `out` is returned.
+        let mut out = self.alloc_blob_buf_uninit();
         out.as_mut_slice().copy_from_slice(buf.as_slice());
         Some(out)
     }
@@ -1276,7 +1307,9 @@ impl BufferManager {
         if entry.content_version() != content_version {
             return Ok(None);
         }
-        let mut out = self.store.alloc_blob_buf_uninit();
+        // SAFETY: copy_from_slice below writes the full PAGE_SIZE
+        // frame before `out` is returned.
+        let mut out = self.alloc_blob_buf_uninit();
         out.as_mut_slice().copy_from_slice(buf.as_slice());
         Ok(Some(out))
     }
@@ -1291,11 +1324,15 @@ impl BufferManager {
     pub(crate) fn snapshot_blob_image(&self, guid: BlobGuid) -> Result<AlignedBlobBuf> {
         if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
             let buf = entry.read();
-            let mut out = self.store.alloc_blob_buf_uninit();
+            // SAFETY: copy_from_slice below writes the full PAGE_SIZE
+            // frame before `out` is returned.
+            let mut out = self.alloc_blob_buf_uninit();
             out.as_mut_slice().copy_from_slice(buf.as_slice());
             return Ok(out);
         }
-        let mut out = self.store.alloc_blob_buf_uninit();
+        // SAFETY: read_blob fills the full PAGE_SIZE frame before
+        // `out` is returned.
+        let mut out = self.alloc_blob_buf_uninit();
         self.store.read_blob(guid, &mut out)?;
         Ok(out)
     }

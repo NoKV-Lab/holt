@@ -62,12 +62,6 @@ pub trait BlobStore: Send + Sync {
         AlignedBlobBuf::zeroed()
     }
 
-    /// Allocate an uninitialized blob buffer suitable for this
-    /// store. Callers must fill all bytes before reading.
-    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
-        AlignedBlobBuf::uninit()
-    }
-
     /// Read blob `guid` into `dst`. `dst.len() == PAGE_SIZE`.
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
 

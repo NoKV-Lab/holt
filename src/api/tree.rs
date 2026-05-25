@@ -261,24 +261,39 @@ impl Tree {
     /// Windows fails at compile time (see the platform stance in
     /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
-        let store: Arc<dyn BlobStore> = match &cfg.storage {
-            Storage::Memory => Arc::new(MemoryBlobStore::new()),
+        let bm = match &cfg.storage {
+            Storage::Memory => {
+                let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+                Arc::new(BufferManager::new(store, cfg.buffer_pool_size))
+            }
             Storage::File { dir } => {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
                 {
-                    Arc::new(FileBlobStore::open_with_buffer_pool_hint(
+                    let store = Arc::new(FileBlobStore::open_with_buffer_pool_hint(
                         dir,
                         cfg.buffer_pool_size,
-                    )?)
+                    )?);
+                    let store_dyn: Arc<dyn BlobStore> = store.clone();
+                    let alloc_store = Arc::clone(&store);
+                    Arc::new(BufferManager::new_with_uninit_allocator(
+                        store_dyn,
+                        cfg.buffer_pool_size,
+                        move || {
+                            // SAFETY: BufferManager initializes every
+                            // returned buffer before reading it.
+                            unsafe { alloc_store.alloc_blob_buf_uninit() }
+                        },
+                    ))
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    Arc::new(FileBlobStore::open(dir)?)
+                    let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
+                    Arc::new(BufferManager::new(store, cfg.buffer_pool_size))
                 }
             }
         };
         // The auto-managed store earns automatic WAL coverage.
-        Self::open_inner(cfg, store, /*attach_wal=*/ true)
+        Self::open_inner(cfg, bm, /*attach_wal=*/ true)
     }
 
     /// Open a tree with a caller-supplied [`BlobStore`].
@@ -300,11 +315,11 @@ impl Tree {
     /// an empty one and writes it through, flushing before
     /// returning.
     pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
-        Self::open_inner(cfg, store, /*attach_wal=*/ false)
+        let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
+        Self::open_inner(cfg, bm, /*attach_wal=*/ false)
     }
 
-    fn open_inner(cfg: TreeConfig, store: Arc<dyn BlobStore>, attach_wal: bool) -> Result<Self> {
-        let bm: Arc<BufferManager> = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
+    fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_wal: bool) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
         if !bm.has_blob(root_guid)? {
             // Seed an empty root blob and write it through.

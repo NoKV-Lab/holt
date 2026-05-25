@@ -697,6 +697,23 @@ fn preallocate_unsupported(err: &io::Error) -> bool {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl FileBlobStore {
+    pub(crate) unsafe fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
+        if let Some(pool) = &self.registered_buffers {
+            // SAFETY: this method's caller upholds the
+            // initialization contract before reading the returned
+            // buffer.
+            if let Some(buf) = unsafe { AlignedBlobBuf::pooled_uninit(pool) } {
+                return buf;
+            }
+        }
+        // SAFETY: this method's caller upholds the initialization
+        // contract before reading the returned buffer.
+        unsafe { AlignedBlobBuf::uninit() }
+    }
+}
+
 impl BlobStore for FileBlobStore {
     fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -706,16 +723,6 @@ impl BlobStore for FileBlobStore {
             }
         }
         AlignedBlobBuf::zeroed()
-    }
-
-    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
-        #[cfg(all(target_os = "linux", feature = "io-uring"))]
-        if let Some(pool) = &self.registered_buffers {
-            if let Some(buf) = AlignedBlobBuf::pooled_uninit(pool) {
-                return buf;
-            }
-        }
-        AlignedBlobBuf::uninit()
     }
 
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
@@ -1245,7 +1252,9 @@ mod tests {
         }
 
         let mut src = b.alloc_blob_buf_zeroed();
-        let mut dst = b.alloc_blob_buf_uninit();
+        // SAFETY: read_blob below fills the full frame before the
+        // test reads from `dst`.
+        let mut dst = unsafe { b.alloc_blob_buf_uninit() };
         assert!(
             src.fixed_buffer_index().is_some(),
             "source buffer should come from the registered pool"
