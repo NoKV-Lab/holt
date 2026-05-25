@@ -8,7 +8,7 @@ use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
-    BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
+    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
 use std::sync::Arc;
 
@@ -53,6 +53,10 @@ pub(super) fn lookup_at<'a>(
 /// the latch version, read raw bytes, then `validate()` after the
 /// hop. If a writer lapped the snapshot mid-walk the hop is
 /// discarded and the entire lookup restarts from the root.
+/// Cross-blob hops are pinned under a short shared guard on the
+/// parent blob after revalidating the `BlobNode` edge, so point
+/// reads do not need the tree-wide maintenance gate to keep a
+/// child blob alive between "saw edge" and "pinned child".
 ///
 /// Why restart from the root: a writer who modifies any blob may
 /// also have moved the `BlobNode` crossing that pointed there, so
@@ -105,7 +109,6 @@ where
             let root_version = root_pin.content_version();
             let guard = root_pin.read_optimistic();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let root_guid = frame.header().blob_guid;
             let root_slot = frame.header().root_slot;
             let result = lookup_at(frame, root_slot, key, 0);
 
@@ -119,29 +122,23 @@ where
                 Err(e) => return Err(e),
                 Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
                 Ok(LookupResult::NotFound) => return Ok(None),
-                Ok(LookupResult::Crossing(crossing)) => {
-                    if let Some(cache) = route_cache {
-                        cache.learn(
-                            key,
-                            root_guid,
-                            0,
-                            root_version,
-                            crossing.child_guid,
-                            crossing.child_depth,
-                        );
-                        bm.mark_route_resident(crossing.child_guid);
-                    }
-                    crossing
-                }
+                Ok(LookupResult::Crossing(crossing)) => crossing,
             }
         };
         // (No drop needed for `root_pin`: it's a borrow held by
         // the caller, not an owned `Arc` we'd be releasing here.)
 
+        let Some((child_pin, child_depth)) =
+            pin_validated_child(bm, route_cache, key, root_pin, 0, crossing)?
+        else {
+            bm.note_optimistic_restart();
+            continue 'restart;
+        };
+
         // Cross-blob hops. Same pattern; on a torn read we restart
         // the whole walk from the root (the parent BlobNode that
         // pointed us here may also have moved).
-        match lookup_from_blob_crossing(bm, route_cache, key, crossing, &mut consume)? {
+        match lookup_from_pinned_blob(bm, route_cache, key, child_pin, child_depth, &mut consume)? {
             CrossBlobLookup::Done(result) => return Ok(result),
             CrossBlobLookup::Restart => {
                 bm.note_optimistic_restart();
@@ -203,71 +200,123 @@ where
     child_pin.prefetch_header();
     drop(parent_guard);
 
-    let guard = child_pin.read_optimistic();
-    let frame = BlobFrameRef::wrap(guard.as_slice());
-    let start_slot = frame.header().root_slot;
-    let result = lookup_at(frame, start_slot, key, route.child_depth);
-    if !guard.validate() {
-        return Ok(RouteLookup::Restart);
-    }
-    match result {
-        Err(e) => Err(e),
-        Ok(LookupResult::Found(hit)) => Ok(RouteLookup::Done(Some(consume(hit)))),
-        Ok(LookupResult::NotFound) => Ok(RouteLookup::Done(None)),
-        Ok(LookupResult::Crossing(crossing)) => {
-            match lookup_from_blob_crossing(bm, Some(cache), key, crossing, consume)? {
-                CrossBlobLookup::Done(result) => Ok(RouteLookup::Done(result)),
-                CrossBlobLookup::Restart => Ok(RouteLookup::Restart),
-            }
+    let crossing = {
+        let child_version = child_pin.content_version();
+        let guard = child_pin.read_optimistic();
+        let frame = BlobFrameRef::wrap(guard.as_slice());
+        let start_slot = frame.header().root_slot;
+        let result = lookup_at(frame, start_slot, key, route.child_depth);
+        if !guard.validate() || !child_pin.validate_content_version(child_version) {
+            return Ok(RouteLookup::Restart);
+        }
+        match result {
+            Err(e) => return Err(e),
+            Ok(LookupResult::Found(hit)) => return Ok(RouteLookup::Done(Some(consume(hit)))),
+            Ok(LookupResult::NotFound) => return Ok(RouteLookup::Done(None)),
+            Ok(LookupResult::Crossing(crossing)) => crossing,
+        }
+    };
+    {
+        let Some((next_pin, next_depth)) = pin_validated_child(
+            bm,
+            Some(cache),
+            key,
+            &child_pin,
+            route.child_depth,
+            crossing,
+        )?
+        else {
+            return Ok(RouteLookup::Restart);
+        };
+        match lookup_from_pinned_blob(bm, Some(cache), key, next_pin, next_depth, consume)? {
+            CrossBlobLookup::Done(result) => Ok(RouteLookup::Done(result)),
+            CrossBlobLookup::Restart => Ok(RouteLookup::Restart),
         }
     }
 }
 
-fn lookup_from_blob_crossing<R, F>(
+fn lookup_from_pinned_blob<R, F>(
     bm: &BufferManager,
     route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
-    crossing: BlobNodeCrossing,
+    mut pin: Arc<CachedBlob>,
+    mut depth: usize,
     consume: &mut F,
 ) -> Result<CrossBlobLookup<R>>
 where
     F: FnMut(LookupHit<'_>) -> R,
 {
-    let mut current_guid = crossing.child_guid;
-    let mut depth = crossing.child_depth;
     loop {
-        let pin = bm.pin(current_guid)?;
         pin.prefetch_header();
-        let parent_guid = current_guid;
-        let parent_version = pin.content_version();
-        let guard = pin.read_optimistic();
-        let frame = BlobFrameRef::wrap(guard.as_slice());
-        let start_slot = frame.header().root_slot;
-        let result = lookup_at(frame, start_slot, key, depth);
-        if !guard.validate() || !pin.validate_content_version(parent_version) {
-            return Ok(CrossBlobLookup::Restart);
-        }
-        match result {
-            Err(e) => return Err(e),
-            Ok(LookupResult::Found(hit)) => return Ok(CrossBlobLookup::Done(Some(consume(hit)))),
-            Ok(LookupResult::NotFound) => return Ok(CrossBlobLookup::Done(None)),
-            Ok(LookupResult::Crossing(crossing)) => {
-                if let Some(cache) = route_cache {
-                    cache.learn(
-                        key,
-                        parent_guid,
-                        depth,
-                        parent_version,
-                        crossing.child_guid,
-                        crossing.child_depth,
-                    );
-                    bm.mark_route_resident(crossing.child_guid);
-                }
-                current_guid = crossing.child_guid;
-                depth = crossing.child_depth;
+        let crossing = {
+            let parent_version = pin.content_version();
+            let guard = pin.read_optimistic();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let start_slot = frame.header().root_slot;
+            let result = lookup_at(frame, start_slot, key, depth);
+            if !guard.validate() || !pin.validate_content_version(parent_version) {
+                return Ok(CrossBlobLookup::Restart);
             }
-        }
+            match result {
+                Err(e) => return Err(e),
+                Ok(LookupResult::Found(hit)) => {
+                    return Ok(CrossBlobLookup::Done(Some(consume(hit))));
+                }
+                Ok(LookupResult::NotFound) => return Ok(CrossBlobLookup::Done(None)),
+                Ok(LookupResult::Crossing(crossing)) => crossing,
+            }
+        };
+
+        let Some((child_pin, child_depth)) =
+            pin_validated_child(bm, route_cache, key, &pin, depth, crossing)?
+        else {
+            return Ok(CrossBlobLookup::Restart);
+        };
+        pin = child_pin;
+        depth = child_depth;
     }
+}
+
+fn pin_validated_child(
+    bm: &BufferManager,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    parent_pin: &Arc<CachedBlob>,
+    parent_depth: usize,
+    expected: BlobNodeCrossing,
+) -> Result<Option<(Arc<CachedBlob>, usize)>> {
+    let parent_guard = parent_pin.read();
+    let parent_version = parent_pin.content_version();
+    let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+    let parent_guid: BlobGuid = frame.header().blob_guid;
+    let start_slot = frame.header().root_slot;
+    let actual = match lookup_at(frame, start_slot, key, parent_depth)? {
+        LookupResult::Crossing(crossing)
+            if crossing.child_guid == expected.child_guid
+                && crossing.child_depth == expected.child_depth =>
+        {
+            crossing
+        }
+        LookupResult::Crossing(_) | LookupResult::Found(_) | LookupResult::NotFound => {
+            return Ok(None);
+        }
+    };
+
+    if let Some(cache) = route_cache {
+        cache.learn(
+            key,
+            parent_guid,
+            parent_depth,
+            parent_version,
+            actual.child_guid,
+            actual.child_depth,
+        );
+        bm.mark_route_resident(actual.child_guid);
+    }
+    let child_pin = bm.pin(actual.child_guid)?;
+    child_pin.prefetch_header();
+    drop(parent_guard);
+    Ok(Some((child_pin, actual.child_depth)))
 }
 
 // ---------- descent dispatch ----------

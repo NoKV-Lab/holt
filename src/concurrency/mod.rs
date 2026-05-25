@@ -6,9 +6,11 @@
 //! publish barrier for persistent trees.
 
 mod commit_gate;
+mod endpoint_locks;
 mod hybrid_latch;
 mod maintenance_gate;
 
 pub(crate) use commit_gate::CommitGate;
+pub(crate) use endpoint_locks::EndpointLocks;
 pub use hybrid_latch::{Guard, HybridLatch};
 pub(crate) use maintenance_gate::MaintenanceGate;

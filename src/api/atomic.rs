@@ -200,7 +200,7 @@ impl AtomicBatch {
 
     /// `true` if nothing has been queued. A closure that leaves
     /// the batch empty makes [`super::tree::Tree::atomic`] return
-    /// without taking the rename lock or emitting a WAL record.
+    /// without taking endpoint locks or emitting a WAL record.
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

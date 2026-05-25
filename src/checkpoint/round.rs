@@ -41,8 +41,8 @@ use std::time::Instant;
 use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
-use crate::store::blob_store::BlobStore;
-use crate::store::WriteThroughEntry;
+use crate::store::blob_store::{AlignedBlobBuf, BlobStore};
+use crate::store::{DirtySnapshotEntry, WriteThroughEntry};
 
 use super::io::{CheckpointEpoch, CheckpointEpochReport, IoTask};
 use super::Shared;
@@ -57,6 +57,8 @@ struct PendingEpoch {
     snap: HashMap<BlobGuid, u64>,
     pending: HashMap<BlobGuid, u64>,
 }
+
+type ClonedDirtyBytes = Vec<(BlobGuid, u64, AlignedBlobBuf)>;
 
 impl Pipeline {
     pub(super) fn new(max_in_flight: usize) -> Self {
@@ -192,13 +194,12 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     };
     shared.merges_total.fetch_add(merged, Ordering::Relaxed);
 
-    // 1+2. Snapshot dirty + pending-deletes + cloned bytes + WAL
-    // watermark under the same commit-publish gate used by
-    // foreground persistent writers. Holding the gate through byte
-    // cloning is load-bearing: a writer must not mutate a blob
-    // between our dirty snapshot and `snapshot_bytes`, otherwise the
-    // store flush could include bytes whose WAL record was not part
-    // of the checkpoint snapshot.
+    // 1. Snapshot dirty + pending-deletes + WAL watermark under
+    // the same commit-publish gate used by foreground persistent
+    // writers. For each dirty blob we also capture its latch
+    // content version; byte cloning happens after the gate is
+    // released and accepts a blob only if that version is still
+    // current under a shared blob latch.
     //
     // If `snapshot_pending_deletes` were taken outside this
     // commit-publish block, a writer could (a) enter its mutation,
@@ -212,47 +213,42 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     // designed to prevent.
     //
     // No-WAL trees (memory mode, user-supplied store) skip the WAL
-    // watermark but still clone immediately after draining.
-    let (snap, pending, snap_bytes, wal_up_to) = if let Some(journal) = &shared.journal {
+    // watermark but use the same version-checked clone path.
+    let (mut snap, mut pending, versioned_snap, wal_up_to) = if let Some(journal) = &shared.journal
+    {
         let _commit = shared.commit_gate.enter_checkpoint();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
         let wal_up_to = journal.wal_work();
-        let mut snap_bytes = Vec::with_capacity(snap.len());
-        for (guid, seq) in &snap {
-            let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
+        let versioned_snap = match shared.bm.snapshot_dirty_versions(&snap) {
+            Ok(versioned) => versioned,
+            Err(e) => {
                 shared.bm.restore_pending_deletes(pending);
-                shared.bm.restore_dirty(snap.clone());
+                shared.bm.restore_dirty(snap);
                 shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
                 shared
                     .last_round_micros
                     .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                return Err(Error::Internal(
-                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
-                ));
-            };
-            snap_bytes.push((*guid, *seq, bytes));
-        }
-        (snap, pending, snap_bytes, Some(wal_up_to))
+                return Err(e);
+            }
+        };
+        (snap, pending, versioned_snap, Some(wal_up_to))
     } else {
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
-        let mut snap_bytes = Vec::with_capacity(snap.len());
-        for (guid, seq) in &snap {
-            let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
+        let versioned_snap = match shared.bm.snapshot_dirty_versions(&snap) {
+            Ok(versioned) => versioned,
+            Err(e) => {
                 shared.bm.restore_pending_deletes(pending);
-                shared.bm.restore_dirty(snap.clone());
+                shared.bm.restore_dirty(snap);
                 shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
                 shared
                     .last_round_micros
                     .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                return Err(Error::Internal(
-                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
-                ));
-            };
-            snap_bytes.push((*guid, *seq, bytes));
-        }
-        (snap, pending, snap_bytes, None)
+                return Err(e);
+            }
+        };
+        (snap, pending, versioned_snap, None)
     };
 
     // 3. Force the WAL watermark before data-file writes, but do
@@ -269,6 +265,30 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
                 .last_round_micros
                 .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             return Err(e);
+        }
+    }
+
+    let (snap_bytes, stale_dirty) = match clone_versioned_dirty(shared, &versioned_snap) {
+        Ok(cloned) => cloned,
+        Err(e) => {
+            shared.bm.restore_pending_deletes(pending);
+            shared.bm.restore_dirty(snap);
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            shared
+                .last_round_micros
+                .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            return Err(e);
+        }
+    };
+    if !stale_dirty.is_empty() {
+        for guid in stale_dirty.keys() {
+            snap.remove(guid);
+        }
+        shared.bm.restore_dirty(stale_dirty);
+        if !pending.is_empty() {
+            shared
+                .bm
+                .restore_pending_deletes(std::mem::take(&mut pending));
         }
     }
     let snap_count = snap.len();
@@ -355,6 +375,26 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         .last_round_micros
         .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(())
+}
+
+fn clone_versioned_dirty(
+    shared: &Arc<Shared>,
+    versioned: &[DirtySnapshotEntry],
+) -> Result<(ClonedDirtyBytes, HashMap<BlobGuid, u64>)> {
+    let mut snap_bytes = Vec::with_capacity(versioned.len());
+    let mut stale = HashMap::new();
+    for entry in versioned {
+        match shared
+            .bm
+            .snapshot_bytes_if_version(entry.guid, entry.content_version)?
+        {
+            Some(bytes) => snap_bytes.push((entry.guid, entry.expected_seq, bytes)),
+            None => {
+                stale.insert(entry.guid, entry.expected_seq);
+            }
+        }
+    }
+    Ok((snap_bytes, stale))
 }
 
 /// Candidate-driven merge pass — fold mergeable `BlobNode`

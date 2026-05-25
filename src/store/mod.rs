@@ -15,5 +15,7 @@ pub(crate) mod blob_store;
 mod buffer_manager;
 
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
-pub(crate) use buffer_manager::{BlobWriteGuard, WriteThroughEntry, STRUCTURAL_SEQ};
+pub(crate) use buffer_manager::{
+    BlobWriteGuard, DirtySnapshotEntry, WriteThroughEntry, STRUCTURAL_SEQ,
+};
 pub use buffer_manager::{BufferManager, CachedBlob};

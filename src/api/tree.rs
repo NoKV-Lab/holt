@@ -13,14 +13,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use super::stats::OpenStats;
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 use super::view::View;
-use crate::concurrency::{CommitGate, MaintenanceGate};
+use crate::concurrency::{CommitGate, EndpointLocks, MaintenanceGate};
 use crate::engine;
 use crate::engine::{KeyRangeBuilder, KeyRangeEntry, RangeBuilder};
 use crate::journal::codec::{
@@ -75,11 +75,14 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 ///
 /// ## Concurrency
 ///
-/// - **Point reads** (`get`) take the shared maintenance gate,
-///   then run against `HybridLatch::read_optimistic` — they capture
-///   each blob's latch version, read the bytes, then `validate()`.
-///   Restarts from the root on a torn read. Never blocks foreground
-///   writers and never block each other.
+/// - **Point reads** (`get`) run against
+///   `HybridLatch::read_optimistic` — they capture each blob's
+///   latch version, read the bytes, then `validate()`. Cross-blob
+///   hops revalidate the parent `BlobNode` edge under a short
+///   shared blob latch before pinning the child, so reads do not
+///   enter the tree-wide maintenance gate. Restarts from the root
+///   on a torn read. Never blocks foreground writers and never
+///   block each other.
 /// - **Range reads** (`range`, `scan`, `range_keys`,
 ///   `scan_keys`) use a versioned cursor. Each cursor frame
 ///   records the blob content version it was built from; if an
@@ -87,20 +90,22 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 ///   stack and performs a marker-aware seek from the last emitted
 ///   key / delimiter lower bound.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
-///   exclusively for the blobs they touch. Persistent trees enter
-///   the writer-shared `commit_gate` while publishing dirty state
-///   and the journal record. If `TreeConfig::wal_sync` is set,
-///   writes wait for the journal worker after leaving the gate.
+///   exclusively for the blobs they touch and lock-couple across
+///   `BlobNode` crossings. Persistent trees enter the writer-shared
+///   `commit_gate` while publishing dirty state and the journal
+///   record. If `TreeConfig::wal_sync` is set, writes wait for the
+///   journal worker after leaving the gate.
 /// - **Maintenance** (`compact`, background merge) takes short
 ///   exclusive windows on `maintenance_gate` while folding/deleting
 ///   cross-blob edges. Blob-local compaction runs on the shared
-///   side under per-blob latches. Foreground reads and writers
-///   enter the shared side around tree traversal, so ordinary
-///   operations stay mutually concurrent.
-/// - **`rename`** holds `rename_lock` (a `Mutex<()>` scoped to
-///   rename only) so its multi-step
-///   `lookup → erase → insert` appears atomic to other writers.
-///   `put` / `delete` / `get` never take `rename_lock`.
+///   side under per-blob latches. Point reads and single-key writes
+///   rely on parent/child blob latches instead of this tree-wide
+///   gate; range scans and atomic predicate preflight still enter
+///   the shared/exclusive sides.
+/// - **`rename`** locks the two endpoint shards for `src` and
+///   `dst` in canonical order so overlapping renames serialize,
+///   while disjoint endpoint pairs can run concurrently. `put` /
+///   `delete` / `get` never take these endpoint locks.
 #[derive(Clone)]
 pub struct Tree {
     cfg: TreeConfig,
@@ -115,12 +120,12 @@ pub struct Tree {
     /// the root hop. Cross-blob descents still pin children
     /// through the BM as normal.
     root_pin: Arc<CachedBlob>,
-    /// Serialises **only `rename`** — the multi-step
-    /// `lookup_multi_with(src)` + `erase_multi(src)` + `insert_multi(dst)`
-    /// must appear atomic to other writers. `put` / `delete` /
-    /// `get` never take this lock; they coordinate via the
-    /// per-blob `HybridLatch` inside the BM.
-    rename_lock: Arc<Mutex<()>>,
+    /// Serialises multi-key operations whose endpoint shards overlap. The
+    /// multi-step `lookup_multi_with(src)` + `erase_multi(src)` +
+    /// `insert_multi(dst)` must not interleave with another rename
+    /// touching either endpoint. Disjoint endpoint pairs can run
+    /// concurrently and still coordinate through per-blob latches.
+    endpoint_locks: Arc<EndpointLocks>,
     /// Parent-validated route cache for path-shaped large trees.
     /// Entries cache prefix anchors at BlobNode crossings and are
     /// validated against the parent blob's latch version before
@@ -128,15 +133,12 @@ pub struct Tree {
     route_cache: Arc<engine::RouteCache>,
     /// Tree-wide structural-maintenance gate.
     ///
-    /// Foreground read and mutation paths enter the shared side
-    /// while they may cross `BlobNode` boundaries. `compact()` and
-    /// the background merge pass enter the exclusive side only
+    /// Range and atomic predicate paths enter the shared/exclusive
+    /// sides while they may cross `BlobNode` boundaries. `compact()`
+    /// and the background merge pass enter the exclusive side only
     /// around folding a child blob back into its parent and queuing
-    /// the child for delete.
-    /// Point reads participate too: per-blob optimistic validation
-    /// handles in-place rewrites, while the maintenance gate keeps
-    /// a merge pass from deleting a child blob after a reader has
-    /// observed the parent `BlobNode` but before it pins the child.
+    /// the child for delete. Point reads and single-key writes rely
+    /// on parent/child blob latches instead of this tree-wide gate.
     maintenance_gate: Arc<MaintenanceGate>,
     /// Monotonically-increasing sequence stamped on every record.
     /// On open the tree replays the WAL and resumes at
@@ -358,7 +360,7 @@ impl Tree {
             store: bm,
             root_guid,
             root_pin,
-            rename_lock: Arc::new(Mutex::new(())),
+            endpoint_locks: Arc::new(EndpointLocks::new()),
             route_cache: Arc::new(engine::RouteCache::new()),
             maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
@@ -378,7 +380,6 @@ impl Tree {
     /// cached blobs optimistically and restarts from the root when
     /// a concurrent writer invalidates its snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         self.lookup_record_unlocked(key)
             .map(|record| record.map(|record| record.value))
     }
@@ -389,7 +390,6 @@ impl Tree {
     /// This is the preferred read before a compare-and-set update:
     /// it avoids the two-lookup `get()` + `get_version()` pattern.
     pub fn get_record(&self, key: &[u8]) -> Result<Option<Record>> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         self.lookup_record_unlocked(key)
     }
 
@@ -401,7 +401,6 @@ impl Tree {
     /// It is not an MVCC timestamp and cannot be used to read old
     /// values.
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
         engine::lookup_multi_with(
             &self.store,
@@ -485,7 +484,6 @@ impl Tree {
         value: &[u8],
         condition: engine::InsertCondition,
     ) -> Result<engine::InsertOutcome> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -577,7 +575,6 @@ impl Tree {
         key: &[u8],
         condition: engine::EraseCondition,
     ) -> Result<engine::EraseOutcome> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
         // Pre-allocate the seq before the walker descends so any
         // child blob the walker touches can `mark_dirty(child, seq)`
@@ -653,18 +650,18 @@ impl Tree {
     /// - When `force` is `true`, any existing leaf at `dst` is
     ///   overwritten.
     ///
-    /// Atomic with respect to other renames (`rename_lock` is held
-    /// for the whole sequence). Concurrent `put` / `delete` on
-    /// disjoint subtrees are not blocked. The op emits a single
-    /// `RenameObject` WAL record so its erase + insert phases
-    /// recover atomically on replay.
+    /// Atomic with respect to renames touching the same endpoint
+    /// lock shards; unrelated endpoint pairs can proceed in
+    /// parallel. Concurrent `put` / `delete` on disjoint subtrees
+    /// are not blocked. The op emits a single `RenameObject` WAL
+    /// record so its erase + insert phases recover atomically on
+    /// replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
-        let _maintenance = self.maintenance_gate.enter_shared();
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let _r = self.rename_lock.lock().unwrap();
+        let _endpoints = self.endpoint_locks.lock_pair(src, dst);
 
         // Probe src across all blobs — zero-copy via BM pin.
         let Some(value) = engine::lookup_multi_with(
@@ -2184,6 +2181,53 @@ mod tests {
         assert!(tree.delete(b"abc").unwrap());
         assert_eq!(tree.get(b"abc").unwrap(), None);
         assert_eq!(tree.get(b"abcdef").unwrap().as_deref(), Some(&b"long"[..]));
+    }
+
+    #[test]
+    fn point_get_does_not_enter_maintenance_gate() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        tree.put(b"hot/key", b"value").unwrap();
+
+        let exclusive = tree.maintenance_gate.enter_exclusive();
+        let worker_tree = tree.clone();
+        let (done_tx, done_rx) = sync_channel(0);
+        let handle = thread::spawn(move || {
+            let got = worker_tree.get(b"hot/key").unwrap();
+            done_tx.send(got).unwrap();
+        });
+
+        let got = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(exclusive);
+        handle.join().unwrap();
+        assert_eq!(got.unwrap().as_deref(), Some(&b"value"[..]));
+    }
+
+    #[test]
+    fn single_key_writes_do_not_enter_maintenance_gate() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        tree.put(b"src", b"old").unwrap();
+
+        let exclusive = tree.maintenance_gate.enter_exclusive();
+        let worker_tree = tree.clone();
+        let (done_tx, done_rx) = sync_channel(0);
+        let handle = thread::spawn(move || {
+            worker_tree.put(b"k1", b"v1").unwrap();
+            assert!(worker_tree.delete(b"src").unwrap());
+            worker_tree.put(b"rename-src", b"v2").unwrap();
+            worker_tree
+                .rename(b"rename-src", b"rename-dst", false)
+                .unwrap();
+            let k1 = worker_tree.get(b"k1").unwrap();
+            let renamed = worker_tree.get(b"rename-dst").unwrap();
+            done_tx.send((k1, renamed)).unwrap();
+        });
+
+        let got = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(exclusive);
+        handle.join().unwrap();
+        let (k1, renamed) = got.unwrap();
+        assert_eq!(k1.as_deref(), Some(&b"v1"[..]));
+        assert_eq!(renamed.as_deref(), Some(&b"v2"[..]));
     }
 
     #[test]

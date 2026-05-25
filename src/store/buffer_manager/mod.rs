@@ -164,6 +164,21 @@ pub(crate) struct WriteThroughEntry {
     pub(crate) expected_seq: u64,
 }
 
+/// Dirty blob claimed by a checkpoint round before byte cloning.
+///
+/// `content_version` is captured under `CommitGate`; later
+/// checkpoint cloning accepts the cached bytes only if the blob
+/// still carries the same latch version under a shared blob guard.
+/// If a foreground writer updates the blob first, the round restores
+/// this dirty entry and retries it later instead of writing bytes
+/// whose WAL record was outside the captured watermark.
+#[derive(Clone, Copy)]
+pub(crate) struct DirtySnapshotEntry {
+    pub(crate) guid: BlobGuid,
+    pub(crate) expected_seq: u64,
+    pub(crate) content_version: u64,
+}
+
 #[derive(Clone, Copy)]
 enum PinAccess {
     Point,
@@ -989,6 +1004,29 @@ impl BufferManager {
         out
     }
 
+    /// Capture per-blob content versions for a just-drained dirty
+    /// snapshot. Call while the caller still holds `CommitGate`,
+    /// before foreground writers can publish newer dirty state.
+    pub(crate) fn snapshot_dirty_versions(
+        &self,
+        snap: &HashMap<BlobGuid, u64>,
+    ) -> Result<Vec<DirtySnapshotEntry>> {
+        let mut out = Vec::with_capacity(snap.len());
+        for (&guid, &seq) in snap {
+            let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) else {
+                return Err(Error::Internal(
+                    "snapshot_dirty_versions: dirty entry lost cache image",
+                ));
+            };
+            out.push(DirtySnapshotEntry {
+                guid,
+                expected_seq: seq,
+                content_version: entry.content_version(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Merge `entries` back into the dirty map, preserving the
     /// per-blob `min` between any existing entry (from a concurrent
     /// writer that ran after a snapshot drained the map) and the
@@ -1214,6 +1252,33 @@ impl BufferManager {
         let mut out = self.store.alloc_blob_buf_uninit();
         out.as_mut_slice().copy_from_slice(buf.as_slice());
         Some(out)
+    }
+
+    /// Clone cached bytes only when the blob still has the
+    /// checkpoint-captured content version.
+    ///
+    /// `Ok(None)` means a newer foreground writer reached the blob
+    /// before this round could clone it; the caller should restore
+    /// the dirty entry and retry later. `Err` means the dirty entry
+    /// lost its protected cache image, which violates the flushing
+    /// protection invariant.
+    pub(crate) fn snapshot_bytes_if_version(
+        &self,
+        guid: BlobGuid,
+        content_version: u64,
+    ) -> Result<Option<AlignedBlobBuf>> {
+        let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) else {
+            return Err(Error::Internal(
+                "snapshot_bytes_if_version: dirty entry lost cache image",
+            ));
+        };
+        let buf = entry.read();
+        if entry.content_version() != content_version {
+            return Ok(None);
+        }
+        let mut out = self.store.alloc_blob_buf_uninit();
+        out.as_mut_slice().copy_from_slice(buf.as_slice());
+        Ok(Some(out))
     }
 
     /// Snapshot the latest image of `guid` whether or not it is
@@ -2136,6 +2201,37 @@ mod tests {
             bm.try_evict_cold(guid),
             "successful write-through releases flushing protection",
         );
+    }
+
+    #[test]
+    fn snapshot_bytes_if_version_rejects_stale_blob_image() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x56; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 1);
+        let pin = bm.pin(guid).unwrap();
+
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let versioned = bm.snapshot_dirty_versions(&snap).unwrap();
+        assert_eq!(versioned.len(), 1);
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0xEE;
+        }
+
+        assert!(
+            bm.snapshot_bytes_if_version(guid, versioned[0].content_version)
+                .unwrap()
+                .is_none(),
+            "checkpoint clone must reject bytes after a newer blob mutation"
+        );
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, pin.content_version())
+            .unwrap()
+            .expect("current version should clone");
+        assert_eq!(bytes.as_slice()[123], 0xEE);
     }
 
     #[test]
