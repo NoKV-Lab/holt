@@ -7,25 +7,29 @@
 //! DB-level atomic batch can commit mutations across trees in one
 //! WAL record.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::atomic::{BatchOp, RecordVersion};
 use super::config::TreeConfig;
-use super::errors::Result;
+use super::errors::{Error, Result};
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
+use crate::engine::KeyRangeEntry;
 use crate::journal::codec::BatchEncoder;
 use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
 use crate::store::BufferManager;
 
 const DB_ROOT_TAG: u8 = 0xDB;
+const DB_CATALOG_TREE_ID: u64 = 0x686f_6c74_6462_0001;
 const DB_TREE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const DB_TREE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+const CATALOG_VALUE_MAGIC: &[u8; 8] = b"holtdb01";
+const CATALOG_VALUE_LEN: usize = 16;
 
 #[derive(Clone)]
 struct OpenTree {
@@ -111,15 +115,80 @@ impl DB {
         })
     }
 
-    /// Open a named tree inside this DB.
+    /// Create a named tree inside this DB.
     ///
-    /// The name is stable across reopen: opening the same byte string
-    /// maps to the same ART root. Tree creation is lazy; the empty
-    /// root blob is written through before the handle is returned.
-    pub fn open_tree(&self, name: &str) -> Result<Tree> {
-        let tree_id = tree_id_for_name(name.as_bytes());
+    /// Creation is recorded in the internal catalog before the
+    /// handle is returned. Re-creating an existing name returns
+    /// [`Error::TreeExists`].
+    pub fn create_tree(&self, name: &str) -> Result<Tree> {
+        let name_bytes = validate_tree_name(name)?;
+        let tree_id = tree_id_for_name(name_bytes);
+        if self.catalog_lookup(name_bytes)?.is_some() {
+            return Err(Error::TreeExists {
+                name: name.to_owned(),
+            });
+        }
+
+        let committed = self.apply_atomic(vec![DBBatchOp {
+            tree_id: DB_CATALOG_TREE_ID,
+            tree_name: None,
+            op: BatchOp::PutIfAbsent {
+                key: name_bytes.to_vec(),
+                value: encode_catalog_value(tree_id).to_vec(),
+            },
+        }])?;
+        if !committed {
+            return Err(Error::TreeExists {
+                name: name.to_owned(),
+            });
+        }
         let open = self.open_tree_state(tree_id)?;
         self.tree_from_state(tree_id, open)
+    }
+
+    /// Open an existing named tree inside this DB.
+    ///
+    /// Use [`Self::open_or_create_tree`] when lazy creation is the
+    /// desired behavior.
+    pub fn open_tree(&self, name: &str) -> Result<Tree> {
+        let name_bytes = validate_tree_name(name)?;
+        let tree_id = self
+            .catalog_lookup(name_bytes)?
+            .ok_or_else(|| Error::TreeNotFound {
+                name: name.to_owned(),
+            })?;
+        let open = self.open_tree_state(tree_id)?;
+        self.tree_from_state(tree_id, open)
+    }
+
+    /// Open a named tree, creating it when the catalog has no entry.
+    pub fn open_or_create_tree(&self, name: &str) -> Result<Tree> {
+        match self.open_tree(name) {
+            Ok(tree) => Ok(tree),
+            Err(Error::TreeNotFound { .. }) => match self.create_tree(name) {
+                Ok(tree) => Ok(tree),
+                Err(Error::TreeExists { .. }) => self.open_tree(name),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Return every named tree recorded in the durable catalog.
+    pub fn list_trees(&self) -> Result<Vec<String>> {
+        let catalog = self.catalog_tree()?;
+        let mut names = Vec::new();
+        for entry in catalog.range_keys() {
+            match entry? {
+                KeyRangeEntry::Key { key, .. } => {
+                    let name = String::from_utf8(key)
+                        .map_err(|_| Error::node_corrupt("db catalog key"))?;
+                    names.push(name);
+                }
+                KeyRangeEntry::CommonPrefix(_) => {}
+            }
+        }
+        Ok(names)
     }
 
     /// Apply mutations across named trees under one WAL record.
@@ -147,10 +216,8 @@ impl DB {
     /// with an immutable [`DBView`]. Writes committed after the
     /// capture are invisible to every captured tree view.
     ///
-    /// Scopes are explicit to keep the semantic boundary honest:
-    /// `DB` has no catalog enumeration yet, so it cannot infer
-    /// "all trees" without depending on which handles happened to
-    /// be opened in this process.
+    /// Scopes are explicit so callers choose exactly which catalog
+    /// trees participate in the consistent read view.
     pub fn view<F, R>(&self, scopes: &[(&str, &[u8])], read: F) -> Result<R>
     where
         F: FnOnce(&DBView) -> Result<R>,
@@ -159,7 +226,12 @@ impl DB {
             let _maintenance = self.maintenance_gate.enter_exclusive();
             let mut trees = HashMap::with_capacity(scopes.len());
             for (name, prefix) in scopes {
-                let tree_id = tree_id_for_name(name.as_bytes());
+                let name_bytes = validate_tree_name(name)?;
+                let tree_id =
+                    self.catalog_lookup(name_bytes)?
+                        .ok_or_else(|| Error::TreeNotFound {
+                            name: (*name).to_owned(),
+                        })?;
                 let open = self.open_tree_state(tree_id)?;
                 let tree = self.tree_from_state(tree_id, open)?;
                 trees.insert(tree_id, tree.capture_view_unlocked(prefix)?);
@@ -183,23 +255,12 @@ impl DB {
         )
     }
 
-    /// Run one online maintenance pass for every tree opened by
-    /// this process.
-    ///
-    /// Without a durable tree catalog, `DB` can only enumerate
-    /// trees that have been opened through this handle. The pass
-    /// still stages all rewrites through the shared DB checkpoint
-    /// protocol.
+    /// Run one online maintenance pass for the catalog and every
+    /// named tree.
     pub fn compact(&self) -> Result<()> {
-        let trees: Vec<_> = self
-            .trees
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(tree_id, open)| (*tree_id, open.clone()))
-            .collect();
-        for (tree_id, open) in trees {
-            self.tree_from_state(tree_id, open)?.compact()?;
+        self.catalog_tree()?.compact()?;
+        for name in self.list_trees()? {
+            self.open_tree(&name)?.compact()?;
         }
         Ok(())
     }
@@ -237,7 +298,13 @@ impl DB {
             last_round_micros: ck.last_round_micros(),
         });
         DBStats {
-            open_tree_count: self.trees.lock().unwrap().len(),
+            open_tree_count: self
+                .trees
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|tree_id| **tree_id != DB_CATALOG_TREE_ID)
+                .count(),
             bm_dirty_count: self.store.dirty_count(),
             bm_pending_delete_count: self.store.pending_delete_count(),
             bm_cache_hits: self.store.cache_hits(),
@@ -260,6 +327,19 @@ impl DB {
             journal,
             checkpointer,
         }
+    }
+
+    fn catalog_tree(&self) -> Result<Tree> {
+        let open = self.open_tree_state(DB_CATALOG_TREE_ID)?;
+        self.tree_from_state(DB_CATALOG_TREE_ID, open)
+    }
+
+    fn catalog_lookup(&self, name: &[u8]) -> Result<Option<u64>> {
+        let catalog = self.catalog_tree()?;
+        catalog
+            .get(name)?
+            .map(|value| decode_catalog_value(name, &value))
+            .transpose()
     }
 
     fn open_tree_state(&self, tree_id: u64) -> Result<OpenTree> {
@@ -295,87 +375,128 @@ impl DB {
 
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_exclusive();
-        let mut groups = Vec::<DBBatchGroup>::new();
-        for item in pending {
-            let open = self.open_tree_state(item.tree_id)?;
-            match groups
-                .iter_mut()
-                .find(|group| group.tree_id == item.tree_id)
-            {
-                Some(group) => group.ops.push(item.op),
-                None => groups.push(DBBatchGroup {
-                    tree_id: item.tree_id,
-                    tree: Tree::from_shared(
-                        self.cfg.clone(),
-                        open.root_guid,
-                        item.tree_id,
-                        Arc::clone(&self.store),
-                        open.runtime,
-                        Arc::clone(&self.maintenance_gate),
-                        Arc::clone(&self.next_seq),
-                        Arc::clone(&self.commit_gate),
-                        self.journal.clone(),
-                        self.checkpointer.clone(),
-                        self.open_stats,
-                    )?,
-                    ops: vec![item.op],
-                }),
-            }
-        }
-
-        let count: u64 = groups
-            .iter()
-            .flat_map(|group| group.ops.iter())
-            .filter(|op| op.emits_wal())
-            .count()
-            .try_into()
-            .expect("batch op count fits in u64");
+        self.validate_batch_trees(&pending)?;
+        let groups = self.group_batch_ops(pending)?;
+        let count = count_wal_ops(&groups);
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
-        let mut group_base = base_seq;
-        for group in &groups {
-            if !group.tree.preflight_batch(&group.ops, group_base)? {
-                return Ok(false);
-            }
-            group_base += group.ops.iter().filter(|op| op.emits_wal()).count() as u64;
+        if !Self::preflight_batch_groups(&groups, base_seq)? {
+            return Ok(false);
         }
         if count == 0 {
             return Ok(true);
         }
 
         if let Some(journal) = &self.journal {
-            let ack = {
-                let _commit = self.commit_gate.enter_writer();
-                let mut record = journal.record_buffer(encoded_db_batch_record_len(&groups));
-                let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
-                let mut group_base = base_seq;
-                for group in &groups {
-                    group
-                        .tree
-                        .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
-                    group_base += group.ops.iter().filter(|op| op.emits_wal()).count() as u64;
-                }
-                let _n = enc.finish();
-                journal.submit(record, self.cfg.wal_sync)?
-            };
-            if let Some(ack) = ack {
-                ack.wait()?;
-            }
+            self.apply_batch_groups_with_journal(&groups, base_seq, journal)?;
         } else {
-            let mut group_base = base_seq;
-            for group in &groups {
-                group
-                    .tree
-                    .apply_batch_walker_inline(&group.ops, group_base, None)?;
-                group_base += group.ops.iter().filter(|op| op.emits_wal()).count() as u64;
-            }
-            if self.cfg.memory_flush_on_write {
-                if let Some(group) = groups.first() {
-                    group.tree.flush_dirty_inline()?;
-                    group.tree.flush_pending_deletes_inline()?;
-                }
-            }
+            self.apply_batch_groups_in_memory(&groups, base_seq)?;
         }
         Ok(true)
+    }
+
+    fn validate_batch_trees(&self, pending: &[DBBatchOp]) -> Result<()> {
+        let mut checked = HashSet::<u64>::new();
+        for item in pending {
+            if item.tree_id == DB_CATALOG_TREE_ID || checked.contains(&item.tree_id) {
+                continue;
+            }
+            let name = item
+                .tree_name
+                .as_deref()
+                .ok_or(Error::Internal("DB batch missing tree name"))?;
+            if name.is_empty() {
+                return Err(Error::InvalidTreeName { reason: "empty" });
+            }
+            match self.catalog_lookup(name)? {
+                Some(id) if id == item.tree_id => {}
+                Some(_) => return Err(Error::node_corrupt("db catalog tree id mismatch")),
+                None => {
+                    return Err(Error::TreeNotFound {
+                        name: String::from_utf8_lossy(name).into_owned(),
+                    });
+                }
+            }
+            checked.insert(item.tree_id);
+        }
+        Ok(())
+    }
+
+    fn group_batch_ops(&self, pending: Vec<DBBatchOp>) -> Result<Vec<DBBatchGroup>> {
+        let mut groups = Vec::<DBBatchGroup>::new();
+        for item in pending {
+            self.push_batch_op(&mut groups, item)?;
+        }
+        Ok(groups)
+    }
+
+    fn push_batch_op(&self, groups: &mut Vec<DBBatchGroup>, item: DBBatchOp) -> Result<()> {
+        let open = self.open_tree_state(item.tree_id)?;
+        match groups
+            .iter_mut()
+            .find(|group| group.tree_id == item.tree_id)
+        {
+            Some(group) => group.ops.push(item.op),
+            None => groups.push(DBBatchGroup {
+                tree_id: item.tree_id,
+                tree: self.tree_from_state(item.tree_id, open)?,
+                ops: vec![item.op],
+            }),
+        }
+        Ok(())
+    }
+
+    fn preflight_batch_groups(groups: &[DBBatchGroup], base_seq: u64) -> Result<bool> {
+        let mut group_base = base_seq;
+        for group in groups {
+            if !group.tree.preflight_batch(&group.ops, group_base)? {
+                return Ok(false);
+            }
+            group_base += count_group_wal_ops(group);
+        }
+        Ok(true)
+    }
+
+    fn apply_batch_groups_with_journal(
+        &self,
+        groups: &[DBBatchGroup],
+        base_seq: u64,
+        journal: &Arc<Journal>,
+    ) -> Result<()> {
+        let ack = {
+            let _commit = self.commit_gate.enter_writer();
+            let mut record = journal.record_buffer(encoded_db_batch_record_len(groups));
+            let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
+            let mut group_base = base_seq;
+            for group in groups {
+                group
+                    .tree
+                    .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
+                group_base += count_group_wal_ops(group);
+            }
+            let _n = enc.finish();
+            journal.submit(record, self.cfg.wal_sync)?
+        };
+        if let Some(ack) = ack {
+            ack.wait()?;
+        }
+        Ok(())
+    }
+
+    fn apply_batch_groups_in_memory(&self, groups: &[DBBatchGroup], base_seq: u64) -> Result<()> {
+        let mut group_base = base_seq;
+        for group in groups {
+            group
+                .tree
+                .apply_batch_walker_inline(&group.ops, group_base, None)?;
+            group_base += count_group_wal_ops(group);
+        }
+        if self.cfg.memory_flush_on_write {
+            if let Some(group) = groups.first() {
+                group.tree.flush_dirty_inline()?;
+                group.tree.flush_pending_deletes_inline()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -419,6 +540,7 @@ struct DBBatchGroup {
 #[derive(Debug)]
 struct DBBatchOp {
     tree_id: u64,
+    tree_name: Option<Vec<u8>>,
     op: BatchOp,
 }
 
@@ -531,6 +653,7 @@ impl DBAtomicBatch {
     fn push(&mut self, tree: &str, op: BatchOp) {
         self.pending.push(DBBatchOp {
             tree_id: tree_id_for_name(tree.as_bytes()),
+            tree_name: Some(tree.as_bytes().to_vec()),
             op,
         });
     }
@@ -557,14 +680,22 @@ fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
     len + crate::journal::codec::RECORD_FOOTER_SIZE
 }
 
+fn count_wal_ops(groups: &[DBBatchGroup]) -> u64 {
+    groups.iter().map(count_group_wal_ops).sum::<u64>()
+}
+
+fn count_group_wal_ops(group: &DBBatchGroup) -> u64 {
+    group.ops.iter().filter(|op| op.emits_wal()).count() as u64
+}
+
 fn tree_id_for_name(name: &[u8]) -> u64 {
     let mut h = DB_TREE_HASH_OFFSET;
     for byte in name {
         h ^= u64::from(*byte);
         h = h.wrapping_mul(DB_TREE_HASH_PRIME);
     }
-    if h == 0 {
-        1
+    if h == 0 || h == DB_CATALOG_TREE_ID {
+        h ^ DB_TREE_HASH_PRIME
     } else {
         h
     }
@@ -576,4 +707,33 @@ fn root_guid_for_tree_id(tree_id: u64) -> BlobGuid {
     guid[8..15].copy_from_slice(b"holt-db");
     guid[15] = DB_ROOT_TAG;
     guid
+}
+
+fn validate_tree_name(name: &str) -> Result<&[u8]> {
+    if name.is_empty() {
+        return Err(Error::InvalidTreeName { reason: "empty" });
+    }
+    Ok(name.as_bytes())
+}
+
+fn encode_catalog_value(tree_id: u64) -> [u8; CATALOG_VALUE_LEN] {
+    let mut out = [0u8; CATALOG_VALUE_LEN];
+    out[..CATALOG_VALUE_MAGIC.len()].copy_from_slice(CATALOG_VALUE_MAGIC);
+    out[CATALOG_VALUE_MAGIC.len()..].copy_from_slice(&tree_id.to_le_bytes());
+    out
+}
+
+fn decode_catalog_value(name: &[u8], value: &[u8]) -> Result<u64> {
+    if value.len() != CATALOG_VALUE_LEN
+        || &value[..CATALOG_VALUE_MAGIC.len()] != CATALOG_VALUE_MAGIC
+    {
+        return Err(Error::node_corrupt("db catalog value"));
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&value[CATALOG_VALUE_MAGIC.len()..]);
+    let tree_id = u64::from_le_bytes(raw);
+    if tree_id == 0 || tree_id == DB_CATALOG_TREE_ID || tree_id != tree_id_for_name(name) {
+        return Err(Error::node_corrupt("db catalog tree id"));
+    }
+    Ok(tree_id)
 }

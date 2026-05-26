@@ -43,8 +43,8 @@ fn db_named_trees_replay_from_one_wal() {
     let dir = tempdir().unwrap();
     {
         let db = DB::open(durable_cfg(dir.path())).unwrap();
-        let objects = db.open_tree("objects").unwrap();
-        let inodes = db.open_tree("inodes").unwrap();
+        let objects = db.create_tree("objects").unwrap();
+        let inodes = db.create_tree("inodes").unwrap();
 
         objects.put(b"same/key", b"object").unwrap();
         inodes.put(b"same/key", b"inode").unwrap();
@@ -60,6 +60,7 @@ fn db_named_trees_replay_from_one_wal() {
         let db = DB::open(durable_cfg(dir.path())).unwrap();
         let objects = db.open_tree("objects").unwrap();
         let inodes = db.open_tree("inodes").unwrap();
+        assert_eq!(db.list_trees().unwrap(), vec!["inodes", "objects"]);
 
         assert_eq!(
             objects.get(b"same/key").unwrap().as_deref(),
@@ -85,6 +86,8 @@ fn db_checkpoint_flushes_replayed_multi_tree_without_tree_handles() {
     let dir = tempdir().unwrap();
     {
         let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let _objects = db.create_tree("objects").unwrap();
+        let _inodes = db.create_tree("inodes").unwrap();
         assert!(db
             .atomic(|batch| {
                 batch.put("objects", b"bucket/a.jpg", b"etag-a");

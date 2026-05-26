@@ -84,6 +84,21 @@ pub enum Error {
     /// already has a leaf. Caller can retry with `force=true` to
     /// overwrite.
     DstExists,
+    /// A named DB tree was requested but no catalog entry exists.
+    TreeNotFound {
+        /// Requested tree name.
+        name: String,
+    },
+    /// A named DB tree create was requested for an existing tree.
+    TreeExists {
+        /// Existing tree name.
+        name: String,
+    },
+    /// A named DB tree name is invalid.
+    InvalidTreeName {
+        /// Static reason.
+        reason: &'static str,
+    },
     /// A scoped [`crate::View`] read tried to access a key or range
     /// prefix outside the subtree captured when the view was opened.
     OutsideViewScope {
@@ -178,6 +193,9 @@ impl std::fmt::Display for Error {
                 f,
                 "destination key already exists (use force=true to overwrite)"
             ),
+            Self::TreeNotFound { name } => write!(f, "DB tree not found: {name}"),
+            Self::TreeExists { name } => write!(f, "DB tree already exists: {name}"),
+            Self::InvalidTreeName { reason } => write!(f, "invalid DB tree name: {reason}"),
             Self::OutsideViewScope {
                 requested_len,
                 scope_len,
@@ -271,6 +289,24 @@ mod tests {
                 Error::DstExists.to_string(),
                 "destination key already exists (use force=true to overwrite)",
             ),
+            (
+                Error::TreeNotFound {
+                    name: "objects".to_owned(),
+                }
+                .to_string(),
+                "DB tree not found: objects",
+            ),
+            (
+                Error::TreeExists {
+                    name: "objects".to_owned(),
+                }
+                .to_string(),
+                "DB tree already exists: objects",
+            ),
+            (
+                Error::InvalidTreeName { reason: "empty" }.to_string(),
+                "invalid DB tree name: empty",
+            ),
         ];
 
         for (actual, expected) in cases {
@@ -296,5 +332,8 @@ mod tests {
 
         assert!(Error::NotFound.source().is_none());
         assert!(Error::DstExists.source().is_none());
+        assert!(Error::InvalidTreeName { reason: "empty" }
+            .source()
+            .is_none());
     }
 }

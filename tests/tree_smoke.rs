@@ -57,8 +57,12 @@ fn checkpoint_is_idempotent_on_memory_store() {
 #[test]
 fn db_named_trees_are_isolated_but_share_handles() {
     let db = DB::open(TreeConfig::memory()).unwrap();
-    let objects = db.open_tree("objects").unwrap();
-    let inodes = db.open_tree("inodes").unwrap();
+    let objects = db.create_tree("objects").unwrap();
+    let inodes = db.create_tree("inodes").unwrap();
+    assert!(matches!(
+        db.create_tree("objects"),
+        Err(holt::Error::TreeExists { .. })
+    ));
 
     objects.put(b"same/key", b"object").unwrap();
     inodes.put(b"same/key", b"inode").unwrap();
@@ -77,13 +81,35 @@ fn db_named_trees_are_isolated_but_share_handles() {
         objects_again.get(b"same/key").unwrap().as_deref(),
         Some(&b"object"[..])
     );
+    assert_eq!(db.list_trees().unwrap(), vec!["inodes", "objects"]);
+    assert!(matches!(
+        db.open_tree("missing"),
+        Err(holt::Error::TreeNotFound { .. })
+    ));
+    let lazy = db.open_or_create_tree("lazy").unwrap();
+    lazy.put(b"k", b"v").unwrap();
+    assert_eq!(
+        db.open_or_create_tree("lazy")
+            .unwrap()
+            .get(b"k")
+            .unwrap()
+            .as_deref(),
+        Some(&b"v"[..])
+    );
 }
 
 #[test]
 fn db_atomic_commits_and_aborts_across_trees() {
     let db = DB::open(TreeConfig::memory()).unwrap();
-    let default = db.open_tree("mvcc/default").unwrap();
-    let lock = db.open_tree("mvcc/lock").unwrap();
+    let default = db.create_tree("mvcc/default").unwrap();
+    let lock = db.create_tree("mvcc/lock").unwrap();
+
+    assert!(matches!(
+        db.atomic(|batch| {
+            batch.put("missing", b"k", b"v");
+        }),
+        Err(holt::Error::TreeNotFound { .. })
+    ));
 
     assert!(db
         .atomic(|batch| {
@@ -116,8 +142,8 @@ fn db_atomic_commits_and_aborts_across_trees() {
 #[test]
 fn db_view_captures_explicit_tree_scopes() {
     let db = DB::open(TreeConfig::memory()).unwrap();
-    let objects = db.open_tree("objects").unwrap();
-    let inodes = db.open_tree("inodes").unwrap();
+    let objects = db.create_tree("objects").unwrap();
+    let inodes = db.create_tree("inodes").unwrap();
 
     objects.put(b"tenant-a/file", b"old-object").unwrap();
     objects.put(b"tenant-b/file", b"outside-scope").unwrap();
@@ -155,8 +181,8 @@ fn db_stats_reports_shared_resources() {
     let db = DB::open(TreeConfig::memory()).unwrap();
     assert_eq!(db.stats().open_tree_count, 0);
 
-    let objects = db.open_tree("objects").unwrap();
-    let inodes = db.open_tree("inodes").unwrap();
+    let objects = db.create_tree("objects").unwrap();
+    let inodes = db.create_tree("inodes").unwrap();
     objects.put(b"bucket/a", b"etag").unwrap();
     inodes.put(b"42", b"mode").unwrap();
 

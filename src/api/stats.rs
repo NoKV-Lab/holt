@@ -249,8 +249,7 @@ impl TreeStats {
 ///
 /// These counters describe shared resources owned by a multi-tree
 /// `DB`, not any one ART root. Per-tree shape counters still live in
-/// [`TreeStats`] because shape is root-specific until a durable tree
-/// catalog exists.
+/// [`TreeStats`] because shape is root-specific.
 #[derive(Debug, Clone)]
 pub struct DBStats {
     /// Number of named trees opened by this process.
