@@ -127,6 +127,7 @@ fn db_drop_tree_survives_checkpoint_and_reopen() {
         db.checkpoint().unwrap();
 
         db.drop_tree("objects").unwrap();
+        drop(objects);
         db.checkpoint().unwrap();
     }
 

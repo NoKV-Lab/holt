@@ -1588,10 +1588,16 @@ impl Tree {
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, seq) in pending {
-            if let Err(e) = self.store.execute_pending_delete(guid) {
-                failed.insert(guid, seq);
-                if first_err.is_none() {
-                    first_err = Some(e);
+            match self.store.execute_pending_delete(guid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    failed.insert(guid, seq);
+                }
+                Err(e) => {
+                    failed.insert(guid, seq);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
             }
         }
@@ -1857,9 +1863,15 @@ impl Tree {
         let mut failed = CheckpointMap::new();
         let mut first_err = None;
         for (guid, seq) in snap_pending {
-            if let Err(e) = store.execute_pending_delete(*guid) {
-                failed.insert(*guid, *seq);
-                first_err.get_or_insert(e);
+            match store.execute_pending_delete(*guid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    failed.insert(*guid, *seq);
+                }
+                Err(e) => {
+                    failed.insert(*guid, *seq);
+                    first_err.get_or_insert(e);
+                }
             }
         }
         PendingDeleteOutcome { failed, first_err }

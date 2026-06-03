@@ -19,6 +19,11 @@ pub(super) struct MutationState {
     /// store manifest because WAL/checkpoint ordering still owns
     /// them.
     pub(super) pending_deletes: HashMap<BlobGuid, u64>,
+    /// Pending deletes claimed by a checkpoint epoch but not yet
+    /// completed. This keeps the delete fence visible while I/O is
+    /// in flight, so stale walkers cannot reload or dirty a blob
+    /// that has already been logically unlinked.
+    pub(super) deleting: HashMap<BlobGuid, u64>,
     /// In-memory maintenance hints for blobs whose local garbage
     /// is worth checking before the next online compact pass.
     ///
@@ -37,7 +42,7 @@ impl MutationState {
     }
 
     pub(super) fn is_protected_or_pending(&self, guid: &BlobGuid) -> bool {
-        self.is_protected(guid) || self.pending_deletes.contains_key(guid)
+        self.is_protected(guid) || self.has_delete_fence(guid)
     }
 
     pub(super) fn remove_dirty(&mut self, guid: &BlobGuid) {
@@ -60,6 +65,10 @@ impl MutationState {
                 self.flushing.remove(guid);
             }
         }
+    }
+
+    pub(super) fn has_delete_fence(&self, guid: &BlobGuid) -> bool {
+        self.pending_deletes.contains_key(guid) || self.deleting.contains_key(guid)
     }
 
     pub(super) fn remove_maintenance_candidates(&mut self, guid: &BlobGuid) -> (bool, bool) {

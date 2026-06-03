@@ -284,6 +284,7 @@ fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
         range_before_drop.next(),
         Some(Err(holt::Error::TreeDropped))
     ));
+    drop(range_before_drop);
     assert!(matches!(
         objects.range_keys().into_iter().next(),
         Some(Err(holt::Error::TreeDropped))
@@ -301,6 +302,7 @@ fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
         Err(holt::Error::TreeExists { .. })
     ));
 
+    drop(objects);
     db.checkpoint().unwrap();
     let recreated = db.create_tree("objects").unwrap();
     assert!(recreated.get(b"bucket/a").unwrap().is_none());

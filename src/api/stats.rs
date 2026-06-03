@@ -112,11 +112,9 @@ pub struct TreeStats {
     /// checkpoint cadence; without it, it tracks the user's
     /// explicit `Tree::checkpoint` schedule.
     pub bm_dirty_count: usize,
-    /// Number of blobs queued for deferred store deletion —
-    /// children unlinked by an erase walker's `SubtreeGone` path
-    /// or by a merge pass, waiting for the next checkpoint round
-    /// (or `Tree::checkpoint`) to issue the actual
-    /// `store.delete_blob` + manifest re-sync.
+    /// Number of blobs fenced for deferred store deletion. Includes
+    /// queued deletes and deletes already claimed by a checkpoint
+    /// epoch but not yet completed.
     pub bm_pending_delete_count: usize,
     /// Cumulative cache lookups served from BM cache without
     /// going to the inner store. Read by external observers to
@@ -167,7 +165,7 @@ pub struct TreeStats {
     /// background eviction sweep.
     pub bm_cache_evictions: u64,
     /// Eviction candidates skipped because dirty / flushing /
-    /// pending-delete bookkeeping protected them.
+    /// delete-fence bookkeeping protected them.
     pub bm_eviction_skips_protected: u64,
     /// Eviction candidates skipped because they are route-resident
     /// anchor blobs.

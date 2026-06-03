@@ -238,8 +238,9 @@ impl DB {
     ///
     /// The catalog tombstone is hidden from [`Self::list_trees`] and
     /// from [`Self::open_tree`]. Existing handles are fenced before
-    /// this call returns, and a later [`Self::checkpoint`] completes
-    /// the physical cleanup.
+    /// this call returns. Physical cleanup completes in a later
+    /// [`Self::checkpoint`] after old handles/iterators have dropped
+    /// their cached root pins.
     pub fn drop_tree(&self, name: &str) -> Result<()> {
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();

@@ -42,7 +42,10 @@
 //! Erase ops that empty a child blob queue a deferred deletion
 //! via [`BufferManager::mark_for_delete`] — the `store.delete_blob`
 //! syscall runs only after the corresponding WAL record is on
-//! disk.
+//! disk. A checkpoint round moves queued deletes into an in-flight
+//! delete-fence state while the I/O worker owns them; the fence
+//! still hides the blob from stale pins until the manifest delete
+//! has completed or the round restores the work.
 //!
 //! Invariants:
 //!
@@ -53,8 +56,9 @@
 //! - **I3**: [`BufferManager::snapshot_dirty`] drains the map
 //!   atomically, so `mark_dirty` calls that race with a checkpoint
 //!   round land in the new (empty) map and are tracked for the
-//!   next round. [`BufferManager::snapshot_pending_deletes`] has
-//!   the same drain semantics.
+//!   next round. [`BufferManager::snapshot_pending_deletes`]
+//!   drains queued work into an in-flight delete fence rather than
+//!   making the blob visible again.
 //! - **W2D**: any byte written to `store.data_file` or any
 //!   manifest mutation persisted to disk must have its
 //!   corresponding WAL record durably on disk first.
@@ -229,7 +233,7 @@ pub struct BufferManager {
     /// one short critical section with no global dirty mutex on the
     /// persistent write hot path.
     mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
-    pending_delete_total: AtomicUsize,
+    delete_fence_total: AtomicUsize,
     /// Rotating shard cursors for advisory maintenance queues.
     /// Without this, a fixed shard-0-first drain can starve later
     /// shards when online maintenance has a small per-call budget.
@@ -289,7 +293,7 @@ impl BufferManager {
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
-            pending_delete_total: AtomicUsize::new(0),
+            delete_fence_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
             merge_candidate_cursor: AtomicUsize::new(0),
             compact_candidate_total: AtomicUsize::new(0),
@@ -568,14 +572,13 @@ impl BufferManager {
     }
 
     fn is_pending_delete(&self, guid: BlobGuid) -> bool {
-        if self.pending_delete_total.load(Ordering::Acquire) == 0 {
+        if self.delete_fence_total.load(Ordering::Acquire) == 0 {
             return false;
         }
         self.mutation_shard(guid)
             .lock()
             .unwrap()
-            .pending_deletes
-            .contains_key(&guid)
+            .has_delete_fence(&guid)
     }
 
     fn pending_delete_not_found(guid: BlobGuid) -> Error {
@@ -893,7 +896,7 @@ impl BufferManager {
         };
         let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        if state.pending_deletes.contains_key(&guid) {
+        if state.has_delete_fence(&guid) {
             cached.clear_dirty_hint();
             return;
         }
@@ -937,7 +940,7 @@ impl BufferManager {
             }
             let snap = std::mem::take(&mut state.dirty);
             for (guid, seq) in snap {
-                if state.pending_deletes.contains_key(&guid) {
+                if state.has_delete_fence(&guid) {
                     if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
                         entry.clear_dirty_hint();
                     }
@@ -991,7 +994,7 @@ impl BufferManager {
                 let _ = entry.dirty_hint_needs_map_publish(t);
             }
             let mut state = self.mutation_shard(guid).lock().unwrap();
-            if state.pending_deletes.contains_key(&guid) {
+            if state.has_delete_fence(&guid) {
                 if let Some(entry) = cached {
                     entry.clear_dirty_hint();
                 }
@@ -1054,6 +1057,15 @@ impl BufferManager {
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, seq: u64) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
+        if let Some(seq_ref) = state.deleting.get_mut(&guid) {
+            *seq_ref = (*seq_ref).min(seq);
+            state.remove_unclaimed_dirty(&guid);
+            let removed = state.remove_maintenance_candidates(&guid);
+            drop(state);
+            self.route_resident.remove(guid);
+            self.decrement_candidate_totals(removed);
+            return;
+        }
         match state.pending_deletes.entry(guid) {
             Entry::Occupied(mut entry) => {
                 let cur = entry.get_mut();
@@ -1061,7 +1073,7 @@ impl BufferManager {
             }
             Entry::Vacant(entry) => {
                 entry.insert(seq);
-                self.pending_delete_total.fetch_add(1, Ordering::AcqRel);
+                self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
             }
         }
         let keep_cached_for_flushing = state.flushing.contains_key(&guid);
@@ -1074,7 +1086,11 @@ impl BufferManager {
             if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
                 entry.clear_dirty_hint();
             }
-        } else if let Some((_, entry)) = self.cache.remove(&guid) {
+        } else if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+            Arc::strong_count(entry) == 1
+        }) {
+            entry.clear_dirty_hint();
+        } else if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
             entry.clear_dirty_hint();
         }
     }
@@ -1090,9 +1106,12 @@ impl BufferManager {
         for shard in &self.mutation {
             let mut state = shard.lock().unwrap();
             let pending = std::mem::take(&mut state.pending_deletes);
-            let count = pending.len();
-            if count != 0 {
-                self.pending_delete_total.fetch_sub(count, Ordering::AcqRel);
+            for (guid, seq) in &pending {
+                state
+                    .deleting
+                    .entry(*guid)
+                    .and_modify(|cur| *cur = (*cur).min(*seq))
+                    .or_insert(*seq);
             }
             out.extend(pending);
         }
@@ -1107,25 +1126,34 @@ impl BufferManager {
         }
         for (g, t) in entries {
             let mut state = self.mutation_shard(g).lock().unwrap();
+            let mut seq = t;
+            let had_fence = state.has_delete_fence(&g);
+            if let Some(claimed) = state.deleting.remove(&g) {
+                seq = seq.min(claimed);
+            }
             match state.pending_deletes.entry(g) {
                 Entry::Occupied(mut entry) => {
                     let cur = entry.get_mut();
-                    *cur = (*cur).min(t);
+                    *cur = (*cur).min(seq);
                 }
                 Entry::Vacant(entry) => {
-                    entry.insert(t);
-                    self.pending_delete_total.fetch_add(1, Ordering::AcqRel);
+                    entry.insert(seq);
+                    if !had_fence {
+                        self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
+                    }
                 }
             }
         }
     }
 
-    /// Number of blobs waiting for deferred store deletion.
+    /// Number of blobs fenced for deferred store deletion. Counts
+    /// queued deletes plus checkpoint-claimed deletes still in
+    /// flight.
     /// Reads as zero under the WAL-truncate gate are part of the
     /// "WAL records are all redundant" invariant.
     #[must_use]
     pub fn pending_delete_count(&self) -> usize {
-        self.pending_delete_total.load(Ordering::Acquire)
+        self.delete_fence_total.load(Ordering::Acquire)
     }
 
     // ---------- online-maintenance candidates ----------
@@ -1138,7 +1166,7 @@ impl BufferManager {
     /// correctness and eviction safety.
     pub(crate) fn note_compaction_candidate(&self, guid: BlobGuid) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        if !state.pending_deletes.contains_key(&guid) && state.compact_candidates.insert(guid) {
+        if !state.has_delete_fence(&guid) && state.compact_candidates.insert(guid) {
             self.compact_candidate_total.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1146,7 +1174,7 @@ impl BufferManager {
     /// Mark `guid` as a parent-merge candidate.
     pub(crate) fn note_merge_candidate(&self, guid: BlobGuid) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        if !state.pending_deletes.contains_key(&guid) && state.merge_candidates.insert(guid) {
+        if !state.has_delete_fence(&guid) && state.merge_candidates.insert(guid) {
             self.merge_candidate_total.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1194,15 +1222,35 @@ impl BufferManager {
 
     /// Execute a queued deletion against the inner store.
     /// Manifest mutation is in-memory; subsequent `store.flush`
-    /// makes it durable. Failure is the caller's restoration
-    /// concern.
-    pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<()> {
-        self.store.delete_blob(guid)?;
-        if let Some((_, entry)) = self.cache.remove(&guid) {
-            entry.clear_dirty_hint();
+    /// makes it durable. Returns `Ok(false)` when the blob still
+    /// has dirty/flushing state and the caller should requeue the
+    /// delete for a later round.
+    pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<bool> {
+        {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.is_protected(&guid) {
+                return Ok(false);
+            }
         }
+        if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+            Arc::strong_count(entry) == 1
+        }) {
+            entry.clear_dirty_hint();
+        } else if self.cache.contains_key(&guid) {
+            return Ok(false);
+        }
+        self.store.delete_blob(guid)?;
         self.route_resident.remove(guid);
-        Ok(())
+        self.finish_pending_delete(guid);
+        Ok(true)
+    }
+
+    fn finish_pending_delete(&self, guid: BlobGuid) {
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        let had_claim = state.deleting.remove(&guid).is_some();
+        if had_claim && !state.pending_deletes.contains_key(&guid) {
+            self.delete_fence_total.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// `true` iff the inner store currently knows `guid`.
@@ -1301,10 +1349,10 @@ impl BufferManager {
     }
 
     /// Push a whole checkpoint snapshot to the inner store using
-    /// its native batch path, then retire each matching flushing
-    /// entry. On store error the caller must restore the whole
-    /// dirty snapshot; we intentionally retire nothing because the
-    /// store contract permits an arbitrary written prefix.
+    /// its native batch path, then retire written flushing entries.
+    /// Stale entries are reported to the caller and must be restored
+    /// through [`Self::restore_dirty`], which retires that epoch's
+    /// flushing reference exactly once.
     pub(crate) fn write_through_batch(
         &self,
         entries: &[WriteThroughEntry],
@@ -1336,11 +1384,6 @@ impl BufferManager {
             self.retire_write_through(entry.guid, entry.expected_seq);
             statuses[idx] = WriteThroughStatus::Written;
         }
-        for (idx, entry) in entries.iter().enumerate() {
-            if statuses[idx] == WriteThroughStatus::Stale {
-                self.retire_write_through(entry.guid, entry.expected_seq);
-            }
-        }
         Ok(WriteThroughBatchReport { statuses })
     }
 
@@ -1361,10 +1404,11 @@ impl BufferManager {
         if expected_seq != STRUCTURAL_SEQ {
             if let std::collections::hash_map::Entry::Occupied(e) = state.dirty.entry(guid) {
                 // Only retire the entry when no racing writer has
-                // bumped it. `mark_dirty` keeps the **minimum**
-                // unflushed seq, so a survivor here has a seq newer
-                // than ours iff a racer landed after we drained.
-                if *e.get() == expected_seq {
+                // bumped it past this snapshot. `mark_dirty` keeps
+                // the **minimum** unflushed seq; a lower/equal seq is
+                // covered by this durable full-blob image, while a
+                // higher seq belongs to a newer writer and must stay.
+                if *e.get() <= expected_seq {
                     e.remove();
                 }
             }
@@ -1434,6 +1478,9 @@ impl BufferManager {
 
 impl BlobStore for BufferManager {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         // Cache hit?
         if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Point) {
             let buf = entry.read();
@@ -1442,11 +1489,17 @@ impl BlobStore for BufferManager {
         }
         // Cache miss — load from inner store and cache.
         self.store.read_blob(guid, dst)?;
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         self.insert_into_cache(guid, dst);
         Ok(())
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
         // store in the same call so durability is unchanged.
@@ -1468,6 +1521,11 @@ impl BlobStore for BufferManager {
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        for (guid, _) in writes {
+            if self.is_pending_delete(*guid) {
+                return Err(Self::pending_delete_not_found(*guid));
+            }
+        }
         for (guid, src) in writes {
             if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
                 let mut buf = entry.write();
@@ -1487,6 +1545,9 @@ impl BlobStore for BufferManager {
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         self.evict_from_cache(guid);
         self.store.delete_blob(guid)
     }
@@ -1999,13 +2060,83 @@ mod tests {
 
         let pending = bm.snapshot_pending_deletes();
         assert_eq!(pending.get(&guid), Some(&10));
-        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(
+            bm.pending_delete_count(),
+            1,
+            "claimed deletes remain fenced while the I/O worker owns them",
+        );
 
         bm.restore_pending_deletes(pending);
         assert_eq!(bm.pending_delete_count(), 1);
         let pending = bm.snapshot_pending_deletes();
         assert_eq!(pending.get(&guid), Some(&10));
+        assert_eq!(bm.pending_delete_count(), 1);
+    }
+
+    #[test]
+    fn claimed_pending_delete_still_hides_blob_from_stale_pins() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5A; 16];
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+
+        bm.mark_for_delete(guid, 10);
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&10));
+        assert!(inner.has_blob(guid).unwrap());
+        assert!(!bm.has_blob(guid).unwrap());
+        assert!(
+            bm.pin(guid).is_err(),
+            "a claimed delete must keep stale walkers from reloading the blob",
+        );
+        let mut dst = AlignedBlobBuf::zeroed();
+        assert!(
+            bm.read_blob(guid, &mut dst).is_err(),
+            "BlobStore reads must obey the same delete fence as pin()",
+        );
+        bm.mark_dirty(guid, 11);
+        assert_eq!(bm.dirty_count(), 0);
+        assert!(bm.write_blob(guid, &make_buf(9)).is_err());
+        assert!(bm.delete_blob(guid).is_err());
+
+        assert!(bm.execute_pending_delete(guid).unwrap());
         assert_eq!(bm.pending_delete_count(), 0);
+        assert!(!inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn pending_delete_defers_until_existing_pin_drops() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5C; 16];
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+        let pin = bm.pin(guid).unwrap();
+
+        bm.mark_for_delete(guid, 10);
+        let pending = bm.snapshot_pending_deletes();
+        assert!(
+            !bm.execute_pending_delete(guid).unwrap(),
+            "delete must wait while an old walker still holds a cached blob pin",
+        );
+        bm.restore_pending_deletes(pending);
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x66;
+        }
+        bm.mark_dirty_cached(guid, 11, pin.as_ref());
+        assert_eq!(
+            bm.dirty_count(),
+            0,
+            "existing pins must not publish orphan dirty state while delete-fenced",
+        );
+        drop(pin);
+
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&10));
+        assert!(bm.execute_pending_delete(guid).unwrap());
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert!(!inner.has_blob(guid).unwrap());
     }
 
     #[test]
@@ -2357,6 +2488,7 @@ mod tests {
             }])
             .unwrap();
         assert_eq!(first_report.statuses, vec![WriteThroughStatus::Stale]);
+        bm.restore_dirty(first);
         assert!(
             !bm.try_evict_cold(guid),
             "second in-flight epoch must keep the blob cached after first retire",
@@ -2435,6 +2567,54 @@ mod tests {
             0x33,
             "checkpoint write-through must preserve the durable image until delete applies",
         );
+    }
+
+    #[test]
+    fn execute_pending_delete_defers_while_blob_is_flushing() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5B; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x44;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .unwrap();
+        drop(pin);
+
+        bm.mark_for_delete(guid, 20);
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&20));
+        assert!(
+            !bm.execute_pending_delete(guid).unwrap(),
+            "delete must wait for the in-flight checkpoint image to retire",
+        );
+        assert!(inner.has_blob(guid).unwrap());
+        bm.restore_pending_deletes(pending);
+        assert_eq!(bm.pending_delete_count(), 1);
+
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 10,
+                content_version: Some(version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Written]);
+        let pending = bm.snapshot_pending_deletes();
+        assert!(bm.execute_pending_delete(guid).unwrap());
+        assert!(!inner.has_blob(guid).unwrap());
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(pending.get(&guid), Some(&20));
     }
 
     #[test]

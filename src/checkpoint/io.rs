@@ -91,6 +91,12 @@ struct BatchWriteReport {
     deferred: bool,
 }
 
+struct PendingDeleteReport {
+    per_epoch_failed: Vec<HashMap<BlobGuid, u64>>,
+    per_epoch_first_err: Vec<Option<Error>>,
+    applied_total: usize,
+}
+
 const EPOCH_COALESCE_WINDOW: Duration = Duration::from_micros(100);
 const MAX_COALESCED_EPOCHS: usize = 64;
 
@@ -203,30 +209,10 @@ fn commit_epoch_batch(
         }
     };
 
-    let mut per_epoch_failed = Vec::with_capacity(epochs.len());
-    let mut per_epoch_first_err = Vec::with_capacity(epochs.len());
-    let mut applied_total = 0usize;
-    for epoch in epochs.iter() {
-        let mut pending_failed = HashMap::new();
-        let mut first_pending_err = None;
-        for (guid, seq) in &epoch.pending {
-            if let Err(e) = shared.bm.execute_pending_delete(*guid) {
-                pending_failed.insert(*guid, *seq);
-                if first_pending_err.is_none() {
-                    first_pending_err = Some(e);
-                }
-            }
-        }
-        applied_total += epoch.pending.len() - pending_failed.len();
-        if !pending_failed.is_empty() {
-            shared.bm.restore_pending_deletes(pending_failed.clone());
-        }
-        per_epoch_failed.push(pending_failed);
-        per_epoch_first_err.push(first_pending_err);
-    }
-    if applied_total > 0 {
+    let pending_report = apply_pending_deletes(shared, epochs);
+    if pending_report.applied_total > 0 {
         if let Err(e) = shared.bm.flush_inner() {
-            restore_applied_pending(shared, epochs, &per_epoch_failed);
+            restore_applied_pending(shared, epochs, &pending_report.per_epoch_failed);
             return reports_with_error(&progresses, dirty_flushed_by_epoch, e);
         }
     }
@@ -235,8 +221,8 @@ fn commit_epoch_batch(
         .iter()
         .zip(progresses)
         .zip(dirty_flushed_by_epoch)
-        .zip(per_epoch_failed)
-        .zip(per_epoch_first_err)
+        .zip(pending_report.per_epoch_failed)
+        .zip(pending_report.per_epoch_first_err)
         .map(
             |((((epoch, progress), dirty_flushed), failed), first_err)| CheckpointEpochReport {
                 dirty_total: progress.dirty_total,
@@ -247,6 +233,39 @@ fn commit_epoch_batch(
             },
         )
         .collect()
+}
+
+fn apply_pending_deletes(shared: &Arc<Shared>, epochs: &[CheckpointEpoch]) -> PendingDeleteReport {
+    let mut per_epoch_failed = Vec::with_capacity(epochs.len());
+    let mut per_epoch_first_err = Vec::with_capacity(epochs.len());
+    let mut applied_total = 0usize;
+    for epoch in epochs {
+        let mut pending_failed = HashMap::new();
+        let mut first_pending_err = None;
+        for (guid, seq) in &epoch.pending {
+            match shared.bm.execute_pending_delete(*guid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    pending_failed.insert(*guid, *seq);
+                }
+                Err(e) => {
+                    pending_failed.insert(*guid, *seq);
+                    first_pending_err.get_or_insert(e);
+                }
+            }
+        }
+        applied_total += epoch.pending.len() - pending_failed.len();
+        if !pending_failed.is_empty() {
+            shared.bm.restore_pending_deletes(pending_failed.clone());
+        }
+        per_epoch_failed.push(pending_failed);
+        per_epoch_first_err.push(first_pending_err);
+    }
+    PendingDeleteReport {
+        per_epoch_failed,
+        per_epoch_first_err,
+        applied_total,
+    }
 }
 
 fn collect_entry_children(entry: &WriteThroughEntry) -> Result<Vec<BlobGuid>> {
