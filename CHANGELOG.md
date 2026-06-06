@@ -7,10 +7,42 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased]
+## [0.5.0] — 2026-06-06
+
+This release adds a two-axis durability model (who owns durability ×
+where data lives) and the metadata-shaped fast paths a replicated
+metadata service needs, plus crash-consistent on-disk recovery for the
+state-machine mode. It contains breaking API and on-disk changes — see
+**Changed**.
 
 ### Added
 
+- **Durability policy.** `Durability::Wal { sync }` / `Durability::StateMachine`
+  replaces the ad-hoc `wal_sync` flag and is orthogonal to `Storage`. `Wal` is
+  single-node — holt's own write-ahead log is the durable record.
+  `StateMachine` is for a replicated state machine: an external log (e.g. Raft)
+  owns durability and replay, and holt attaches no WAL.
+- **Durable state-machine recovery.** Under `Durability::StateMachine` with file
+  storage, `DB::commit_durable(applied_index)` / `Tree::commit_durable` write a
+  crash-consistent on-disk checkpoint without a WAL: a copy-on-write snapshot
+  plus an atomic manifest rename recording the durable roots, `applied_index`,
+  and the resume `next_seq`. Reopen rehydrates from it and exposes
+  `durable_applied_index()`; the external log replays only the tail past that
+  index. Verified by fault injection and a SIGKILL crash soak.
+- **`DB::export_checkpoint` / `DB::install_checkpoint`** — a whole-`DB`
+  logical-KV snapshot image carrying `applied_index`, for shipping and
+  installing state-machine snapshots (Raft `InstallSnapshot`).
+- **`Tree::put_many_if_absent`** — create every absent key as one atomic batch
+  (single WAL record), reporting per key whether it was `Created` or
+  `AlreadyExists`.
+- **`DB::scatter`** — independent single-key conditional writes across families
+  with no cross-family atomic barrier; each runs on its own per-key concurrent
+  path so unrelated keys never serialize. `StateMachine`-only (the log owns
+  write ordering).
+- **`ScanStats`** — per-scan `visited` / `returned` / `rollup` / `restarts`
+  accounting on `RangeIter` / `KeyRangeIter` (read via `.stats()`), and the
+  return of `KeyRangeBuilder::visit`. Surfaces work-vs-yield so callers can spot
+  tombstone-bloated listings.
 - Copy-on-write snapshots. `Tree::snapshot` returns a stable
   point-in-time `Snapshot` handle in O(1) — only the root frame is
   copied; the rest is shared with the live tree and forked
@@ -22,6 +54,18 @@ fine-grained per-commit history is in `git log`.
 
 ### Changed
 
+- **Breaking.** `TreeConfig.wal_sync` and `TreeBuilder::wal_sync()` are removed;
+  use `TreeConfig.durability` / `TreeBuilder::durability(Durability)`.
+- **Breaking.** `KeyRangeBuilder::visit` returns `ScanStats` instead of the
+  emitted count (use `stats.returned + stats.rollup`).
+- **Breaking (on-disk).** The file-store manifest is v2 (durable trailer); v1
+  manifests are not migrated.
+- Under `Durability::StateMachine`, atomic batches take the mutation gate shared
+  rather than exclusive — the external log serializes writes, so applies no
+  longer fence concurrent range scans. `view` / `snapshot` capture still fences,
+  so consistent point-in-time reads are unaffected.
+- `DB::open` gates the WAL on durability (`attach_wal()`), not just on storage,
+  so a file-backed `StateMachine` database no longer attaches a holt WAL.
 - `Tree::view` / `DB::view` are reimplemented on copy-on-write
   snapshots: same API and point-in-time semantics, but capture is now
   O(1) instead of eagerly copying every reachable blob frame, and holds
