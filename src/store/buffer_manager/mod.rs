@@ -405,12 +405,26 @@ impl BufferManager {
     }
 
     /// Free a copy-on-write frame no longer referenced by the live tree
-    /// or any live snapshot: drop it from cache (and its dirty
-    /// bookkeeping) and from the inner store. Best-effort on the store —
-    /// a frame forked but never checkpointed is cache-only, so its store
-    /// delete is a `NotFound` we ignore.
+    /// or any live snapshot. Checkpoint-owned or pending-delete frames
+    /// are still load-bearing for checkpoint correctness, so reclamation
+    /// is best-effort: those frames are left for a later DB-wide GC after
+    /// their checkpoint owner has retired.
     fn reclaim_blob(&self, guid: BlobGuid) {
-        self.evict_from_cache(guid);
+        {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.checkpoint_owned_or_pending(&guid) {
+                return;
+            }
+        }
+        if let Some((_, entry)) = self.cache.remove(&guid) {
+            entry.clear_dirty_hint();
+        }
+        self.route_resident.remove(guid);
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        state.remove_unclaimed_dirty(&guid);
+        let removed = state.remove_maintenance_candidates(&guid);
+        drop(state);
+        self.decrement_candidate_totals(removed);
         let _ = self.store.delete_blob(guid);
     }
 
@@ -976,16 +990,31 @@ impl BufferManager {
     /// `delete_blob`, where the blob is going away entirely and
     /// any pending dirty write would race with the delete in the
     /// store.
-    fn evict_from_cache(&self, guid: BlobGuid) {
-        if let Some((_, entry)) = self.cache.remove(&guid) {
+    fn evict_from_cache(&self, guid: BlobGuid) -> bool {
+        {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.checkpoint_owned_or_pending(&guid) {
+                return false;
+            }
+        }
+        if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+            if Arc::strong_count(entry) > 1 {
+                return false;
+            }
+            let state = self.mutation_shard(guid).lock().unwrap();
+            !state.checkpoint_owned_or_pending(&guid)
+        }) {
             entry.clear_dirty_hint();
+        } else if self.cache.contains_key(&guid) {
+            return false;
         }
         self.route_resident.remove(guid);
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        state.remove_dirty(&guid);
+        state.remove_unclaimed_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
         self.decrement_candidate_totals(removed);
+        true
     }
 
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
@@ -1421,10 +1450,13 @@ impl BufferManager {
                 return Ok(false);
             }
         }
-        if let Some((_, entry)) = self
-            .cache
-            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1)
-        {
+        if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+            if Arc::strong_count(entry) > 1 {
+                return false;
+            }
+            let state = self.mutation_shard(guid).lock().unwrap();
+            !state.is_protected(&guid)
+        }) {
             entry.clear_dirty_hint();
         } else if self.cache.contains_key(&guid) {
             return Ok(false);
@@ -1711,7 +1743,7 @@ impl BlobStore for BufferManager {
         // entry for this blob is satisfied. Subsequent writes via
         // the pin/write-guard path will re-mark it.
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        state.remove_dirty(&guid);
+        state.remove_unclaimed_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
         self.decrement_candidate_totals(removed);
@@ -1734,7 +1766,7 @@ impl BlobStore for BufferManager {
         self.store.write_blobs(writes)?;
         for (guid, _) in writes {
             let mut state = self.mutation_shard(*guid).lock().unwrap();
-            state.remove_dirty(guid);
+            state.remove_unclaimed_dirty(guid);
             let removed = state.remove_maintenance_candidates(guid);
             drop(state);
             self.decrement_candidate_totals(removed);
@@ -1746,7 +1778,11 @@ impl BlobStore for BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.evict_from_cache(guid);
+        if !self.evict_from_cache(guid) {
+            return Err(Error::Internal(
+                "delete_blob: protected cache image cannot be evicted",
+            ));
+        }
         self.store.delete_blob(guid)
     }
 
@@ -2561,6 +2597,34 @@ mod tests {
     }
 
     #[test]
+    fn cow_reclaim_does_not_drop_flushing_cache_image() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x56; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0xAA;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap[&guid], 10);
+        drop(pin);
+
+        bm.reclaim_blob(guid);
+
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .expect("COW reclaim must not drop checkpoint-owned bytes");
+        assert_eq!(bytes.as_slice()[123], 0xAA);
+        assert!(inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
     fn snapshot_bytes_if_version_rejects_stale_blob_image() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0x56; 16];
@@ -2813,6 +2877,87 @@ mod tests {
         assert!(!inner.has_blob(guid).unwrap());
         assert_eq!(bm.pending_delete_count(), 0);
         assert_eq!(pending.get(&guid), Some(&20));
+    }
+
+    #[test]
+    fn write_through_does_not_clear_in_flight_checkpoint_owner() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5C; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x55;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .unwrap();
+        drop(pin);
+
+        bm.write_blob(guid, &make_buf(0x66)).unwrap();
+
+        assert_eq!(
+            bm.flushing_count(),
+            1,
+            "direct write-through must not retire another checkpoint epoch",
+        );
+        assert!(
+            bm.cache.contains_key(&guid),
+            "direct write-through must keep the image required by version validation",
+        );
+
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 10,
+                content_version: Some(version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Stale]);
+    }
+
+    #[test]
+    fn delete_blob_rejects_in_flight_checkpoint_owner() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5D; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x77;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .unwrap();
+        drop(pin);
+
+        assert!(bm.delete_blob(guid).is_err());
+        assert_eq!(bm.flushing_count(), 1);
+        assert!(bm.cache.contains_key(&guid));
+        assert!(inner.has_blob(guid).unwrap());
+
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 10,
+                content_version: Some(version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Written]);
     }
 
     #[test]

@@ -7,6 +7,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.5.3] — 2026-06-07
+
+### Fixed
+
+- Preserved checkpoint-owned cache images while copy-on-write snapshot reclaim,
+  DB-wide GC, direct blob deletes, or write-through paths run concurrently.
+  This fixes NoKV-style metadata pressure that could otherwise report
+  `snapshot_dirty_versions: dirty entry lost cache image` or
+  `write_through_batch: flushing entry lost cache image`.
+- Kept direct write-through from retiring another in-flight checkpoint epoch;
+  it now clears only unclaimed dirty state and leaves flushing ownership intact.
+
+### Validation
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test store::buffer_manager::tests -- --nocapture`
+- NoKV sibling FUSE/RustFS/JuiceFS smoke with local Holt patch completed without
+  checkpoint invariant failures.
+
 ## [0.5.2] — 2026-06-06
 
 ### Added

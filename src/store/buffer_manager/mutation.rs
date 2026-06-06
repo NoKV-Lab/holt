@@ -45,9 +45,8 @@ impl MutationState {
         self.is_protected(guid) || self.has_delete_fence(guid)
     }
 
-    pub(super) fn remove_dirty(&mut self, guid: &BlobGuid) {
-        self.dirty.remove(guid);
-        self.flushing.remove(guid);
+    pub(super) fn checkpoint_owned_or_pending(&self, guid: &BlobGuid) -> bool {
+        self.flushing.contains_key(guid) || self.has_delete_fence(guid)
     }
 
     pub(super) fn remove_unclaimed_dirty(&mut self, guid: &BlobGuid) {
