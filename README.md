@@ -8,7 +8,7 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.4.2 released).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.5.0 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
 > published version in your `Cargo.toml` (`holt = "=0.4.2"`) until 1.0
