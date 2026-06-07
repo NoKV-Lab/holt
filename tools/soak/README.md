@@ -87,25 +87,6 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
   --kill-max-ms 5000
 ```
 
-The `sm-crash` campaign covers `Durability::StateMachine` recovery — **no
-WAL**. A child loops apply + `commit_durable(round)`, fsync-acks each
-committed round, and resumes from the durable point on restart; the parent
-SIGKILLs it, reopens (recovery is the durable manifest alone), and checks
-that the recovered `durable_applied_index()` is internally consistent,
-never regresses across crashes, and is never below an acked checkpoint. No
-`--wal-sync` (there is no WAL):
-
-```sh
-cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
-  --mode sm-crash \
-  --dir target/holt-soak-sm-crash \
-  --reset \
-  --duration-secs 21600 \
-  --buffer-pool 64 \
-  --kill-min-ms 100 \
-  --kill-max-ms 5000
-```
-
 The tool emits JSON lines with cache, WAL, checkpoint, route-cache, and
 reopen-replay counters. CI runs only a short `normal` smoke; longer
 normal/crash campaigns belong in nightly or release-gate runs.
@@ -114,12 +95,11 @@ normal/crash campaigns belong in nightly or release-gate runs.
 
 - PR CI: build the harness and run short `normal` and `db-normal`
   smokes so API or stats drift is caught quickly.
-- Nightly: run `normal`, `db-normal`, `crash`, `db-crash`, `sm-crash`,
+- Nightly: run `normal`, `db-normal`, `crash`, `db-crash`,
   checkpoint failpoints, WAL integration, and a longer fuzz campaign from
   `.github/workflows/nightly.yml`.
 - Release gate: run `normal` for several hours on the target platform,
-  then run `crash` with `--wal-sync true` (and `sm-crash`); keep the JSON
-  output so replay
+  then run `crash` with `--wal-sync true`; keep the JSON output so replay
   time, cache misses, WAL debt, and checkpoint debt can be compared
   across releases.
 

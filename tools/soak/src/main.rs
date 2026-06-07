@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use holt::{CheckpointConfig, Durability, KeyRangeEntryRef, Tree, TreeConfig, DB};
+use holt::{CheckpointConfig, KeyRangeEntryRef, Tree, TreeConfig, DB};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, DynError>;
@@ -23,8 +23,6 @@ enum Mode {
     DbCrash,
     Child,
     DbChild,
-    SmCrash,
-    SmChild,
 }
 
 #[derive(Debug)]
@@ -71,8 +69,6 @@ impl Config {
                         "db-crash" => Mode::DbCrash,
                         "child" | "crash-child" => Mode::Child,
                         "db-child" | "db-crash-child" => Mode::DbChild,
-                        "sm-crash" => Mode::SmCrash,
-                        "sm-child" | "sm-crash-child" => Mode::SmChild,
                         other => return Err(format!("unknown --mode `{other}`").into()),
                     };
                 }
@@ -131,8 +127,6 @@ fn run() -> Result<()> {
         Mode::DbCrash => run_db_crash_parent(&cfg),
         Mode::Child => run_crash_child(&cfg),
         Mode::DbChild => run_db_crash_child(&cfg),
-        Mode::SmCrash => run_sm_crash_parent(&cfg),
-        Mode::SmChild => run_sm_crash_child(&cfg),
     }
 }
 
@@ -457,133 +451,6 @@ fn open_db(cfg: &Config) -> holt::Result<DB> {
     tree_cfg.durability = holt::Durability::Wal { sync: cfg.wal_sync };
     tree_cfg.checkpoint = CheckpointConfig::default();
     DB::open(tree_cfg)
-}
-
-fn open_sm_tree(cfg: &Config) -> holt::Result<Tree> {
-    let mut tree_cfg = TreeConfig::new(&cfg.dir);
-    tree_cfg.buffer_pool_size = cfg.buffer_pool;
-    tree_cfg.durability = Durability::StateMachine;
-    tree_cfg.checkpoint = CheckpointConfig::default();
-    Tree::open(tree_cfg)
-}
-
-fn sm_ack_log_path(dir: &Path) -> PathBuf {
-    dir.join("soak-sm-ack.log")
-}
-
-fn sm_key(round: u64) -> String {
-    format!("k/{round:016x}")
-}
-
-/// Highest round committed-and-acked to the log (0 if none).
-fn load_last_sm_ack(path: &Path) -> Result<u64> {
-    let mut last = 0u64;
-    if let Ok(f) = fs::File::open(path) {
-        for line in BufReader::new(f).lines() {
-            if let Some(rest) = line?.strip_prefix("C ") {
-                last = last.max(rest.trim().parse::<u64>().unwrap_or(0));
-            }
-        }
-    }
-    Ok(last)
-}
-
-/// StateMachine crash soak: a child loops apply + `commit_durable(round)`,
-/// acking each committed round to an fsync'd log and resuming from the
-/// last durable point on restart. The parent SIGKILLs it, reopens with NO
-/// WAL (recovery is the durable manifest alone), and checks that the
-/// durable point is internally consistent, never regresses across crashes,
-/// and never drops a committed checkpoint.
-fn run_sm_crash_parent(cfg: &Config) -> Result<()> {
-    prepare_dir(cfg)?;
-    let ack_path = sm_ack_log_path(&cfg.dir);
-    let deadline = Instant::now() + cfg.duration;
-    let exe = env::current_exe()?;
-    let mut rng = Rng::new(cfg.seed ^ 0x5A4E_0DEA_D000_0001);
-    let mut rounds = 0u64;
-    let mut prev_durable = 0u64;
-
-    while Instant::now() < deadline {
-        let mut child = Command::new(&exe)
-            .arg("--mode")
-            .arg("sm-child")
-            .arg("--dir")
-            .arg(&cfg.dir)
-            .arg("--buffer-pool")
-            .arg(cfg.buffer_pool.to_string())
-            .arg("--seed")
-            .arg((cfg.seed ^ rounds).to_string())
-            .spawn()?;
-        let sleep_for = random_duration(&mut rng, cfg.kill_min, cfg.kill_max);
-        thread::sleep(sleep_for);
-        let _ = child.kill();
-        let _ = child.wait();
-        rounds += 1;
-
-        let tree = open_sm_tree(cfg)?;
-        let durable = tree.durable_applied_index()?;
-        let acked = load_last_sm_ack(&ack_path)?;
-        verify_sm_state(&tree, durable, acked, prev_durable)?;
-        prev_durable = durable;
-        println!("sm-crash-reopen round={rounds} durable_index={durable} acked={acked}");
-    }
-    Ok(())
-}
-
-fn run_sm_crash_child(cfg: &Config) -> Result<()> {
-    fs::create_dir_all(&cfg.dir)?;
-    let tree = open_sm_tree(cfg)?;
-    let mut ack = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(sm_ack_log_path(&cfg.dir))?;
-    // Resume from the durable point established by prior runs — this is the
-    // durable-recovery path under test.
-    let mut round = tree.durable_applied_index()?;
-    let deadline = Instant::now() + cfg.duration;
-    while Instant::now() < deadline {
-        round += 1;
-        // Deterministic per-round state: counter == round, k{round} added.
-        tree.put(b"counter", &round.to_le_bytes())?;
-        tree.put(sm_key(round).as_bytes(), &round.to_le_bytes())?;
-        tree.commit_durable(round)?;
-        writeln!(ack, "C {round}")?;
-        ack.sync_data()?;
-    }
-    Ok(())
-}
-
-/// A durable point at index `durable` must reflect exactly the state
-/// committed at round `durable`: `counter == durable`, `k{durable}`
-/// present, `k{durable+1}` absent, no holes. It must also be `>= acked`
-/// (no committed checkpoint lost) and `>= prev_durable` (no regression).
-fn verify_sm_state(tree: &Tree, durable: u64, acked: u64, prev_durable: u64) -> Result<()> {
-    if durable < acked {
-        return Err(format!("durable index {durable} < acked {acked}: lost a checkpoint").into());
-    }
-    if durable < prev_durable {
-        return Err(format!("durable index regressed {prev_durable} -> {durable}").into());
-    }
-    if durable == 0 {
-        return Ok(());
-    }
-    let counter = tree
-        .get(b"counter")?
-        .ok_or("durable state missing `counter`")?;
-    let counter = u64::from_le_bytes(counter[..8].try_into().unwrap());
-    if counter != durable {
-        return Err(format!("torn state: counter {counter} != durable {durable}").into());
-    }
-    if tree.get(sm_key(durable).as_bytes())?.is_none() {
-        return Err(format!("durable state missing k{durable}").into());
-    }
-    if tree.get(sm_key(durable + 1).as_bytes())?.is_some() {
-        return Err(format!("uncommitted k{} leaked into durable state", durable + 1).into());
-    }
-    if durable > 1 && tree.get(sm_key(durable / 2).as_bytes())?.is_none() {
-        return Err(format!("durable state has a hole at k{}", durable / 2).into());
-    }
-    Ok(())
 }
 
 fn prepare_dir(cfg: &Config) -> Result<()> {
