@@ -277,6 +277,19 @@ pub fn find_next_nonzero_u16(words: &[u16], start: usize) -> Option<usize> {
         }
     }
 
+    // NEON is base aarch64, so the 16-lane (2×8) path is always
+    // available — no feature gate. Handles the bulk of the 16 / 48 /
+    // 256-element child arrays; the 8-lane loop below mops up the
+    // 8..16 remainder.
+    #[cfg(target_arch = "aarch64")]
+    while i + 16 <= len {
+        let mask = unsafe { nonzero_u16_mask_16(words.as_ptr().add(i)) };
+        if mask != 0 {
+            return Some(i + (mask.trailing_zeros() as usize) / 2);
+        }
+        i += 16;
+    }
+
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     while i + 8 <= len {
         let mask = unsafe { nonzero_u16_mask_8(words.as_ptr().add(i)) };
@@ -335,6 +348,12 @@ unsafe fn nonzero_byte_mask_16(ptr: *const u8) -> u32 {
 #[inline]
 unsafe fn nonzero_u16_mask_8(ptr: *const u16) -> u32 {
     unsafe { arm::cmp_u16_neq_zero_mask_8(ptr) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn nonzero_u16_mask_16(ptr: *const u16) -> u32 {
+    unsafe { arm::cmp_u16_neq_zero_mask_16(ptr) }
 }
 
 // ---------------------------------------------------------------
@@ -602,6 +621,18 @@ mod arm {
         let as_bytes = vreinterpretq_u8_u16(cmp_neq_zero);
         let nib = unsafe { byte_mask_to_nibble_u64(as_bytes) };
         nibble_mask_to_bitmask_16(nib) & 0x5555
+    }
+
+    /// `u16`-lane non-zero mask (NEON, 16 lanes = 2 × 8). Combines
+    /// two 8-lane masks: low 8 lanes occupy even bits 0..16, high 8
+    /// lanes even bits 16..32, so `trailing_zeros() / 2` is the
+    /// first non-zero lane across all 16. Caller guarantees `ptr`
+    /// is at least 32 bytes (16 × `u16`) valid.
+    #[inline]
+    pub(super) unsafe fn cmp_u16_neq_zero_mask_16(ptr: *const u16) -> u32 {
+        let lo = unsafe { cmp_u16_neq_zero_mask_8(ptr) };
+        let hi = unsafe { cmp_u16_neq_zero_mask_8(ptr.add(8)) };
+        lo | (hi << 16)
     }
 }
 
