@@ -195,9 +195,9 @@ brief lock; a single background flusher drains the committed prefix into the
 **unchanged** `WalWriter` (so on-disk format + replay reader are byte-for-byte
 identical) and fsyncs on the sync path. ONE ordered log → trim-watermark /
 single-pass-replay invariants preserved (unlike the rejected multi-lane
-`wal-commit-sharding`). Behind the `wal_ring` feature (default off → legacy
-backend) for A/B + safe rollback. See `src/journal/ring.rs` +
-`src/journal/group_commit_ring.rs`, design in `docs/design/wal-ring.md`.
+`wal-commit-sharding`). **This is now the sole WAL backend — the legacy
+channel+worker has been removed (no feature flag).** See `src/journal/ring.rs`
++ `src/journal/group_commit.rs`, design in `docs/design/wal-ring.md`.
 
 Measured A/B (x86, `objstore put`, 50k ops/thread, same machine; RocksDB the
 fixed comparator):
@@ -223,22 +223,22 @@ loop 0 flaky), loom gap-safety model, clippy clean. loom also **caught a real
 design bug** (separate work-id counter could disagree with byte order →
 unpublished-gap copy) → keyed on the byte tiling instead.
 
-Remaining hardening (not blocking the win, but before flipping the default):
-a dedicated multi-process **SIGKILL crash-soak** of the ring path (the async
-RAM→page-cache window + flusher-mid-drain), a loom model of the `Journal`-level
-`advance`-lock contention at 16+ writers, and built-in backpressure (today the
-ring is sized so it never trips; the bench previews manual backpressure). The
-1-thread mean carries a one-off ~66ms warmup/checkpoint outlier (p50 1.5µs) to
-investigate.
+Hardening completed before making it the sole backend: a multi-process
+**SIGKILL crash-soak** (`examples/wal_crash_soak.rs`, 40 rounds, every recovery
+a contiguous valid prefix — covers the async RAM→page-cache window +
+flusher-mid-drain + mid-checkpoint-truncate), a **2+3-publisher loom** model of
+the `advance` lock (a leaf lock — no deadlock by construction), and **built-in
+backpressure** (writers park on a `space_cv` the flusher signals). The 1-thread
+~66ms outlier was root-caused (a per-op flusher wake = a channel send on every
+write) and removed → 1t is now 1.12 Mops/s (p99 14.8µs), 4.1× RocksDB.
 
 ## Suggested next work (each its own focused session)
 
-- ~~**Lock-free shared WAL ring**~~ — **DONE & MEASURED** (see
-  "Write-concurrency bottleneck" above): the ring backend beats RocksDB
-  2.6–5.3× on concurrent durable write (5.8–6.5× over legacy), dual-arch
-  validated with proptest oracle + checkpoint_failpoint. Behind `wal_ring`
-  (default off). Remaining hardening: multi-process SIGKILL crash-soak +
-  `advance`-lock loom + built-in backpressure before flipping the default.
+- ~~**Lock-free shared WAL ring**~~ — **SHIPPED as the sole WAL backend**
+  (legacy removed; see "Write-concurrency bottleneck" above): beats RocksDB
+  **2.8–5.5×** on concurrent durable write at 1/4/8/16 threads, dual-arch
+  validated (proptest oracle + checkpoint_failpoint + 40-round SIGKILL
+  crash-soak + loom). All hardening done.
 - ~~**Optimistic write descent**~~ / ~~**prefix-sharded-forest**~~ — both
   **RULED OUT by measurement**: the root latch (shared or exclusive) is
   not the bottleneck (no-merge multi-root A/B: 16 roots ≈ 1 root at 16t),

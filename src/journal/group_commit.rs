@@ -1,271 +1,46 @@
-//! WAL append coordinator (legacy channel+worker backend).
+//! WAL append coordinator — lock-free shared ring + single flusher.
 //!
-//! `WalWriter` owns the file format and append/truncate mechanics.
-//! This module owns concurrency around the WAL file. All append
-//! records go through the worker, so foreground writers do not
-//! perform per-operation WAL file writes.
+//! Concurrent writers reserve a byte range in the lock-free [`WalRing`]
+//! (one `tail.fetch_add`), memcpy their encoded record in parallel, and
+//! publish by folding the contiguous published prefix; a single background
+//! **flusher** drains that prefix into the [`WalWriter`] (unchanged on-disk
+//! format + replay) and fsyncs on the sync path. This replaced an earlier
+//! per-record `Vec` + single crossbeam channel + single batching worker,
+//! which serialized concurrent durable writes (see `docs/design/wal-ring.md`
+//! and `PERF_FINDINGS.md`: ~5–6× faster concurrent durable write, beating
+//! RocksDB 2.8–5.5× at 1/4/8/16 threads).
 //!
-//! Under the `wal_ring` feature this backend's `Journal` is unused (the
-//! ring-backed `group_commit_ring::Journal` is selected instead);
-//! `JournalStats` is still shared from here, so suppress dead-code there.
-#![cfg_attr(feature = "wal_ring", allow(dead_code))]
+//! ## Watermarks live in the record-count domain
+//!
+//! `queued`/`written`/`flushed`/`checkpointed` count RECORDS (dense,
+//! monotone), exactly mirroring the legacy work-id watermarks — so
+//! `needs_checkpoint`, the reopen signal, and the checkpoint round-trip are
+//! preserved bit-for-bit. `record_base` is the reopen offset (1 when the
+//! file already had records, else 0). `written/flushed = record_base +
+//! ring.committed_records()` at drain/fsync time; `queued = record_base +
+//! records submitted this process`. They reconcile because every `submit`
+//! both bumps `queued` and appends exactly one ring record.
+//!
+//! ## Durability: the flusher drains PROMPTLY
+//!
+//! Async (`wal_sync=false`) records must reach the OS page cache promptly so
+//! they survive a *process* crash (as the legacy worker guarantees). The
+//! flusher polls every `FLUSH_POLL` and on every wake drains the committed
+//! prefix into `WalWriter` (whose 64 KB auto-drain reaches the page cache).
+//! fsync happens only when a sync target is outstanding (sync write or
+//! checkpoint barrier), exactly like legacy group commit.
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 
 use crate::api::errors::{Error, Result};
 
+use super::ring::{ReserveTicket, WalRing};
 use super::writer::WalWriter;
-
-const GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
-const ENQUEUE_BATCH_WINDOW: Duration = Duration::from_micros(10);
-const GROUP_COMMIT_MAX_BYTES: usize = 256 * 1024;
-const RECORD_BUFFER_POOL_LIMIT: usize = 1024;
-const RECORD_BUFFER_RETAIN_MAX: usize = 64 * 1024;
-// Large enough to absorb metadata bursts without making async WAL
-// enqueue a foreground backpressure point.
-const JOURNAL_QUEUE_DEPTH: usize = 65_536;
-
-type AckTx = Sender<Result<()>>;
-type AckRx = Receiver<Result<()>>;
-
-enum JournalCommand {
-    Append {
-        bytes: Vec<u8>,
-        seq: u64,
-        sync: bool,
-        ack: Option<AckTx>,
-    },
-    Flush {
-        up_to: u64,
-        ack: AckTx,
-    },
-    Truncate {
-        ack: AckTx,
-    },
-    Stop,
-}
-
-struct AppendRequest {
-    bytes: Vec<u8>,
-    seq: u64,
-    sync: bool,
-    ack: Option<AckTx>,
-}
-
-#[derive(Clone, Copy)]
-struct WorkerState<'a> {
-    writer: &'a Arc<Mutex<WalWriter>>,
-    record_pool: &'a Mutex<Vec<Vec<u8>>>,
-    batches: &'a AtomicU64,
-    syncs: &'a AtomicU64,
-    written_work: &'a AtomicU64,
-    flushed_work: &'a AtomicU64,
-}
-
-/// Completion handle for one acknowledged journal append.
-///
-/// Synchronous appends wait until their batch has reached the
-/// `sync_data` durability boundary. Asynchronous appends return
-/// without an acknowledgement handle.
-pub(crate) struct JournalAck {
-    rx: AckRx,
-}
-
-impl JournalAck {
-    pub(crate) fn wait(self) -> Result<()> {
-        self.rx
-            .recv()
-            .map_err(|_| Error::Internal("journal worker dropped append acknowledgement"))?
-    }
-}
-
-/// WAL append coordinator.
-///
-/// Async records are serialized by the background worker, and
-/// `wal_sync = true` waiters share one `sync_data` when they arrive
-/// inside the short group window.
-pub(crate) struct Journal {
-    tx: Sender<JournalCommand>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    appends: Arc<AtomicU64>,
-    batches: Arc<AtomicU64>,
-    syncs: Arc<AtomicU64>,
-    record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
-    next_work: Arc<AtomicU64>,
-    queued_work: Arc<AtomicU64>,
-    written_work: Arc<AtomicU64>,
-    flushed_work: Arc<AtomicU64>,
-    checkpointed_work: Arc<AtomicU64>,
-}
-
-impl Journal {
-    pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
-        let writer = WalWriter::open_or_create(path, tree_id)?;
-        let initial_queued_work = u64::from(writer.has_records());
-        let writer = Arc::new(Mutex::new(writer));
-        let (tx, rx) = bounded::<JournalCommand>(JOURNAL_QUEUE_DEPTH);
-        let batches = Arc::new(AtomicU64::new(0));
-        let syncs = Arc::new(AtomicU64::new(0));
-        // Existing WAL bytes are replayable, but we cannot prove
-        // they were fsync-durable in the previous process. The
-        // first checkpoint after reopen must issue a WAL flush
-        // before it makes replayed effects durable in the store.
-        let initial_flushed_work = if initial_queued_work == 0 {
-            0
-        } else {
-            initial_queued_work - 1
-        };
-        let record_pool = Arc::new(Mutex::new(Vec::new()));
-        let written_work = Arc::new(AtomicU64::new(initial_queued_work));
-        let flushed_work = Arc::new(AtomicU64::new(initial_flushed_work));
-        let worker_batches = Arc::clone(&batches);
-        let worker_syncs = Arc::clone(&syncs);
-        let worker_record_pool = Arc::clone(&record_pool);
-        let worker_written_work = Arc::clone(&written_work);
-        let worker_flushed_work = Arc::clone(&flushed_work);
-        let worker_writer = Arc::clone(&writer);
-        let handle = thread::Builder::new()
-            .name("holt-journal".to_owned())
-            .spawn(move || {
-                run_worker(
-                    worker_writer,
-                    rx,
-                    worker_batches,
-                    worker_syncs,
-                    worker_record_pool,
-                    worker_written_work,
-                    worker_flushed_work,
-                );
-            })
-            .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal"))?;
-        Ok(Self {
-            tx,
-            handle: Mutex::new(Some(handle)),
-            appends: Arc::new(AtomicU64::new(0)),
-            batches,
-            syncs,
-            record_pool,
-            next_work: Arc::new(AtomicU64::new(initial_queued_work)),
-            queued_work: Arc::new(AtomicU64::new(initial_queued_work)),
-            written_work,
-            flushed_work,
-            checkpointed_work: Arc::new(AtomicU64::new(0)),
-        })
-    }
-
-    /// Submit one fully encoded WAL record.
-    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
-        let (ack, rx) = if sync {
-            let (ack, rx) = bounded(1);
-            (Some(ack), Some(rx))
-        } else {
-            (None, None)
-        };
-        let seq = self.next_work.fetch_add(1, Ordering::AcqRel) + 1;
-        self.tx
-            .send(JournalCommand::Append {
-                bytes,
-                seq,
-                sync,
-                ack,
-            })
-            .map_err(|_| Error::Internal("journal worker stopped before append"))?;
-        self.appends.fetch_add(1, Ordering::Relaxed);
-        self.queued_work.fetch_max(seq, Ordering::Release);
-        Ok(rx.map(|rx| JournalAck { rx }))
-    }
-
-    /// Return a scratch buffer for one encoded WAL record.
-    pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
-        if min_capacity <= RECORD_BUFFER_RETAIN_MAX {
-            if let Ok(mut pool) = self.record_pool.try_lock() {
-                while let Some(mut buf) = pool.pop() {
-                    if buf.capacity() >= min_capacity {
-                        buf.clear();
-                        return buf;
-                    }
-                }
-            }
-        }
-        Vec::with_capacity(min_capacity)
-    }
-
-    /// Highest WAL work id accepted by foreground append paths.
-    pub(crate) fn queued_work(&self) -> u64 {
-        self.queued_work.load(Ordering::Acquire)
-    }
-
-    /// Force all WAL records up to `observed` durable.
-    pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
-        if observed <= self.flushed_work.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let (ack, rx) = bounded(1);
-        self.tx
-            .send(JournalCommand::Flush {
-                up_to: observed,
-                ack,
-            })
-            .map_err(|_| Error::Internal("journal worker stopped before flush"))?;
-        recv_control_ack(rx, "journal worker dropped flush acknowledgement")
-    }
-
-    /// Reset the WAL to a fresh header-only file after checkpoint.
-    pub(crate) fn truncate(&self) -> Result<()> {
-        let observed = self.queued_work.load(Ordering::Acquire);
-        if observed == self.checkpointed_work.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let (ack, rx) = bounded(1);
-        self.tx
-            .send(JournalCommand::Truncate { ack })
-            .map_err(|_| Error::Internal("journal worker stopped before truncate"))?;
-        recv_control_ack(rx, "journal worker dropped truncate acknowledgement")?;
-        self.checkpointed_work.fetch_max(observed, Ordering::AcqRel);
-        Ok(())
-    }
-
-    pub(crate) fn needs_checkpoint(&self) -> bool {
-        self.queued_work.load(Ordering::Acquire) != self.checkpointed_work.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    fn needs_flush(&self) -> bool {
-        self.queued_work.load(Ordering::Acquire) > self.flushed_work.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn stats(&self) -> JournalStats {
-        let queued_work = self.queued_work.load(Ordering::Acquire);
-        let written_work = self.written_work.load(Ordering::Acquire);
-        let flushed_work = self.flushed_work.load(Ordering::Acquire);
-        let checkpointed_work = self.checkpointed_work.load(Ordering::Acquire);
-        JournalStats {
-            appends: self.appends.load(Ordering::Relaxed),
-            batches: self.batches.load(Ordering::Relaxed),
-            syncs: self.syncs.load(Ordering::Relaxed),
-            queued_work,
-            written_work,
-            flushed_work,
-            checkpointed_work,
-            pending_work: queued_work.saturating_sub(flushed_work),
-            checkpoint_debt: queued_work.saturating_sub(checkpointed_work),
-        }
-    }
-}
-
-impl Drop for Journal {
-    fn drop(&mut self) {
-        let _ = self.tx.send(JournalCommand::Stop);
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-    }
-}
 
 /// Production journal counters surfaced through `Tree::stats`.
 #[derive(Debug, Clone, Copy)]
@@ -281,206 +56,405 @@ pub(crate) struct JournalStats {
     pub(crate) checkpoint_debt: u64,
 }
 
-fn recv_control_ack(rx: AckRx, closed_msg: &'static str) -> Result<()> {
-    rx.recv().map_err(|_| Error::Internal(closed_msg))?
+/// In-RAM ring capacity. 16 MiB absorbs large metadata bursts between
+/// checkpoints; records are ≤ ~512 KB so a single record always fits.
+const RING_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
+/// Flusher idle poll. Bounds the async RAM→page-cache window (process-crash
+/// durability) and the latency a sync waiter adds if a wake is ever missed.
+const FLUSH_POLL: Duration = Duration::from_micros(50);
+const RECORD_BUFFER_POOL_LIMIT: usize = 1024;
+const RECORD_BUFFER_RETAIN_MAX: usize = 64 * 1024;
+
+/// Control messages to the flusher (rare — never per async append).
+enum Control {
+    /// Wake to drain + (if a sync target is outstanding) fsync.
+    Flush,
+    /// Drain, then truncate the WAL to its header and reset the ring.
+    Truncate(Sender<Result<()>>),
+    Stop,
 }
 
-fn run_worker(
-    writer: Arc<Mutex<WalWriter>>,
-    rx: Receiver<JournalCommand>,
-    batches: Arc<AtomicU64>,
-    syncs: Arc<AtomicU64>,
-    record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
-    written_work: Arc<AtomicU64>,
-    flushed_work: Arc<AtomicU64>,
-) {
-    let mut backlog = VecDeque::new();
-    let mut append_batch = Vec::with_capacity(256);
-    let state = WorkerState {
-        writer: &writer,
-        record_pool: &record_pool,
-        batches: &batches,
-        syncs: &syncs,
-        written_work: &written_work,
-        flushed_work: &flushed_work,
-    };
+struct Shared {
+    ring: WalRing,
+    writer: Mutex<WalWriter>,
+    /// Reopen offset: records already on disk before this process's ring.
+    record_base: u64,
 
-    loop {
-        let cmd = match backlog.pop_front() {
-            Some(cmd) => cmd,
-            None => match rx.recv() {
-                Ok(cmd) => cmd,
-                Err(_) => break,
-            },
-        };
+    queued: AtomicU64,
+    written: AtomicU64,
+    flushed: AtomicU64,
+    checkpointed: AtomicU64,
+    /// Highest record count some waiter needs fsync-durable.
+    sync_target: AtomicU64,
 
-        match cmd {
-            JournalCommand::Append {
-                bytes,
-                seq,
-                sync,
-                ack,
-            } => {
-                process_append_batch(
-                    AppendRequest {
-                        bytes,
-                        seq,
-                        sync,
-                        ack,
-                    },
-                    &rx,
-                    &mut backlog,
-                    &mut append_batch,
-                    state,
-                );
-            }
-            JournalCommand::Flush { up_to, ack } => {
-                let res = writer
-                    .lock()
-                    .map_err(|_| Error::Internal("journal writer mutex poisoned"))
-                    .and_then(|mut writer| writer.flush());
-                if res.is_ok() {
-                    syncs.fetch_add(1, Ordering::Relaxed);
-                    flushed_work.fetch_max(up_to, Ordering::AcqRel);
+    appends: AtomicU64,
+    batches: AtomicU64,
+    syncs: AtomicU64,
+
+    /// Sticky flusher error message; fanned out to waiters and future
+    /// barriers (a `&'static str` because `Error` is not `Clone`, matching
+    /// how the legacy worker collapses failures to `Error::Internal`).
+    err: Mutex<Option<&'static str>>,
+    /// Condvar handshake for `flushed`/`err` waiters.
+    flushed_mx: Mutex<()>,
+    flushed_cv: Condvar,
+    /// Condvar handshake for writers parked on ring backpressure.
+    space_mx: Mutex<()>,
+    space_cv: Condvar,
+
+    control_tx: Sender<Control>,
+    record_pool: Mutex<Vec<Vec<u8>>>,
+}
+
+impl Shared {
+    fn sticky_err(&self) -> Option<&'static str> {
+        *self.err.lock().unwrap()
+    }
+
+    fn set_err(&self, msg: &'static str) {
+        let mut slot = self.err.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(msg);
+        }
+        drop(slot);
+        // Wake any sync waiters so they observe the error.
+        let _g = self.flushed_mx.lock().unwrap();
+        self.flushed_cv.notify_all();
+    }
+
+    /// Drain the committed prefix into the writer; if a sync target is
+    /// outstanding, fsync and advance `flushed`. Flusher thread only.
+    fn drain_and_maybe_sync(&self) {
+        if self.sticky_err().is_some() {
+            return;
+        }
+        // Read the record count BEFORE copying: copy reads committed_addr,
+        // which (addr-before-records publish ordering) is >= end(rc), so the
+        // copy drains >= rc records and `base + rc` is a safe lower bound.
+        let rc = self.ring.committed_records();
+        let want_sync = self.sync_target.load(Ordering::Acquire) > self.flushed.load(Ordering::Acquire);
+
+        let mut sink_err: Option<&'static str> = None;
+        let mut freed_space = false;
+        {
+            let mut w = self.writer.lock().unwrap();
+            let copied = self.ring.copy_committed_prefix(&mut |bytes| {
+                if sink_err.is_none() && w.append_encoded(bytes).is_err() {
+                    sink_err = Some("journal flusher append failed");
                 }
-                let _ = ack.send(res);
+            });
+            if let Some(msg) = sink_err {
+                drop(w);
+                self.set_err(msg);
+                return;
             }
-            JournalCommand::Truncate { ack } => {
-                let res = writer
-                    .lock()
-                    .map_err(|_| Error::Internal("journal writer mutex poisoned"))
-                    .and_then(|mut writer| writer.truncate());
-                let _ = ack.send(res);
+            if copied > 0 {
+                self.written.fetch_max(self.record_base + rc, Ordering::AcqRel);
+                self.batches.fetch_add(1, Ordering::Relaxed);
+                freed_space = true;
             }
-            JournalCommand::Stop => break,
+            if want_sync {
+                if w.flush().is_err() {
+                    drop(w);
+                    self.set_err("journal flusher fsync failed");
+                    return;
+                }
+                self.syncs.fetch_add(1, Ordering::Relaxed);
+                self.flushed.fetch_max(self.record_base + rc, Ordering::AcqRel);
+            }
+        }
+        if want_sync {
+            let _g = self.flushed_mx.lock().unwrap();
+            self.flushed_cv.notify_all();
+        }
+        if freed_space {
+            // The flusher advanced flush_cursor: wake any writer parked on
+            // ring backpressure.
+            let _g = self.space_mx.lock().unwrap();
+            self.space_cv.notify_all();
+        }
+    }
+
+    /// Block until the reserved range fits below `flush_cursor + capacity`
+    /// (built-in backpressure). Parks on `space_cv` instead of spinning;
+    /// rare in practice (the ring is sized to absorb bursts between
+    /// checkpoints), but bounds RAM and CPU under sustained overload.
+    fn wait_for_ring_space(&self, ticket: &ReserveTicket) -> Result<()> {
+        let _ = self.control_tx.send(Control::Flush);
+        let mut guard = self.space_mx.lock().unwrap();
+        while !self.ring.reserve_space_ready(ticket) {
+            if let Some(m) = self.sticky_err() {
+                return Err(Error::Internal(m));
+            }
+            let _ = self.control_tx.send(Control::Flush);
+            let (next, _timeout) = self
+                .space_cv
+                .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
+                .unwrap();
+            guard = next;
+        }
+        Ok(())
+    }
+
+    /// Block until `flushed >= target` (or a flusher error). Used by sync
+    /// appends (`JournalAck::wait`) and `flush_up_to`.
+    fn flush_to(&self, target: u64) -> Result<()> {
+        if target <= self.flushed.load(Ordering::Acquire) {
+            return match self.sticky_err() {
+                Some(m) => Err(Error::Internal(m)),
+                None => Ok(()),
+            };
+        }
+        self.sync_target.fetch_max(target, Ordering::AcqRel);
+        // Wake the flusher; the Flush is advisory (the loop recomputes the
+        // sync target), so a full channel / closed receiver is non-fatal.
+        let _ = self.control_tx.send(Control::Flush);
+        let mut guard = self.flushed_mx.lock().unwrap();
+        loop {
+            if let Some(m) = self.sticky_err() {
+                return Err(Error::Internal(m));
+            }
+            if self.flushed.load(Ordering::Acquire) >= target {
+                return Ok(());
+            }
+            guard = self.flushed_cv.wait(guard).unwrap();
+        }
+    }
+
+    fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
+        if min_capacity <= RECORD_BUFFER_RETAIN_MAX {
+            if let Ok(mut pool) = self.record_pool.try_lock() {
+                while let Some(mut buf) = pool.pop() {
+                    if buf.capacity() >= min_capacity {
+                        buf.clear();
+                        return buf;
+                    }
+                }
+            }
+        }
+        Vec::with_capacity(min_capacity)
+    }
+
+    fn recycle(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > RECORD_BUFFER_RETAIN_MAX {
+            return;
+        }
+        if let Ok(mut pool) = self.record_pool.try_lock() {
+            if pool.len() < RECORD_BUFFER_POOL_LIMIT {
+                buf.clear();
+                pool.push(buf);
+            }
         }
     }
 }
 
-fn process_append_batch(
-    first: AppendRequest,
-    rx: &Receiver<JournalCommand>,
-    backlog: &mut VecDeque<JournalCommand>,
-    batch: &mut Vec<AppendRequest>,
-    state: WorkerState<'_>,
-) {
-    debug_assert!(batch.is_empty());
-    batch.push(first);
-    let mut needs_sync = batch[0].sync;
-    let mut bytes = batch[0].bytes.len();
-    let mut deadline = Instant::now()
-        + if needs_sync {
-            GROUP_COMMIT_WINDOW
+/// Completion handle for one acknowledged journal append. Async appends
+/// return `None`; sync appends return a handle whose `wait` blocks until the
+/// record is fsync-durable.
+pub(crate) struct JournalAck {
+    shared: Arc<Shared>,
+    target: u64,
+}
+
+impl JournalAck {
+    pub(crate) fn wait(self) -> Result<()> {
+        self.shared.flush_to(self.target)
+    }
+}
+
+pub(crate) struct Journal {
+    shared: Arc<Shared>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Journal {
+    pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
+        let writer = WalWriter::open_or_create(path, tree_id)?;
+        let record_base = u64::from(writer.has_records());
+        // Mirror legacy reopen seeding: a reopened non-empty WAL is queued
+        // and unflushed, so the first checkpoint flushes before making
+        // replayed effects durable.
+        let initial_flushed = record_base.saturating_sub(1);
+
+        let (control_tx, control_rx) = unbounded::<Control>();
+        let shared = Arc::new(Shared {
+            ring: WalRing::with_capacity(RING_CAPACITY_BYTES),
+            writer: Mutex::new(writer),
+            record_base,
+            queued: AtomicU64::new(record_base),
+            written: AtomicU64::new(record_base),
+            flushed: AtomicU64::new(initial_flushed),
+            checkpointed: AtomicU64::new(0),
+            sync_target: AtomicU64::new(0),
+            appends: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
+            err: Mutex::new(None),
+            flushed_mx: Mutex::new(()),
+            flushed_cv: Condvar::new(),
+            space_mx: Mutex::new(()),
+            space_cv: Condvar::new(),
+            control_tx,
+            record_pool: Mutex::new(Vec::new()),
+        });
+
+        let worker_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("holt-journal-ring".to_owned())
+            .spawn(move || run_flusher(worker_shared, control_rx))
+            .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal-ring"))?;
+
+        Ok(Self {
+            shared,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    /// Submit one fully encoded WAL record. The caller passes an owned buffer
+    /// (recycled here after the ring copies it). Sync appends return an ack.
+    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
+        if let Some(m) = self.shared.sticky_err() {
+            return Err(Error::Internal(m));
+        }
+        debug_assert!(
+            !bytes.is_empty() && bytes.len() as u64 <= self.shared.ring.capacity(),
+            "record must be non-empty and fit the ring (oversize fallback is stage 5)"
+        );
+        // Reserve → backpressure wait → memcpy → publish. Stage-1 ring has no
+        // built-in backpressure (stage 5); spin on the flusher freeing RAM.
+        let ticket = self.shared.ring.reserve(bytes.len() as u64);
+        if !self.shared.ring.reserve_space_ready(&ticket) {
+            self.shared.wait_for_ring_space(&ticket)?;
+        }
+        self.shared.ring.fill(&ticket, &bytes);
+        self.shared.ring.publish(&ticket);
+        self.shared.recycle(bytes);
+
+        let n = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared.appends.fetch_add(1, Ordering::Relaxed);
+        // No per-op flusher wake: the flusher's FLUSH_POLL drains async
+        // records within the poll window (the async RAM→page-cache budget).
+        // Sync appends + checkpoint barriers wake it explicitly via flush_to.
+
+        if sync {
+            Ok(Some(JournalAck {
+                shared: Arc::clone(&self.shared),
+                target: n,
+            }))
         } else {
-            ENQUEUE_BATCH_WINDOW
-        };
+            Ok(None)
+        }
+    }
 
+    pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
+        self.shared.record_buffer(min_capacity)
+    }
+
+    pub(crate) fn queued_work(&self) -> u64 {
+        self.shared.queued.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
+        self.shared.flush_to(observed)
+    }
+
+    pub(crate) fn truncate(&self) -> Result<()> {
+        let observed = self.shared.queued.load(Ordering::Acquire);
+        if observed == self.shared.checkpointed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (ack, rx) = crossbeam_channel::bounded(1);
+        self.shared
+            .control_tx
+            .send(Control::Truncate(ack))
+            .map_err(|_| Error::Internal("journal flusher stopped before truncate"))?;
+        rx.recv()
+            .map_err(|_| Error::Internal("journal flusher dropped truncate acknowledgement"))??;
+        self.shared.checkpointed.fetch_max(observed, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub(crate) fn needs_checkpoint(&self) -> bool {
+        self.shared.queued.load(Ordering::Acquire) != self.shared.checkpointed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn needs_flush(&self) -> bool {
+        self.shared.queued.load(Ordering::Acquire) > self.shared.flushed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stats(&self) -> JournalStats {
+        let queued_work = self.shared.queued.load(Ordering::Acquire);
+        let written_work = self.shared.written.load(Ordering::Acquire);
+        let flushed_work = self.shared.flushed.load(Ordering::Acquire);
+        let checkpointed_work = self.shared.checkpointed.load(Ordering::Acquire);
+        JournalStats {
+            appends: self.shared.appends.load(Ordering::Relaxed),
+            batches: self.shared.batches.load(Ordering::Relaxed),
+            syncs: self.shared.syncs.load(Ordering::Relaxed),
+            queued_work,
+            written_work,
+            flushed_work,
+            checkpointed_work,
+            pending_work: queued_work.saturating_sub(flushed_work),
+            checkpoint_debt: queued_work.saturating_sub(checkpointed_work),
+        }
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        let _ = self.shared.control_tx.send(Control::Stop);
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_flusher(shared: Arc<Shared>, control_rx: Receiver<Control>) {
     loop {
-        if bytes >= GROUP_COMMIT_MAX_BYTES {
-            break;
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let next = match rx.recv_timeout(deadline - now) {
-            Ok(cmd) => cmd,
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-        };
-
-        match next {
-            JournalCommand::Append {
-                bytes: record,
-                seq,
-                sync,
-                ack,
-            } => {
-                bytes += record.len();
-                let was_sync = needs_sync;
-                needs_sync |= sync;
-                if sync && !was_sync {
-                    deadline = Instant::now() + GROUP_COMMIT_WINDOW;
-                }
-                batch.push(AppendRequest {
-                    bytes: record,
-                    seq,
-                    sync,
-                    ack,
-                });
+        shared.drain_and_maybe_sync();
+        match control_rx.recv_timeout(FLUSH_POLL) {
+            // Flush wake and idle-poll timeout both just re-loop to drain +
+            // (re)check the sync target at the top.
+            Ok(Control::Flush) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Control::Truncate(ack)) => {
+                // Drain anything outstanding, then reset. The caller holds
+                // the commit gate exclusively at the checkpoint truncate
+                // boundary, so no writer is mid-reserve here.
+                shared.drain_and_maybe_sync();
+                let result = do_truncate(&shared);
+                let _ = ack.send(result);
             }
-            other => {
-                backlog.push_back(other);
+            Ok(Control::Stop) => {
+                shared.drain_and_maybe_sync();
                 break;
             }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-
-    state.batches.fetch_add(1, Ordering::Relaxed);
-    let result = write_append_batch(batch.as_slice(), needs_sync, state);
-    notify_append_batch(batch, &result, state.record_pool);
 }
 
-fn write_append_batch(
-    batch: &[AppendRequest],
-    needs_sync: bool,
-    state: WorkerState<'_>,
-) -> Result<()> {
-    let mut writer = state
-        .writer
-        .lock()
-        .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
-    let mut written_seq = 0;
-    for req in batch {
-        writer.append_encoded(&req.bytes)?;
-        written_seq = written_seq.max(req.seq);
+fn do_truncate(shared: &Shared) -> Result<()> {
+    if let Some(m) = shared.sticky_err() {
+        return Err(Error::Internal(m));
     }
-    if written_seq != 0 {
-        state.written_work.fetch_max(written_seq, Ordering::AcqRel);
-    }
-
-    if needs_sync {
-        writer.flush()?;
-        state.syncs.fetch_add(1, Ordering::Relaxed);
-        let durable_seq = batch.iter().map(|req| req.seq).max().unwrap_or(0);
-        state.flushed_work.fetch_max(durable_seq, Ordering::AcqRel);
-    }
+    let mut w = shared.writer.lock().unwrap();
+    w.truncate()?;
+    drop(w);
+    // The ring is fully drained (the drain above caught up; no concurrent
+    // writer under the checkpoint gate). Reset byte cursors; record count is
+    // preserved as the stable cross-truncation order.
+    shared.ring.reset_after_drain();
     Ok(())
-}
-
-fn notify_append_batch(
-    batch: &mut Vec<AppendRequest>,
-    result: &Result<()>,
-    record_pool: &Mutex<Vec<Vec<u8>>>,
-) {
-    for mut req in batch.drain(..) {
-        if let Some(ack) = req.ack.take() {
-            let _ = ack.send(match result {
-                Ok(()) => Ok(()),
-                Err(Error::Internal(msg)) => Err(Error::Internal(msg)),
-                Err(_) => Err(Error::Internal("journal worker failed")),
-            });
-        }
-        recycle_record_buffer(record_pool, req.bytes);
-    }
-}
-
-fn recycle_record_buffer(record_pool: &Mutex<Vec<Vec<u8>>>, mut buf: Vec<u8>) {
-    if buf.capacity() > RECORD_BUFFER_RETAIN_MAX {
-        return;
-    }
-    buf.clear();
-    if let Ok(mut pool) = record_pool.try_lock() {
-        if pool.len() < RECORD_BUFFER_POOL_LIMIT {
-            pool.push(buf);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::journal::codec::FILE_HEADER_SIZE;
+
+    // The 6 legacy contract tests, retargeted at the ring-backed Journal.
 
     #[test]
     fn fresh_journal_flush_and_truncate_are_noops() {
@@ -510,10 +484,7 @@ mod tests {
 
         journal.truncate().unwrap();
         assert!(!journal.needs_checkpoint());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            FILE_HEADER_SIZE as u64,
-        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), FILE_HEADER_SIZE as u64);
 
         let syncs_after_truncate = journal.stats().syncs;
         journal.flush_up_to(journal.queued_work()).unwrap();
@@ -560,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_record_buffers_are_recycled_after_worker_append() {
+    fn encoded_record_buffers_are_recycled_after_flusher_append() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 

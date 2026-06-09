@@ -54,10 +54,6 @@ io-uring = ["dep:io-uring"]
 tracing = ["dep:tracing"]
 # Enables the `holt::metrics` Prometheus text renderer.
 metrics = []
-# Experimental lock-free shared WAL ring (concurrent-append group commit).
-# Stage 1: self-contained ring buffer + loom/unit tests, NOT yet wired into
-# the Journal (zero production-path impact). See docs/design/wal-ring.md.
-wal_ring = []
 
 [profile.release]
 lto = "thin"

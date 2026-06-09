@@ -1,9 +1,10 @@
-//! Lock-free shared WAL ring — stage 1 (see `docs/design/wal-ring.md`).
+//! Lock-free shared WAL ring (see `docs/design/wal-ring.md`).
 //!
-//! Replaces the per-record `Vec` + single crossbeam channel + single
-//! batching worker (the measured concurrent-write bottleneck: durable
-//! writes cap at ~0.29 Mops/s @16t while the in-memory ART path scales to
-//! 5.78). N writers append to ONE ordered log concurrently:
+//! The append substrate for [`super::group_commit::Journal`]. Replaced the
+//! per-record `Vec` + single crossbeam channel + single batching worker (the
+//! measured concurrent-write bottleneck: durable writes capped at ~0.29
+//! Mops/s @16t while the in-memory ART path scaled to 5.78). N writers append
+//! to ONE ordered log concurrently:
 //!
 //! 1. `reserve(total_len)` — one `fetch_add` on `tail`, the byte cursor.
 //!    Successive reservations tile `[0, tail)` with NO gaps (each start ==
@@ -44,23 +45,21 @@
 //!
 //! ## W2D + no-stall (preserved from the work-id design)
 //!
-//! - W2D: checkpoint captures `committed_addr` under `commit_gate`'s
-//!   exclusive side, which waits for in-gate writers; `publish` folds the
-//!   writer's interval synchronously before it releases the gate, so the
-//!   captured watermark covers every record whose blob is in the dirty
-//!   snapshot. (Wiring is stage 6.)
+//! - W2D: checkpoint captures `committed_addr` (via the Journal's record-count
+//!   watermark) under `commit_gate`'s exclusive side, which waits for in-gate
+//!   writers; `publish` folds the writer's interval synchronously before it
+//!   releases the gate, so the captured watermark covers every record whose
+//!   blob is in the dirty snapshot.
 //! - No prefix stall on `next_seq` gaps: the byte range is allocated in
 //!   `reserve`, at the point a record actually exists — failed guards /
 //!   early returns burn `next_seq`, never `tail`.
 //!
-//! Stage 1 is deliberately self-contained: the flusher copies into a
-//! caller-supplied sink (`copy_committed_prefix`), not the real
-//! `WalWriter` — that wiring, the sync-ack path, backpressure parking, and
-//! checkpoint integration are stages 2–6.
+//! The ring is a pure append substrate: `copy_committed_prefix` drains into a
+//! caller-supplied sink. `group_commit` owns the `WalWriter`, the sync-ack
+//! path, backpressure parking, and checkpoint integration.
 
-// Stage 1 exercises the ring only from its own tests; nothing in the
-// production path constructs it yet (the `group_commit` wiring is stage 2).
-// Remove this when `Journal` starts using the ring.
+// `group_commit::Journal` is the production consumer; a few small accessors
+// (`append`, `tail`, …) exist only for the ring's own unit/loom tests.
 #![allow(dead_code)]
 // `loom` is a build-time cfg set only by the model-check pass
 // (`RUSTFLAGS="--cfg loom"`), never a Cargo feature, so the lint can't see it.
@@ -714,7 +713,7 @@ mod tests {
 
 // ===========================================================================
 // loom model: gap-safety + memory-ordering of reserve->fill->publish->copy.
-// Run with:  RUSTFLAGS="--cfg loom" cargo test --features wal_ring ring::loom
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib journal::ring::loom
 // ===========================================================================
 #[cfg(loom)]
 mod loom_tests {

@@ -1,14 +1,15 @@
 # Design: lock-free shared WAL ring (concurrent-append group commit)
 
-Status: **IMPLEMENTED & MEASURED** behind the `wal_ring` feature (default off).
-A/B (x86, `objstore put`): concurrent durable write **2.6–5.3× faster than
-RocksDB** at 4/8/16 threads (5.8–6.5× over the legacy backend), negative→
-positive scaling, p99 51µs @16t. Validated dual-arch with the ring LIVE: 6
-contract tests, proptest oracle, checkpoint_failpoint crash-injection,
-concurrent_stress, loom gap-safety. Remaining before flipping the default:
-multi-process SIGKILL crash-soak + `advance`-lock loom + built-in backpressure.
-Note: the realized design keys on the **byte tiling**, not a separate work-id
-(loom caught the work-id/byte-order disagreement — see below).
+Status: **SHIPPED — the sole WAL backend** (the legacy channel+worker has been
+removed; there is no feature flag). A/B (x86, `objstore put`): concurrent
+durable write **2.8–5.5× faster than RocksDB** at 1/4/8/16 threads (≈5–6× over
+the old backend), positive scaling, p99 ≤56µs @16t, 1t 1.12 Mops/s. Validated
+dual-arch: full lib + integration suite, proptest BTreeMap/WAL-replay oracle,
+checkpoint_failpoint crash-injection, concurrent_stress, loom gap-safety
+(2 + 3 publishers), and a **multi-process SIGKILL crash-soak** (40 rounds,
+every recovery a contiguous valid prefix). Built-in backpressure parks on a
+condvar. Note: the realized design keys on the **byte tiling**, not a separate
+work-id (loom caught the work-id/byte-order disagreement — see below).
 
 ## Problem (measured, not assumed)
 

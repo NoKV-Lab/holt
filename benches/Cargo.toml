@@ -20,9 +20,6 @@ sled = { version = "0.34", optional = true }
 default = ["comparators"]
 comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled"]
 io-uring = ["holt/io-uring"]
-# Build the engine with the lock-free shared WAL ring (concurrent-append
-# group commit) for A/B benchmarking vs the legacy channel+worker.
-wal_ring = ["holt/wal_ring"]
 
 [[bench]]
 name = "regression"
