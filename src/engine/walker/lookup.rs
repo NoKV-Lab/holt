@@ -13,7 +13,7 @@ use crate::layout::{
 use std::mem::size_of;
 use std::sync::Arc;
 
-use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::{BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup};
 
 use super::cast;
 use super::readers::{child_offset, resolve_typed};
@@ -138,11 +138,14 @@ where
         // (No drop needed for `root_pin`: it's a borrow held by
         // the caller, not an owned `Arc` we'd be releasing here.)
 
-        let Some((child_pin, child_depth)) =
-            pin_validated_child(bm, route_cache, key, root_pin, 0, crossing)?
+        let Some(crossing) = validate_child_crossing(bm, route_cache, key, root_pin, 0, crossing)?
         else {
             bm.note_optimistic_restart();
             continue 'restart;
+        };
+        let (child_pin, child_depth) = match cold_lookup_or_pin(bm, key, crossing, &mut consume)? {
+            ColdLookupOrPin::Done(result) => return Ok(result),
+            ColdLookupOrPin::Pin { pin, depth } => (pin, depth),
         };
 
         // Cross-blob hops. Same pattern; on a torn read we restart
@@ -198,8 +201,17 @@ where
         }
         cache.refresh_parent_version(key, route, parent_version);
     }
-    let child_pin = match bm.pin(route.child_guid) {
-        Ok(pin) => pin,
+    let child_pin = match cold_lookup_or_pin(
+        bm,
+        key,
+        BlobNodeCrossing {
+            child_guid: route.child_guid,
+            child_depth: route.child_depth,
+        },
+        consume,
+    ) {
+        Ok(ColdLookupOrPin::Done(result)) => return Ok(RouteLookup::Done(result)),
+        Ok(ColdLookupOrPin::Pin { pin, .. }) => pin,
         Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
@@ -207,7 +219,6 @@ where
         }
         Err(e) => return Err(e),
     };
-    child_pin.prefetch_header();
     drop(parent_guard);
 
     let crossing = {
@@ -227,7 +238,7 @@ where
         }
     };
     {
-        let Some((next_pin, next_depth)) = pin_validated_child(
+        let Some(crossing) = validate_child_crossing(
             bm,
             Some(cache),
             key,
@@ -237,6 +248,10 @@ where
         )?
         else {
             return Ok(RouteLookup::Restart);
+        };
+        let (next_pin, next_depth) = match cold_lookup_or_pin(bm, key, crossing, consume)? {
+            ColdLookupOrPin::Done(result) => return Ok(RouteLookup::Done(result)),
+            ColdLookupOrPin::Pin { pin, depth } => (pin, depth),
         };
         match lookup_from_pinned_blob(bm, Some(cache), key, next_pin, next_depth, consume)? {
             CrossBlobLookup::Done(result) => Ok(RouteLookup::Done(result)),
@@ -277,24 +292,31 @@ where
             }
         };
 
-        let Some((child_pin, child_depth)) =
-            pin_validated_child(bm, route_cache, key, &pin, depth, crossing)?
+        let Some(crossing) = validate_child_crossing(bm, route_cache, key, &pin, depth, crossing)?
         else {
             return Ok(CrossBlobLookup::Restart);
         };
-        pin = child_pin;
-        depth = child_depth;
+        match cold_lookup_or_pin(bm, key, crossing, consume)? {
+            ColdLookupOrPin::Done(result) => return Ok(CrossBlobLookup::Done(result)),
+            ColdLookupOrPin::Pin {
+                pin: child_pin,
+                depth: child_depth,
+            } => {
+                pin = child_pin;
+                depth = child_depth;
+            }
+        }
     }
 }
 
-fn pin_validated_child(
+fn validate_child_crossing(
     bm: &BufferManager,
     route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     parent_pin: &Arc<CachedBlob>,
     parent_depth: usize,
     expected: BlobNodeCrossing,
-) -> Result<Option<(Arc<CachedBlob>, usize)>> {
+) -> Result<Option<BlobNodeCrossing>> {
     let parent_guard = parent_pin.read();
     let parent_version = parent_pin.content_version();
     let frame = BlobFrameRef::wrap(parent_guard.as_slice());
@@ -323,10 +345,58 @@ fn pin_validated_child(
         );
         bm.mark_route_resident(actual.child_guid);
     }
-    let child_pin = bm.pin(actual.child_guid)?;
-    child_pin.prefetch_header();
-    drop(parent_guard);
-    Ok(Some((child_pin, actual.child_depth)))
+    Ok(Some(actual))
+}
+
+enum ColdLookupOrPin<R> {
+    Done(Option<R>),
+    Pin { pin: Arc<CachedBlob>, depth: usize },
+}
+
+fn cold_lookup_or_pin<R, F>(
+    bm: &BufferManager,
+    key: SearchKey<'_>,
+    crossing: BlobNodeCrossing,
+    consume: &mut F,
+) -> Result<ColdLookupOrPin<R>>
+where
+    F: FnMut(LookupHit<'_>) -> R,
+{
+    let Some(user_key) = key.user_bytes() else {
+        let pin = bm.pin(crossing.child_guid)?;
+        pin.prefetch_header();
+        return Ok(ColdLookupOrPin::Pin {
+            pin,
+            depth: crossing.child_depth,
+        });
+    };
+
+    let mut child_guid = crossing.child_guid;
+    let mut child_depth = crossing.child_depth;
+    loop {
+        match bm.cold_lookup_blob(child_guid, user_key, child_depth)? {
+            ColdBlobLookup::Unknown => {
+                let pin = bm.pin(child_guid)?;
+                pin.prefetch_header();
+                return Ok(ColdLookupOrPin::Pin {
+                    pin,
+                    depth: child_depth,
+                });
+            }
+            ColdBlobLookup::Found { value, seq } => {
+                let out = consume(LookupHit { value: &value, seq });
+                return Ok(ColdLookupOrPin::Done(Some(out)));
+            }
+            ColdBlobLookup::Crossing {
+                child_guid: next_guid,
+                child_depth: next_depth,
+            } => {
+                child_guid = next_guid;
+                child_depth = next_depth;
+            }
+            ColdBlobLookup::NotFound => return Ok(ColdLookupOrPin::Done(None)),
+        }
+    }
 }
 
 // ---------- descent dispatch ----------

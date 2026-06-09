@@ -48,6 +48,11 @@ impl<'a> SearchKey<'a> {
     }
 
     #[inline]
+    pub(crate) fn user_bytes(self) -> Option<&'a [u8]> {
+        self.virtual_terminator.then_some(self.bytes)
+    }
+
+    #[inline]
     pub(crate) fn remaining_len(self, depth: usize) -> usize {
         self.len().saturating_sub(depth)
     }

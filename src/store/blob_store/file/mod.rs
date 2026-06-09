@@ -18,6 +18,8 @@
 //!                      is compacted
 //!     manifest.log   — append-only set/delete deltas replayed on
 //!                      open; free slots are rebuilt from holes
+//!     cold.idx       — append-only cold-read acceleration sidecar;
+//!                      safe to delete and rebuilt by checkpoint writes
 //! ```
 //!
 //! Design rationale:
@@ -59,6 +61,7 @@
 //! Switching between them is an internal performance toggle; no
 //! caller-visible behaviour changes.
 
+mod cold_index;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod uring;
 
@@ -77,6 +80,8 @@ use std::sync::{Mutex, RwLock};
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
+use cold_index::ColdIndex;
+
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
 use super::{AlignedBlobBuf, BlobStore};
@@ -90,6 +95,8 @@ const DATA_FILENAME: &str = "blobs.dat";
 const MANIFEST_FILENAME: &str = "manifest.bin";
 /// Append-only manifest delta log inside `data_dir`.
 const MANIFEST_LOG_FILENAME: &str = "manifest.log";
+/// Rebuildable cold-read sidecar inside `data_dir`.
+const COLD_INDEX_FILENAME: &str = "cold.idx";
 /// Filename used as the rename staging target for the manifest.
 const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
 /// Conservative iovec chunk limit used by the non-uring batch
@@ -149,6 +156,7 @@ pub struct FileBlobStore {
     data_dir: PathBuf,
     data_file: File,
     manifest: RwLock<Manifest>,
+    cold_index: ColdIndex,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
     /// overwrites of existing blobs leave this false, avoiding
     /// manifest I/O on pure data overwrites.
@@ -308,6 +316,7 @@ impl FileBlobStore {
         let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
+        let cold_index = ColdIndex::open(data_dir.join(COLD_INDEX_FILENAME))?;
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         let (uring, registered_buffers) = {
@@ -325,6 +334,7 @@ impl FileBlobStore {
             data_dir,
             data_file,
             manifest: RwLock::new(manifest),
+            cold_index,
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
             data_sync_epoch: AtomicU64::new(0),
@@ -374,11 +384,13 @@ impl FileBlobStore {
         let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
+        let cold_index = ColdIndex::open(data_dir.join(COLD_INDEX_FILENAME))?;
 
         Ok(Self {
             data_dir,
             data_file,
             manifest: RwLock::new(manifest),
+            cold_index,
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
             data_sync_epoch: AtomicU64::new(0),
@@ -419,7 +431,7 @@ impl FileBlobStore {
         })
     }
 
-    fn assign_write_slot(&self, guid: BlobGuid) -> u64 {
+    fn assign_write_entry(&self, guid: BlobGuid) -> ManifestEntry {
         let mut m = self.manifest.write().unwrap();
         let entry = m.assign_write_entry(guid);
         m.pending_log.push(ManifestDelta::Set {
@@ -428,10 +440,13 @@ impl FileBlobStore {
             generation: entry.generation,
         });
         self.manifest_dirty.store(true, Ordering::Release);
-        entry.slot
+        entry
     }
 
-    fn assign_write_slots(&self, guids: impl IntoIterator<Item = BlobGuid>) -> Vec<u64> {
+    fn assign_write_entries(
+        &self,
+        guids: impl IntoIterator<Item = BlobGuid>,
+    ) -> Vec<ManifestEntry> {
         let mut m = self.manifest.write().unwrap();
         let mut out = Vec::new();
         let mut dirty = false;
@@ -443,7 +458,7 @@ impl FileBlobStore {
                 generation: entry.generation,
             });
             dirty = true;
-            out.push(entry.slot);
+            out.push(entry);
         }
         if dirty {
             self.manifest_dirty.store(true, Ordering::Release);
@@ -468,19 +483,36 @@ impl FileBlobStore {
     fn prepare_blob_writes<'a>(
         &self,
         writes: &'a [(BlobGuid, &'a AlignedBlobBuf)],
-    ) -> Result<Vec<(u64, &'a AlignedBlobBuf)>> {
+    ) -> Result<Vec<PreparedBlobWrite<'a>>> {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
-        let slots = self.assign_write_slots(writes.iter().map(|(guid, _)| *guid));
-        if let Some(required_slots) = slots.iter().map(|slot| slot.saturating_add(1)).max() {
+        let entries = self.assign_write_entries(writes.iter().map(|(guid, _)| *guid));
+        if let Some(required_slots) = entries
+            .iter()
+            .map(|entry| entry.slot.saturating_add(1))
+            .max()
+        {
             self.ensure_data_capacity(required_slots)?;
         }
         let mut io = Vec::with_capacity(writes.len());
-        for ((_, src), slot) in writes.iter().zip(slots) {
-            io.push((slot * u64::from(PAGE_SIZE), *src));
+        for ((guid, src), entry) in writes.iter().zip(entries) {
+            io.push(PreparedBlobWrite {
+                guid: *guid,
+                generation: entry.generation,
+                offset: entry.slot * u64::from(PAGE_SIZE),
+                src,
+            });
         }
         Ok(io)
+    }
+
+    fn refresh_cold_index(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
+        for write in writes {
+            self.cold_index
+                .put_blob(write.guid, write.generation, write.src.as_slice())?;
+        }
+        Ok(())
     }
 
     // ---------- I/O dispatch (uring vs pread/pwrite) ----------
@@ -511,16 +543,18 @@ impl FileBlobStore {
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pwrite_many_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
+    fn pwrite_many_at(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
-        ring.pwrite_many_at(writes)?;
+        let io: Vec<_> = writes.iter().map(|w| (w.offset, w.src)).collect();
+        ring.pwrite_many_at(&io)?;
         Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pwrite_many_and_sync_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
+    fn pwrite_many_and_sync_at(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
-        ring.pwrite_many_and_sync_at(writes)?;
+        let io: Vec<_> = writes.iter().map(|w| (w.offset, w.src)).collect();
+        ring.pwrite_many_and_sync_at(&io)?;
         Ok(())
     }
 
@@ -538,7 +572,7 @@ impl FileBlobStore {
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pwrite_many_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
+    fn pwrite_many_at(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -546,9 +580,9 @@ impl FileBlobStore {
         let mut ordered: Vec<_> = writes
             .iter()
             .enumerate()
-            .map(|(order, (offset, src))| OrderedWrite {
-                offset: *offset,
-                src: src.as_slice(),
+            .map(|(order, write)| OrderedWrite {
+                offset: write.offset,
+                src: write.src.as_slice(),
                 order,
             })
             .collect();
@@ -759,11 +793,13 @@ impl BlobStore for FileBlobStore {
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        let slot = self.assign_write_slot(guid);
-        let offset = slot * u64::from(PAGE_SIZE);
-        self.ensure_data_capacity(slot.saturating_add(1))?;
+        let entry = self.assign_write_entry(guid);
+        let offset = entry.slot * u64::from(PAGE_SIZE);
+        self.ensure_data_capacity(entry.slot.saturating_add(1))?;
         self.mark_data_write_started();
         self.pwrite_at(offset, src)?;
+        self.cold_index
+            .put_blob(guid, entry.generation, src.as_slice())?;
         Ok(())
     }
 
@@ -775,6 +811,7 @@ impl BlobStore for FileBlobStore {
         }
         self.mark_data_write_started();
         self.pwrite_many_at(&io)?;
+        self.refresh_cold_index(&io)?;
         Ok(())
     }
 
@@ -790,6 +827,7 @@ impl BlobStore for FileBlobStore {
             let epoch = self.mark_data_write_started();
             self.pwrite_many_and_sync_at(&io)?;
             self.mark_data_synced(epoch);
+            self.refresh_cold_index(&io)?;
             Ok(())
         }
 
@@ -798,6 +836,7 @@ impl BlobStore for FileBlobStore {
             let io = self.prepare_blob_writes(writes)?;
             self.mark_data_write_started();
             self.pwrite_many_at(&io)?;
+            self.refresh_cold_index(&io)?;
             Ok(())
         }
     }
@@ -807,6 +846,7 @@ impl BlobStore for FileBlobStore {
         if let Some(entry) = m.entries.remove(&guid) {
             m.pending_free_slots.push(entry.slot);
             m.pending_log.push(ManifestDelta::Delete { guid });
+            self.cold_index.delete_blob(guid)?;
             self.manifest_dirty.store(true, Ordering::Release);
         }
         Ok(())
@@ -837,12 +877,33 @@ impl BlobStore for FileBlobStore {
             m.pending_log.clear();
             m.publish_pending_free_slots();
         }
+        self.cold_index.flush()?;
         Ok(())
     }
 
     fn needs_flush(&self) -> bool {
-        self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
+        self.data_needs_sync().is_some()
+            || self.manifest_dirty.load(Ordering::Acquire)
+            || self.cold_index.needs_flush()
     }
+
+    fn cold_lookup_blob(
+        &self,
+        guid: BlobGuid,
+        key: &[u8],
+        depth: usize,
+    ) -> Result<super::ColdBlobLookup> {
+        let generation = self.entry_of(guid)?.generation;
+        self.cold_index.lookup_blob(guid, generation, key, depth)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedBlobWrite<'a> {
+    guid: BlobGuid,
+    generation: u64,
+    offset: u64,
+    src: &'a AlignedBlobBuf,
 }
 
 impl Manifest {

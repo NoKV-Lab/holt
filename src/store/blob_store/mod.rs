@@ -37,6 +37,21 @@ pub use memory::MemoryBlobStore;
 use crate::api::errors::Result;
 use crate::layout::BlobGuid;
 
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdBlobLookup {
+    Unknown,
+    Found {
+        value: Vec<u8>,
+        seq: u64,
+    },
+    Crossing {
+        child_guid: BlobGuid,
+        child_depth: usize,
+    },
+    NotFound,
+}
+
 /// A blob-granular storage interface.
 ///
 /// All implementations are `Send + Sync` so the buffer manager can
@@ -117,5 +132,15 @@ pub trait BlobStore: Send + Sync {
     /// `true` iff `guid` exists. Default impl scans `list_blobs`.
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.list_blobs().map(|v| v.contains(&guid))
+    }
+
+    #[doc(hidden)]
+    fn cold_lookup_blob(
+        &self,
+        _guid: BlobGuid,
+        _key: &[u8],
+        _depth: usize,
+    ) -> Result<ColdBlobLookup> {
+        Ok(ColdBlobLookup::Unknown)
     }
 }

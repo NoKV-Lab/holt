@@ -142,7 +142,7 @@ use guid_hash::GuidBuildHasher;
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
-use super::blob_store::{AlignedBlobBuf, BlobStore};
+use super::blob_store::{AlignedBlobBuf, BlobStore, ColdBlobLookup};
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -1118,6 +1118,24 @@ impl BufferManager {
             return Err(Self::pending_delete_not_found(guid));
         }
         Ok(self.insert_owned_into_cache(guid, scratch, access))
+    }
+
+    pub(crate) fn cold_lookup_blob(
+        &self,
+        guid: BlobGuid,
+        key: &[u8],
+        depth: usize,
+    ) -> Result<ColdBlobLookup> {
+        if self.is_pending_delete(guid) || self.cache.contains_key(&guid) {
+            return Ok(ColdBlobLookup::Unknown);
+        }
+        {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.is_protected_or_pending(&guid) {
+                return Ok(ColdBlobLookup::Unknown);
+            }
+        }
+        self.store.cold_lookup_blob(guid, key, depth)
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {

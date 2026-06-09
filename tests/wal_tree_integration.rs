@@ -1311,6 +1311,52 @@ fn tree_stats_does_not_perturb_cache_counters_or_lru() {
 }
 
 #[test]
+fn cold_sidecar_serves_checkpointed_child_blob_after_reopen() {
+    let dir = tempdir().unwrap();
+    let mut cfg = manual_checkpoint_cfg(dir.path());
+    cfg.buffer_pool_size = 1;
+
+    let target_key = b"cold/bucket/table/part-0999/object";
+    let target_value = vec![b'm'; 96];
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let payload = vec![b'x'; 1024];
+        for i in 0..1000u32 {
+            let key = format!("cold/bucket/table/part-{i:04}/object");
+            let value = if key.as_bytes() == target_key {
+                &target_value
+            } else {
+                &payload
+            };
+            tree.put(key.as_bytes(), value).unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().blob_count > 1,
+            "test must force at least one child blob"
+        );
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let before = tree.stats().unwrap();
+    assert_eq!(
+        tree.get(target_key).unwrap().as_deref(),
+        Some(target_value.as_slice())
+    );
+    let after = tree.stats().unwrap();
+    assert!(
+        after.bm_point_full_blob_reads <= before.bm_point_full_blob_reads + 1,
+        "cold sidecar should avoid loading every child blob on point get (before={}, after={})",
+        before.bm_point_full_blob_reads,
+        after.bm_point_full_blob_reads,
+    );
+    assert!(tree
+        .get(b"cold/bucket/table/missing/object")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn batch_replay_then_checkpoint_then_reopen_preserves_data() {
     // Same W2D closure as `replay_then_checkpoint_then_reopen_preserves_data`,
     // but exercises the `apply_batch` path: a single `Batch` WAL
