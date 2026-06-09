@@ -575,7 +575,9 @@ fn insert_batch_in_pinned_blob(
                 bm.note_walker_blob_hops(blob_hops_per_item, depth);
             }
             Ok(InsertStep::Crossing(_))
-            | Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => break,
+            | Err(Error::Alloc(
+                crate::store::AllocError::OutOfSpace { .. } | crate::store::AllocError::OutOfSlots,
+            )) => break,
             Err(e) => return Err(e.with_blob_guid(current_guid)),
         }
     }
@@ -688,6 +690,31 @@ fn lock_coupled_insert_in_blob(
                 bm.note_spillover();
                 compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
                 current_dirty = true;
+            }
+            Err(Error::Alloc(crate::store::AllocError::OutOfSlots)) => {
+                // The slot table filled. Structural ops abandon old nodes
+                // (offset-addressing R1 = abandon-on-free); those dead
+                // slots are reclaimed only by compaction, and under
+                // concurrent write pressure the *background* compactor
+                // can be starved of this blob's exclusive latch — so
+                // reclaim inline here, where we already hold it. If
+                // compaction frees slots the retry proceeds; only if the
+                // blob is genuinely full of *live* nodes do we spill a
+                // subtree out (now with post-compaction slot headroom for
+                // the spillover BlobNode).
+                let before = guard.frame().header().num_slots;
+                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+                current_dirty = true;
+                if guard.frame().header().num_slots >= before {
+                    {
+                        let mut frame = guard.frame();
+                        spillover_blob(bm, &mut frame, seq)
+                            .map_err(|e| e.with_blob_guid(current_guid))?;
+                    }
+                    bm.note_merge_candidate(current_guid);
+                    bm.note_spillover();
+                    compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+                }
             }
             Err(e) => return Err(e.with_blob_guid(current_guid)),
         }
