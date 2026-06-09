@@ -1195,7 +1195,7 @@ fn insert_into_leaf(
                 for b in &mut region[new_value.len()..] {
                     *b = 0;
                 }
-                let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
+                let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq, new_key.fingerprint());
                 write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
                 if was_tombstoned {
                     let h = frame.header_mut();

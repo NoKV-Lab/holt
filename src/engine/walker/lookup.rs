@@ -372,6 +372,16 @@ fn leaf_check<'a>(
     if leaf.tombstone != 0 {
         return Ok(LookupResult::NotFound);
     }
+    // Fingerprint gate: a path-compressed ART reaches a leaf whose key
+    // may still differ from the search key (lazy expansion). When the
+    // leaf carries a fingerprint (`!= 0`) and it disagrees with the
+    // search key's, the keys cannot be equal — reject without the
+    // second cache miss of reading the key extent. A match (or an
+    // un-fingerprinted older leaf) still does the full compare below,
+    // so this is never a false negative.
+    if leaf.key_fp != 0 && leaf.key_fp != key.fingerprint() {
+        return Ok(LookupResult::NotFound);
+    }
     let (leaf_key, value) = leaf_extent(frame, leaf)?;
     if !key.eq_slice(leaf_key) {
         return Ok(LookupResult::NotFound);

@@ -115,6 +115,33 @@ impl<'a> SearchKey<'a> {
         usize::from(other[0] == 0)
     }
 
+    /// One-byte fingerprint of the full key (including the virtual
+    /// terminator), used by `leaf_check` to reject a non-matching
+    /// leaf without reading its key extent. FNV-1a folded to a byte,
+    /// remapped away from `0` so `0` can mean "no fingerprint" on the
+    /// leaf side. Computed identically on the write and lookup paths
+    /// (both hold a `SearchKey`), so a present key always matches its
+    /// stored fingerprint — the check is never a false negative.
+    #[inline]
+    pub(crate) fn fingerprint(self) -> u8 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        for &b in self.bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        if self.virtual_terminator {
+            // terminator byte is 0: xor is a no-op, still mix once
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let fp = (h ^ (h >> 32)) as u8;
+        // Reserve 0 for "no fingerprint"; remap a 0 hash to 0xFF.
+        if fp == 0 {
+            0xFF
+        } else {
+            fp
+        }
+    }
+
     pub(crate) fn write_to_slice(self, dst: &mut [u8]) {
         debug_assert_eq!(dst.len(), self.len());
         if self.virtual_terminator {
@@ -146,5 +173,21 @@ mod tests {
         assert!(key.range_eq(2, b"c\0"));
         assert_eq!(key.common_prefix_with_slice(0, b"abc\0def"), 4);
         assert_eq!(key.common_prefix_with_slice(0, b"abcdef"), 3);
+    }
+
+    #[test]
+    fn fingerprint_is_non_zero_and_deterministic() {
+        // Never 0 (0 is reserved for "no fingerprint" on the leaf).
+        for k in [&b""[..], b"a", b"hello", b"bucket-07/path/sub/file-0001.bin"] {
+            let fp = SearchKey::user(k).fingerprint();
+            assert_ne!(fp, 0, "fingerprint must be non-zero for {k:?}");
+            assert_eq!(fp, SearchKey::user(k).fingerprint(), "deterministic");
+        }
+        // The virtual terminator participates: a user key and the same
+        // bytes as an exact (terminator-free) key generally differ.
+        assert_ne!(
+            SearchKey::user(b"hello").fingerprint(),
+            SearchKey::exact(b"hello").fingerprint(),
+        );
     }
 }

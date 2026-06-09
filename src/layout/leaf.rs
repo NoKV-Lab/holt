@@ -28,7 +28,14 @@ pub struct Leaf {
     /// 0 = live leaf, 1 = tombstone (soft-deleted; pending
     /// reclaim via compactBlob).
     pub tombstone: u8,
-    _pad: u8,
+    /// One-byte fingerprint of the full key (a non-zero hash). A
+    /// point lookup compares it before touching the key/value
+    /// extent, so ~255/256 of non-matching leaves are rejected
+    /// without the second (extent) cache miss. `0` means "no
+    /// fingerprint" (an older-format leaf) — the reader then always
+    /// falls back to the full extent compare. Never a false
+    /// negative: a mismatch only fires when the keys truly differ.
+    pub key_fp: u8,
     /// Byte offset within the blob to the key/value extent. The
     /// extent layout is `u16 key_len ++ key_bytes ++ value_bytes`,
     /// 8-byte-aligned tail-padded.
@@ -41,17 +48,20 @@ pub struct Leaf {
 const _: () = assert!(size_of::<Leaf>() == 16);
 const _: () = assert!(offset_of!(Leaf, value_size) == 0);
 const _: () = assert!(offset_of!(Leaf, tombstone) == 2);
+const _: () = assert!(offset_of!(Leaf, key_fp) == 3);
 const _: () = assert!(offset_of!(Leaf, key_offset) == 4);
 const _: () = assert!(offset_of!(Leaf, seq) == 8);
 
 impl Leaf {
-    /// Construct a live (non-tombstone) leaf.
+    /// Construct a live (non-tombstone) leaf. `key_fp` is the
+    /// one-byte key fingerprint (non-zero) the lookup uses to skip
+    /// the extent read on a mismatch; pass `0` to disable it.
     #[must_use]
-    pub const fn live(key_offset: u32, value_size: u16, seq: u64) -> Self {
+    pub const fn live(key_offset: u32, value_size: u16, seq: u64, key_fp: u8) -> Self {
         Self {
             value_size,
             tombstone: 0,
-            _pad: 0,
+            key_fp,
             key_offset,
             seq,
         }

@@ -182,6 +182,45 @@ fn leaf_inline_split_erase_and_compaction() {
 }
 
 #[test]
+fn leaf_fingerprint_rejects_wrong_key_keeps_present_key() {
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+
+    // Large value forces an extent Leaf (not LeafInline); the
+    // fingerprint gate only guards the extent read path.
+    let big = vec![0xCD; 100];
+    put(&mut frame, b"hello", &big, 1);
+
+    // Lazy expansion: looking up a different key descends to the one
+    // leaf, whose fingerprint rejects the wrong key — without a false
+    // negative on the present key.
+    assert_eq!(get(&frame, b"hello").as_deref(), Some(big.as_slice()));
+    assert_eq!(get(&frame, b"hellx"), None);
+    assert_eq!(get(&frame, b"help"), None);
+
+    // The written extent leaf carries a non-zero fingerprint.
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
+    let body = frame.as_ref().body_of_slot(root).unwrap();
+    let leaf = *cast::<crate::layout::Leaf>(body);
+    assert_ne!(leaf.key_fp, 0, "written leaf must carry a fingerprint");
+
+    // Keys sharing a long prefix: a missing sibling resolves to
+    // NotFound; both present keys are still found.
+    put(&mut frame, b"shared/prefix/aaaa", &big, 2);
+    put(&mut frame, b"shared/prefix/bbbb", &big, 3);
+    assert_eq!(
+        get(&frame, b"shared/prefix/aaaa").as_deref(),
+        Some(big.as_slice())
+    );
+    assert_eq!(
+        get(&frame, b"shared/prefix/bbbb").as_deref(),
+        Some(big.as_slice())
+    );
+    assert_eq!(get(&frame, b"shared/prefix/cccc"), None);
+}
+
+#[test]
 fn two_keys_with_shared_prefix_creates_prefix_plus_node4() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);

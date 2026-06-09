@@ -82,7 +82,7 @@ pub(super) fn write_leaf(
         s[2 + key_len..2 + key_len + value.len()].copy_from_slice(value);
     }
     let leaf_out = frame.alloc_node(NodeType::Leaf)?;
-    let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq);
+    let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq, key.fingerprint());
     write_struct_to_slot(frame, leaf_out.slot, &leaf)?;
     Ok(leaf_out.slot)
 }

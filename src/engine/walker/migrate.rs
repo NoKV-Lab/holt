@@ -409,7 +409,14 @@ fn clone_leaf(
     // Preserve tombstone byte in preserve-mode; filter-mode bailed
     // out above so the survivor is always live.
     let new_leaf = if filter_tombstones {
-        Leaf::live(dst_ext.byte_offset, src_leaf.value_size, src_leaf.seq)
+        // Carry the source key fingerprint over — the key bytes are
+        // copied verbatim, so the fingerprint is still valid.
+        Leaf::live(
+            dst_ext.byte_offset,
+            src_leaf.value_size,
+            src_leaf.seq,
+            src_leaf.key_fp,
+        )
     } else {
         let mut copy = src_leaf;
         copy.key_offset = dst_ext.byte_offset;
