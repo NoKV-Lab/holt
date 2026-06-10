@@ -364,25 +364,23 @@ fn cold_lookup_or_pin<R, F>(
 where
     F: FnMut(LookupHit<'_>) -> R,
 {
-    let Some(user_key) = key.user_bytes() else {
+    // Only exact point lookups (a user-style key) take the cold path;
+    // range/prefix/non-exact searches pin directly.
+    if key.user_bytes().is_none() {
         let pin = bm.pin(crossing.child_guid)?;
         pin.prefetch_header();
         return Ok(ColdLookupOrPin::Pin {
             pin,
             depth: crossing.child_depth,
         });
-    };
+    }
 
     let mut child_guid = crossing.child_guid;
     let mut child_depth = crossing.child_depth;
     loop {
-        // The sidecar (cold.idx) gets first refusal; on a miss (Unknown)
-        // try the stage-3 routed read before paying for a full pin.
-        let answer = match bm.cold_lookup_blob(child_guid, user_key, child_depth)? {
-            ColdBlobLookup::Unknown => cold_read_routed(bm, child_guid, key, child_depth),
-            answer => answer,
-        };
-        match answer {
+        // Answer cold from the in-blob routing region (stage 3); any
+        // uncertainty falls back to the authoritative full pin.
+        match cold_read_routed(bm, child_guid, key, child_depth) {
             ColdBlobLookup::Unknown => {
                 let pin = bm.pin(child_guid)?;
                 pin.prefetch_header();

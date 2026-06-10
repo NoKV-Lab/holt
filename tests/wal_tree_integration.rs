@@ -1311,7 +1311,7 @@ fn tree_stats_does_not_perturb_cache_counters_or_lru() {
 }
 
 #[test]
-fn cold_sidecar_serves_checkpointed_child_blob_after_reopen() {
+fn cold_read_touches_one_child_blob_after_reopen() {
     let dir = tempdir().unwrap();
     let mut cfg = manual_checkpoint_cfg(dir.path());
     cfg.buffer_pool_size = 1;
@@ -1338,6 +1338,9 @@ fn cold_sidecar_serves_checkpointed_child_blob_after_reopen() {
     }
 
     let tree = Tree::open(cfg).unwrap();
+    // A cold point get descends to exactly ONE child blob — served by
+    // the in-blob routing region (cold routed read) or, for a legacy
+    // blob, a single full pin — never by scanning every child blob.
     let before = tree.stats().unwrap();
     assert_eq!(
         tree.get(target_key).unwrap().as_deref(),
@@ -1346,23 +1349,20 @@ fn cold_sidecar_serves_checkpointed_child_blob_after_reopen() {
     let after = tree.stats().unwrap();
     assert!(
         after.bm_point_full_blob_reads <= before.bm_point_full_blob_reads + 1,
-        "cold sidecar should avoid loading every child blob on point get (before={}, after={})",
+        "point get must touch one child blob, not all (before={}, after={})",
         before.bm_point_full_blob_reads,
         after.bm_point_full_blob_reads,
     );
-    assert!(
-        after.bm_cold_lookup_hits > before.bm_cold_lookup_hits,
-        "cold sidecar should serve the target leaf"
-    );
-    let before_miss = after;
+    // A missing key under an existing prefix resolves against one child
+    // blob too.
     assert!(tree
         .get(b"cold/bucket/table/part-0999/missing")
         .unwrap()
         .is_none());
     let after_miss = tree.stats().unwrap();
     assert!(
-        after_miss.bm_cold_lookup_negatives > before_miss.bm_cold_lookup_negatives,
-        "cold sidecar should prove a missing key without loading the child blob"
+        after_miss.bm_point_full_blob_reads <= after.bm_point_full_blob_reads + 1,
+        "missing-key get must touch one child blob, not all",
     );
 }
 

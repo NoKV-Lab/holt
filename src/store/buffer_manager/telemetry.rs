@@ -8,10 +8,6 @@ pub(super) struct Telemetry {
     point_full_blob_reads: AtomicU64,
     scan_full_blob_reads: AtomicU64,
     silent_full_blob_reads: AtomicU64,
-    cold_lookup_hits: AtomicU64,
-    cold_lookup_negatives: AtomicU64,
-    cold_lookup_crossings: AtomicU64,
-    cold_lookup_fallbacks: AtomicU64,
     optimistic_restarts: AtomicU64,
     range_restarts: AtomicU64,
     walker_ops: AtomicU64,
@@ -49,22 +45,6 @@ impl Telemetry {
     pub(super) fn note_silent_full_blob_read(&self) {
         self.full_blob_reads.fetch_add(1, Ordering::Relaxed);
         self.silent_full_blob_reads.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn note_cold_lookup_hit(&self) {
-        self.cold_lookup_hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn note_cold_lookup_negative(&self) {
-        self.cold_lookup_negatives.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn note_cold_lookup_crossing(&self) {
-        self.cold_lookup_crossings.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn note_cold_lookup_fallback(&self) {
-        self.cold_lookup_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn note_optimistic_restart(&self) {
@@ -137,22 +117,6 @@ impl Telemetry {
 
     pub(super) fn silent_full_blob_reads(&self) -> u64 {
         self.silent_full_blob_reads.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn cold_lookup_hits(&self) -> u64 {
-        self.cold_lookup_hits.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn cold_lookup_negatives(&self) -> u64 {
-        self.cold_lookup_negatives.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn cold_lookup_crossings(&self) -> u64 {
-        self.cold_lookup_crossings.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn cold_lookup_fallbacks(&self) -> u64 {
-        self.cold_lookup_fallbacks.load(Ordering::Relaxed)
     }
 
     pub(super) fn optimistic_restarts(&self) -> u64 {

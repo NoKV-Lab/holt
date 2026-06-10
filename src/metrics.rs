@@ -54,10 +54,6 @@
 //! | `holt_bm_point_full_blob_reads_total`   | counter | `TreeStats::bm_point_full_blob_reads`  |
 //! | `holt_bm_scan_full_blob_reads_total`    | counter | `TreeStats::bm_scan_full_blob_reads`   |
 //! | `holt_bm_silent_full_blob_reads_total`  | counter | `TreeStats::bm_silent_full_blob_reads` |
-//! | `holt_bm_cold_lookup_hits_total`        | counter | `TreeStats::bm_cold_lookup_hits`       |
-//! | `holt_bm_cold_lookup_negatives_total`   | counter | `TreeStats::bm_cold_lookup_negatives`  |
-//! | `holt_bm_cold_lookup_crossings_total`   | counter | `TreeStats::bm_cold_lookup_crossings`  |
-//! | `holt_bm_cold_lookup_fallbacks_total`   | counter | `TreeStats::bm_cold_lookup_fallbacks`  |
 //! | `holt_bm_optimistic_restarts_total`     | counter | `TreeStats::bm_optimistic_restarts`    |
 //! | `holt_bm_range_restarts_total`          | counter | `TreeStats::bm_range_restarts`         |
 //! | `holt_bm_walker_ops_total`              | counter | `TreeStats::bm_walker_ops`             |
@@ -294,34 +290,6 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Full-frame blob reads caused by silent stats/maintenance paths.",
         "counter",
         stats.bm_silent_full_blob_reads,
-    );
-    metric(
-        &mut out,
-        "holt_bm_cold_lookup_hits_total",
-        "Cold sidecar lookups that returned a leaf without a full-frame read.",
-        "counter",
-        stats.bm_cold_lookup_hits,
-    );
-    metric(
-        &mut out,
-        "holt_bm_cold_lookup_negatives_total",
-        "Cold sidecar lookups that proved a key was absent.",
-        "counter",
-        stats.bm_cold_lookup_negatives,
-    );
-    metric(
-        &mut out,
-        "holt_bm_cold_lookup_crossings_total",
-        "Cold sidecar lookups that resolved one child crossing.",
-        "counter",
-        stats.bm_cold_lookup_crossings,
-    );
-    metric(
-        &mut out,
-        "holt_bm_cold_lookup_fallbacks_total",
-        "Cold sidecar probes that fell back to the normal blob pin path.",
-        "counter",
-        stats.bm_cold_lookup_fallbacks,
     );
     metric(
         &mut out,
@@ -691,10 +659,6 @@ mod tests {
             bm_point_full_blob_reads: 12,
             bm_scan_full_blob_reads: 7,
             bm_silent_full_blob_reads: 1,
-            bm_cold_lookup_hits: 8,
-            bm_cold_lookup_negatives: 9,
-            bm_cold_lookup_crossings: 10,
-            bm_cold_lookup_fallbacks: 11,
             bm_optimistic_restarts: 3,
             bm_range_restarts: 2,
             bm_walker_ops: 4,
@@ -762,10 +726,6 @@ mod tests {
         assert!(out.contains("holt_bm_point_full_blob_reads_total 12\n"));
         assert!(out.contains("holt_bm_scan_full_blob_reads_total 7\n"));
         assert!(out.contains("holt_bm_silent_full_blob_reads_total 1\n"));
-        assert!(out.contains("holt_bm_cold_lookup_hits_total 8\n"));
-        assert!(out.contains("holt_bm_cold_lookup_negatives_total 9\n"));
-        assert!(out.contains("holt_bm_cold_lookup_crossings_total 10\n"));
-        assert!(out.contains("holt_bm_cold_lookup_fallbacks_total 11\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
         assert!(out.contains("holt_bm_range_restarts_total 2\n"));
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));

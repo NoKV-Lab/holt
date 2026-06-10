@@ -153,14 +153,4 @@ pub trait BlobStore: Send + Sync {
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.list_blobs().map(|v| v.contains(&guid))
     }
-
-    #[doc(hidden)]
-    fn cold_lookup_blob(
-        &self,
-        _guid: BlobGuid,
-        _key: &[u8],
-        _depth: usize,
-    ) -> Result<ColdBlobLookup> {
-        Ok(ColdBlobLookup::Unknown)
-    }
 }

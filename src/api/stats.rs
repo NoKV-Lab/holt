@@ -137,16 +137,6 @@ pub struct TreeStats {
     pub bm_scan_full_blob_reads: u64,
     /// Full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
-    /// Cold sidecar lookups that returned a leaf value without a
-    /// full-frame blob read.
-    pub bm_cold_lookup_hits: u64,
-    /// Cold sidecar lookups that proved the key was absent.
-    pub bm_cold_lookup_negatives: u64,
-    /// Cold sidecar lookups that resolved one more blob crossing.
-    pub bm_cold_lookup_crossings: u64,
-    /// Cold sidecar probes that could not answer and fell back to
-    /// the normal blob pin path.
-    pub bm_cold_lookup_fallbacks: u64,
     /// Cumulative wait-free read restarts in `Tree::get` — each
     /// one means a concurrent writer lapped an optimistic
     /// snapshot and the lookup walked the tree from scratch.
@@ -293,14 +283,6 @@ pub struct DBStats {
     pub bm_scan_full_blob_reads: u64,
     /// Shared full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
-    /// Shared cold sidecar leaf hits.
-    pub bm_cold_lookup_hits: u64,
-    /// Shared cold sidecar negative answers.
-    pub bm_cold_lookup_negatives: u64,
-    /// Shared cold sidecar blob-crossing answers.
-    pub bm_cold_lookup_crossings: u64,
-    /// Shared cold sidecar fallbacks to the normal blob pin path.
-    pub bm_cold_lookup_fallbacks: u64,
     /// Shared optimistic point-read restarts.
     pub bm_optimistic_restarts: u64,
     /// Shared range cursor restarts.

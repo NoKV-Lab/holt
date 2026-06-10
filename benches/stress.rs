@@ -149,7 +149,6 @@ struct StressConfig {
     buffer_pool_size: usize,
     wal_sync: bool,
     reopen_after_preload: bool,
-    drop_cold_index_after_preload: bool,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -192,10 +191,6 @@ impl StressConfig {
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_REOPEN_AFTER_PRELOAD", s))
                 .unwrap_or(false),
-            drop_cold_index_after_preload: env::var("HOLT_STRESS_DROP_COLD_INDEX_AFTER_PRELOAD")
-                .as_deref()
-                .map(|s| parse_bool_env("HOLT_STRESS_DROP_COLD_INDEX_AFTER_PRELOAD", s))
-                .unwrap_or(false),
             engines,
             ops,
         }
@@ -235,8 +230,8 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},drop_cold_index_after_preload={}",
-        cfg.wal_sync, cfg.reopen_after_preload, cfg.drop_cold_index_after_preload
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={}",
+        cfg.wal_sync, cfg.reopen_after_preload
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -282,15 +277,6 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     print_holt_shape("ready", &tree);
     if cfg.reopen_after_preload {
         drop(tree);
-        if cfg.drop_cold_index_after_preload {
-            let path = dir.path().join("cold.idx");
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    panic!("remove cold index before reopen: {e}");
-                }
-            }
-            println!("holt_shape dropped_cold_index_before_reopen=1");
-        }
         tree = Tree::open(tree_cfg).expect("holt reopen");
         println!("holt_shape reopened deferred_until_after_timing=1");
     }
@@ -1029,7 +1015,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_hits={} cold_negatives={} cold_crossings={} cold_fallbacks={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -1046,10 +1032,6 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.bm_point_full_blob_reads,
         s.bm_scan_full_blob_reads,
         s.bm_silent_full_blob_reads,
-        s.bm_cold_lookup_hits,
-        s.bm_cold_lookup_negatives,
-        s.bm_cold_lookup_crossings,
-        s.bm_cold_lookup_fallbacks,
         s.bm_avg_blob_hops(),
         s.bm_max_blob_hops,
         s.bm_spillovers,

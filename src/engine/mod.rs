@@ -36,6 +36,5 @@ pub use walker::{
 };
 pub(crate) use walker::{
     collect_blob_children_from_frame, fresh_blob_guid, insert_multi_batch_conditional,
-    summarize_blob_for_cold_index, ColdBlobSummary, ColdCrossing, ColdLeaf, InsertBatchItem,
-    PrefixListCache, SearchKey,
+    InsertBatchItem, PrefixListCache, SearchKey,
 };
