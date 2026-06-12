@@ -7,6 +7,27 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.5.5] — 2026-06-12
+
+### Fixed
+
+- `FileBlobStore::open` now takes an exclusive `flock(2)` on
+  `<data_dir>/store.lock` and holds it for the lifetime of the
+  instance. Two live instances on one data directory previously
+  replayed `manifest.log` into the same `next_slot`, assigned the
+  same slot to different blob GUIDs, and appended conflicting set
+  deltas — permanently poisoning the manifest (every later open
+  failed with `FileBlobStore::Manifest::duplicate slot`) while the
+  colliding frames overwrote each other in `blobs.dat`. Since 0.5.0
+  even read-only snapshots persist frozen root frames, so the
+  overlap window of a plain handover (`store = reopen(path)`) was
+  enough to trip this. Open now waits up to 5 s for the previous
+  instance to finish dropping, so handover reopen serializes; a
+  genuinely concurrent second opener fails with a clear
+  `WouldBlock` error instead of corrupting the store. Same-process
+  double-opens are caught too (`flock` is per open-file-description),
+  and the kernel releases the lock if the holder crashes.
+
 ## [0.5.4] — 2026-06-07
 
 ### Removed
