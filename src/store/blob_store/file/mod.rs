@@ -17,6 +17,10 @@
 //!                      manifest delta log is compacted
 //!     manifest.log   — append-only set/delete deltas replayed on
 //!                      open; free slots are rebuilt from holes
+//!     store.lock     — zero-byte advisory lock file; held
+//!                      exclusively (flock) for the lifetime of an
+//!                      open instance so a second opener cannot
+//!                      corrupt the manifest
 //! ```
 //!
 //! Design rationale:
@@ -67,11 +71,12 @@ use std::io::{self, Read, Write};
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
@@ -85,6 +90,16 @@ use self::uring::UringContext;
 
 /// Filename of the packed blob data file inside `data_dir`.
 const DATA_FILENAME: &str = "blobs.dat";
+/// Advisory lock file inside `data_dir`, flock'd exclusively for
+/// the lifetime of an open instance.
+const LOCK_FILENAME: &str = "store.lock";
+/// How long `open` waits for a previous instance to release the
+/// directory lock before failing. Covers the handover pattern where
+/// a caller opens a new instance while the previous one is still
+/// flushing its final checkpoint round on drop.
+const DIR_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for the directory lock.
+const DIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// Filename of the manifest inside `data_dir`.
 const MANIFEST_FILENAME: &str = "manifest.bin";
 /// Append-only manifest delta log inside `data_dir`.
@@ -138,6 +153,14 @@ const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
 #[derive(Debug)]
 pub struct FileBlobStore {
     data_dir: PathBuf,
+    /// Exclusive advisory lock on `data_dir`, held for the lifetime
+    /// of this instance. Two live instances on one directory would
+    /// each replay `manifest.log` into the same `next_slot`, assign
+    /// the same slot to different blob GUIDs, and append conflicting
+    /// set deltas — permanently corrupting the manifest. The kernel
+    /// releases the lock when this handle closes, so a crashed
+    /// holder never leaves a stale lock behind.
+    _dir_lock: File,
     data_file: File,
     manifest: RwLock<Manifest>,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
@@ -223,6 +246,49 @@ struct FreeSlotRange {
     end: u64,
 }
 
+/// Acquire the exclusive advisory lock on `data_dir`, waiting up to
+/// `timeout` for a previous instance to release it.
+///
+/// `flock(2)` locks are per open-file-description, so this also
+/// rejects a second instance inside the same process — the scenario
+/// `fcntl` record locks would silently allow. The polling wait lets
+/// an open racing a previous instance's drop (the common handover
+/// pattern `store = reopen(path)`) serialize instead of failing.
+fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(data_dir.join(LOCK_FILENAME))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(lock_file);
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(Error::BlobStoreIo(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "blob store at {} is locked by another live instance \
+                             (waited {timeout:?}); a second opener would corrupt \
+                             the manifest",
+                            data_dir.display()
+                        ),
+                    )));
+                }
+                thread::sleep(DIR_LOCK_RETRY_INTERVAL);
+            }
+            _ => return Err(Error::BlobStoreIo(err)),
+        }
+    }
+}
+
 impl FileBlobStore {
     /// Open or create a persistent store at `data_dir`.
     ///
@@ -254,6 +320,10 @@ impl FileBlobStore {
     ) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
+        // Take the lock before touching any store file: manifest
+        // replay (including torn-tail truncation) must not run
+        // while another instance can still append deltas.
+        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
@@ -302,6 +372,7 @@ impl FileBlobStore {
 
         Ok(Self {
             data_dir,
+            _dir_lock: dir_lock,
             data_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
@@ -323,6 +394,10 @@ impl FileBlobStore {
     ) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
+        // Take the lock before touching any store file: manifest
+        // replay (including torn-tail truncation) must not run
+        // while another instance can still append deltas.
+        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
@@ -356,6 +431,7 @@ impl FileBlobStore {
 
         Ok(Self {
             data_dir,
+            _dir_lock: dir_lock,
             data_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
@@ -1290,6 +1366,35 @@ mod tests {
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 42);
+    }
+
+    #[test]
+    fn open_holds_exclusive_dir_lock_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+
+        // While `b` is live, a second open must be rejected — on
+        // 0.5.x a second instance replays the same manifest into
+        // the same next_slot and corrupts it with duplicate-slot
+        // set deltas.
+        let second = acquire_dir_lock(dir.path(), Duration::from_millis(50));
+        match second {
+            Err(Error::BlobStoreIo(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "unexpected error: {e}");
+            }
+            Err(e) => panic!("unexpected error variant: {e}"),
+            Ok(_) => panic!("second open acquired the lock while the store is live"),
+        }
+
+        // The handover pattern: once the previous instance is fully
+        // dropped, the kernel releases the flock and a fresh open
+        // succeeds immediately.
+        drop(b);
+        let Some(_b2) = try_open(dir.path()) else {
+            return;
+        };
     }
 
     #[test]
