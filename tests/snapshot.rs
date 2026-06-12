@@ -485,35 +485,74 @@ fn snapshot_correct_after_reopen() {
     }
 }
 
+/// Environment variable carrying the store directory into the
+/// crash-session child processes below.
+const CRASH_LEAK_DIR_ENV: &str = "HOLT_CRASH_LEAK_DIR";
+/// Keys written by each crash session.
+const CRASH_LEAK_N: u32 = 5000;
+
+fn crash_leak_value() -> Vec<u8> {
+    vec![0xAB_u8; 200]
+}
+
+fn crash_leak_cfg(dir: &std::path::Path) -> TreeConfig {
+    let mut c = TreeConfig::new(dir);
+    c.checkpoint.enabled = false;
+    c.durability = Durability::Wal { sync: true };
+    c
+}
+
+/// Run the named `#[ignore]` child test in a separate process.
+///
+/// The crash-leak tests simulate a crash with `mem::forget(snap)`.
+/// Inside a single process that keeps the leaked instance — and its
+/// exclusive store-directory lock — alive forever; a real crash ends
+/// the process and the kernel drops the flock with it. A child
+/// process reproduces the real semantics: leaked on-disk frames,
+/// released lock.
+fn run_crash_session(child_test: &str, dir: &std::path::Path) {
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(exe)
+        .args([child_test, "--exact", "--ignored", "--nocapture"])
+        .env(CRASH_LEAK_DIR_ENV, dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "crash-session child {child_test} failed");
+}
+
+/// Child body for [`gc_reclaims_crash_leaked_snapshot_frames`]:
+/// snapshot + fork, checkpoint so the forks/orphans/snapshot root
+/// persist, then "crash" — forget the snapshot so it never retires
+/// and its in-memory orphan list dies with the process.
+#[test]
+#[ignore = "child-process body for gc_reclaims_crash_leaked_snapshot_frames"]
+fn crash_leak_tree_session() {
+    let Some(dir) = std::env::var_os(CRASH_LEAK_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let v = crash_leak_value();
+    let tree = Tree::open(crash_leak_cfg(&dir)).unwrap();
+    for i in 0..CRASH_LEAK_N {
+        tree.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    let snap = tree.snapshot(b"").unwrap();
+    for i in 0..CRASH_LEAK_N {
+        tree.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
+    }
+    tree.checkpoint().unwrap();
+    std::mem::forget(snap);
+}
+
 #[test]
 fn gc_reclaims_crash_leaked_snapshot_frames() {
     let dir = tempdir().unwrap();
-    let cfg = || {
-        let mut c = TreeConfig::new(dir.path());
-        c.checkpoint.enabled = false;
-        c.durability = Durability::Wal { sync: true };
-        c
-    };
+    let cfg = || crash_leak_cfg(dir.path());
 
-    const N: u32 = 5000;
-    let v = vec![0xAB_u8; 200];
+    const N: u32 = CRASH_LEAK_N;
 
-    // Session 1: snapshot + fork, checkpoint so the forks/orphans/snapshot
-    // root persist, then "crash" — forget the snapshot so it never retires
-    // and its in-memory orphan list dies with the process.
-    {
-        let tree = Tree::open(cfg()).unwrap();
-        for i in 0..N {
-            tree.put(format!("k{i:06}").as_bytes(), &v).unwrap();
-        }
-        tree.checkpoint().unwrap();
-        let snap = tree.snapshot(b"").unwrap();
-        for i in 0..N {
-            tree.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
-        }
-        tree.checkpoint().unwrap();
-        std::mem::forget(snap);
-    }
+    run_crash_session("crash_leak_tree_session", dir.path());
 
     // Reopen: the store still carries the leaked orphan frames + the
     // forgotten snapshot's root, unreachable from the live tree.
@@ -543,36 +582,41 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
     }
 }
 
+/// Child body for [`db_gc_reclaims_leak_and_preserves_all_trees`]:
+/// two trees; snapshot + fork + crash on t1.
+#[test]
+#[ignore = "child-process body for db_gc_reclaims_leak_and_preserves_all_trees"]
+fn crash_leak_db_session() {
+    let Some(dir) = std::env::var_os(CRASH_LEAK_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let v = crash_leak_value();
+    let db = DB::open(crash_leak_cfg(&dir)).unwrap();
+    let t1 = db.create_tree("t1").unwrap();
+    let t2 = db.create_tree("t2").unwrap();
+    for i in 0..CRASH_LEAK_N {
+        t1.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+        t2.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let snap = t1.snapshot(b"").unwrap();
+    for i in 0..CRASH_LEAK_N {
+        t1.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
+    }
+    db.checkpoint().unwrap();
+    std::mem::forget(snap); // crash: t1's forked-away frames leak
+}
+
 #[test]
 fn db_gc_reclaims_leak_and_preserves_all_trees() {
     let dir = tempdir().unwrap();
-    let cfg = || {
-        let mut c = TreeConfig::new(dir.path());
-        c.checkpoint.enabled = false;
-        c.durability = Durability::Wal { sync: true };
-        c
-    };
+    let cfg = || crash_leak_cfg(dir.path());
 
-    const N: u32 = 5000;
-    let v = vec![0xAB_u8; 200];
+    const N: u32 = CRASH_LEAK_N;
+    let v = crash_leak_value();
 
-    // Session 1: two trees; snapshot + fork + crash on t1.
-    {
-        let db = DB::open(cfg()).unwrap();
-        let t1 = db.create_tree("t1").unwrap();
-        let t2 = db.create_tree("t2").unwrap();
-        for i in 0..N {
-            t1.put(format!("k{i:06}").as_bytes(), &v).unwrap();
-            t2.put(format!("k{i:06}").as_bytes(), &v).unwrap();
-        }
-        db.checkpoint().unwrap();
-        let snap = t1.snapshot(b"").unwrap();
-        for i in 0..N {
-            t1.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
-        }
-        db.checkpoint().unwrap();
-        std::mem::forget(snap); // crash: t1's forked-away frames leak
-    }
+    run_crash_session("crash_leak_db_session", dir.path());
 
     let db = DB::open(cfg()).unwrap();
     let freed = db.gc().unwrap();
