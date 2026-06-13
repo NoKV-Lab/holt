@@ -153,9 +153,23 @@ impl Pipeline {
             return Ok(());
         }
         let _commit = shared.commit_gate.enter_checkpoint();
+        // The dirty/flushing/pending counters are BufferManager state and do
+        // NOT capture the store's own deferred durability: the I/O worker
+        // retires a dirty entry right after the data `pwrite` but BEFORE the
+        // data fsync + manifest-delta persist (`flush_inner`). So all three
+        // counters can read 0 while `store.needs_flush()` is still true —
+        // i.e. a just-written blob's new slot mapping is only in the in-memory
+        // manifest, not yet in `manifest.log`. Truncating the WAL there leaves
+        // a crashed reopen with the acked write in NEITHER the (truncated) WAL
+        // nor the (un-persisted) manifest — a lost acknowledged write. The
+        // SIGKILL crash soak hits exactly this (lazy routing keeps the root
+        // blob a perpetual compaction target, so it is re-written every round).
+        // `run_round`'s early-skip gates on the same `needs_flush()` for this
+        // recovery edge; mirror it here so truncate waits for store durability.
         if shared.bm.dirty_count() == 0
             && shared.bm.flushing_count() == 0
             && shared.bm.pending_delete_count() == 0
+            && !shared.bm.needs_flush()
         {
             journal.truncate()?;
             use std::sync::atomic::Ordering;

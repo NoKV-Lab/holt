@@ -2633,6 +2633,19 @@ where
         stats.torn_tail_at.is_none() || stats.records_seen > 0 || stats.highest_seq.is_none(),
         "a torn tail without complete records must not report a highest seq",
     );
+    // Physically drop a torn tail record before the writer reopens with
+    // O_APPEND. Otherwise the next session appends a good record *after*
+    // the torn bytes, turning them into a MID-log torn record; a later
+    // replay's torn-tail `break` stops there and silently discards every
+    // acked record written after it. The torn record was never acked (the
+    // crash hit mid-write, before its fdatasync), so truncating it to the
+    // last complete record loses nothing durable — standard WAL recovery.
+    if let Some(off) = stats.torn_tail_at {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(off)?;
+    }
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything
     // ever seen in the log.

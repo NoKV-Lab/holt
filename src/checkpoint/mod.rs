@@ -526,6 +526,121 @@ mod tests {
         }
     }
 
+    /// A store whose `needs_flush()` is gated by an explicit flag, so a test
+    /// can hold "store durability still pending" true while the BufferManager
+    /// dirty/flushing/pending counters all read 0 — the exact window in which
+    /// the I/O worker has retired a written-through blob (after `pwrite`) but
+    /// not yet run the data fsync + manifest persist.
+    struct FlushGateStore {
+        inner: MemoryBlobStore,
+        flush_pending: AtomicBool,
+    }
+
+    impl FlushGateStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                flush_pending: AtomicBool::new(true),
+            }
+        }
+
+        fn release_flush(&self) {
+            self.flush_pending.store(false, AtomicOrdering::Release);
+        }
+    }
+
+    impl BlobStore for FlushGateStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+        fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.inner.write_blobs_with_data_sync(writes)
+        }
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+        fn flush(&self) -> Result<()> {
+            // Deliberately does NOT clear `flush_pending`; the test controls
+            // when the store reports durable so the truncate gate is exercised.
+            self.inner.flush()
+        }
+        fn needs_flush(&self) -> bool {
+            self.flush_pending.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    /// Regression for the nightly crash-soak durability bug: `maybe_truncate`
+    /// must NOT truncate the WAL while the store still owes a flush (data
+    /// fsync / manifest-delta persist), even though dirty/flushing/pending all
+    /// read 0. Truncating there drops the only recoverable copy of an
+    /// acknowledged write across a crash. (On the pre-fix gate this test
+    /// truncates immediately once the dirty blob is written through.)
+    #[test]
+    fn truncate_waits_for_store_flush() {
+        let store = Arc::new(FlushGateStore::new()); // needs_flush() == true
+        let bm = Arc::new(BufferManager::new(store.clone(), 8));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open_or_create(&dir.path().join("wal.log"), 0).unwrap());
+        journal.submit(vec![1, 2, 3, 4], false).unwrap(); // -> needs_checkpoint()
+        assert!(journal.needs_checkpoint());
+
+        bm.write_blob([0x55; 16], &test_blob([0x55; 16])).unwrap();
+        let _pin = bm.pin([0x55; 16]).unwrap();
+        bm.mark_dirty([0x55; 16], 1);
+
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            Some(Arc::clone(&journal)),
+            maintenance_gate(),
+            commit_gate(),
+            no_merge_cfg(),
+        )
+        .expect("spawn");
+
+        // Wait until the dirty blob is written through (dirty retired).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if bm.dirty_count() == 0 && ck.blobs_flushed() >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "checkpoint never drained dirty");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // dirty/flushing/pending are all 0 now, but the store still needs a
+        // flush — the WAL must stay intact across several truncate attempts.
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            ck.truncates(),
+            0,
+            "WAL truncated while store flush was still pending"
+        );
+
+        // Once the store reports durable, truncate is allowed to proceed
+        // (no deadlock / unbounded WAL growth).
+        store.release_flush();
+        ck.wake();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if ck.truncates() >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "WAL never truncated after the store flush completed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(ck);
+    }
+
     /// Tests that don't construct a real Tree skip the merge pass —
     /// `collect_blob_guids` would otherwise try to pin a
     /// non-existent root.

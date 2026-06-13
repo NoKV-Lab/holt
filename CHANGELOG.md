@@ -7,6 +7,29 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.7.1] — 2026-06-12
+
+### Fixed
+
+- **Durability: an acknowledged write could be lost after a crash.** The
+  checkpoint's WAL-truncate gate (`maybe_truncate`) only checked the
+  BufferManager dirty/flushing/pending counters, not the store's own deferred
+  durability (`needs_flush`). The I/O worker retires a written-through blob
+  right after the `pwrite` but before the data fsync + manifest-delta persist,
+  so the WAL could be truncated while a just-written blob's new slot mapping
+  was still only in the in-memory manifest — leaving a crashed reopen with the
+  acknowledged record in neither the WAL nor `manifest.log`. The gate now also
+  waits on `needs_flush()`, mirroring the existing `run_round` early-skip
+  guard. Surfaced by the nightly crash-soak; 0.7.0's lazy routing compaction
+  amplified the exposure by re-writing the root blob every round.
+- **Durability: a torn WAL tail is now truncated on reopen.** Previously the
+  writer reopened with `O_APPEND` over the torn bytes, turning a partial tail
+  record into a mid-log torn record that a later replay would stop at,
+  silently stranding every acknowledged record written after it. `replay_wal`
+  now truncates the WAL to the last complete record on open — standard WAL
+  recovery; the torn record was never acknowledged (the crash preceded its
+  fdatasync), so nothing durable is lost.
+
 ## [0.7.0] — 2026-06-11
 
 ### Added
