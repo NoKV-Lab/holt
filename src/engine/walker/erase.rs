@@ -111,7 +111,22 @@ pub fn erase_multi_conditional(
         };
         match root_lookup {
             (root_guid, LookupResult::Crossing(crossing)) => {
-                let child_pin = bm.pin(crossing.child_guid)?;
+                let child_pin = match bm.pin(crossing.child_guid) {
+                    Ok(pin) => pin,
+                    Err(e) if is_blob_store_not_found(&e) => {
+                        drop(root_read);
+                        return erase_from_root(
+                            bm,
+                            root_pin,
+                            key,
+                            seq,
+                            condition,
+                            &mut blob_hops,
+                            &mut max_cross_blob_depth,
+                        );
+                    }
+                    Err(e) => return Err(e),
+                };
                 // Copy-on-write: a shared root child must be forked by
                 // repointing the root's BlobNode, which needs the root's
                 // exclusive latch — bail to the root-local path below.
@@ -165,6 +180,26 @@ pub fn erase_multi_conditional(
         }
     }
 
+    erase_from_root(
+        bm,
+        root_pin,
+        key,
+        seq,
+        condition,
+        &mut blob_hops,
+        &mut max_cross_blob_depth,
+    )
+}
+
+fn erase_from_root(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    key: SearchKey<'_>,
+    seq: u64,
+    condition: EraseCondition,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
+) -> Result<EraseOutcome> {
     let mut guard = root_pin.write();
     let root_guid = {
         let frame = guard.frame();
@@ -180,11 +215,11 @@ pub fn erase_multi_conditional(
         seq,
         condition,
         0,
-        &mut blob_hops,
-        &mut max_cross_blob_depth,
+        blob_hops,
+        max_cross_blob_depth,
     );
     if outcome.is_ok() {
-        bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+        bm.note_walker_blob_hops(*blob_hops, *max_cross_blob_depth);
     }
     outcome
 }

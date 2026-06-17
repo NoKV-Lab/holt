@@ -332,7 +332,7 @@ impl DB {
                 .collect::<Vec<_>>();
             let mut trees = HashMap::with_capacity(scoped.len());
             for (_, name, prefix, tree) in scoped {
-                trees.insert(name, tree.snapshot_unlocked(prefix)?);
+                trees.insert(name, tree.snapshot_unlocked_unfenced(prefix)?);
             }
             DBView { trees }
         };
@@ -421,7 +421,7 @@ impl DB {
 
             let mut snaps = Vec::with_capacity(families.len());
             for (name, _, tree) in &families {
-                snaps.push((name.clone(), tree.snapshot_unlocked(b"")?));
+                snaps.push((name.clone(), tree.snapshot_unlocked_unfenced(b"")?));
             }
             snaps
         };

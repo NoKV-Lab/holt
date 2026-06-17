@@ -24,7 +24,8 @@ pub struct View {
     store: Arc<BufferManager>,
     root_guid: BlobGuid,
     root_pin: Arc<CachedBlob>,
-    maintenance_gate: Arc<Gate>,
+    range_gate: Arc<Gate>,
+    scan_fence: Option<(Arc<Gate>, Arc<Gate>)>,
 }
 
 impl View {
@@ -33,13 +34,15 @@ impl View {
         store: Arc<BufferManager>,
         root_guid: BlobGuid,
         root_pin: Arc<CachedBlob>,
+        scan_fence: Option<(Arc<Gate>, Arc<Gate>)>,
     ) -> Self {
         Self {
             scope,
             store,
             root_guid,
             root_pin,
-            maintenance_gate: Arc::new(Gate::new()),
+            range_gate: Arc::new(Gate::new()),
+            scan_fence,
         }
     }
 
@@ -135,13 +138,21 @@ impl View {
     }
 
     fn range_builder(&self, prefix: &[u8]) -> RangeBuilder {
-        RangeBuilder::new(
+        let builder = RangeBuilder::new(
             Arc::clone(&self.store),
             Arc::clone(&self.root_pin),
             self.root_guid,
-            Arc::clone(&self.maintenance_gate),
-        )
-        .prefix(prefix)
+            self.scan_fence.as_ref().map_or_else(
+                || Arc::clone(&self.range_gate),
+                |(gate, _)| Arc::clone(gate),
+            ),
+        );
+        let builder = if let Some((_, mutation_gate)) = &self.scan_fence {
+            builder.with_mutation_gate(Arc::clone(mutation_gate))
+        } else {
+            builder.snapshot_cursor()
+        };
+        builder.prefix(prefix)
     }
 
     fn ensure_in_scope(&self, prefix_or_key: &[u8]) -> Result<()> {

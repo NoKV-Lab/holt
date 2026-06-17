@@ -359,6 +359,7 @@ pub struct RangeBuilder {
     maintenance_gate: Arc<Gate>,
     mutation_gate: Option<Arc<Gate>>,
     dropped: Option<Arc<AtomicBool>>,
+    snapshot_cursor: bool,
     prefix: KeyBuf,
     start_after: Option<KeyBuf>,
     delimiter: Option<u8>,
@@ -382,6 +383,7 @@ impl RangeBuilder {
             maintenance_gate,
             mutation_gate: None,
             dropped: None,
+            snapshot_cursor: false,
             prefix: KeyBuf::new(),
             start_after: None,
             delimiter: None,
@@ -395,6 +397,11 @@ impl RangeBuilder {
 
     pub(crate) fn with_mutation_gate(mut self, mutation_gate: Arc<Gate>) -> Self {
         self.mutation_gate = Some(mutation_gate);
+        self
+    }
+
+    pub(crate) fn snapshot_cursor(mut self) -> Self {
+        self.snapshot_cursor = true;
         self
     }
 
@@ -454,6 +461,7 @@ impl RangeBuilder {
             maintenance_gate: self.maintenance_gate,
             mutation_gate: self.mutation_gate,
             dropped: self.dropped,
+            snapshot_cursor: self.snapshot_cursor,
             stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             emit_buf: Vec::with_capacity(self.prefix.len().saturating_add(64)),
@@ -708,6 +716,7 @@ pub struct RangeIter {
     maintenance_gate: Arc<Gate>,
     mutation_gate: Option<Arc<Gate>>,
     dropped: Option<Arc<AtomicBool>>,
+    snapshot_cursor: bool,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
     stack: Vec<Frame>,
@@ -1317,7 +1326,7 @@ impl RangeIter {
                         let is_candidate = {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
-                            if top.pin.content_version() != top.version {
+                            if !self.frame_content_still_valid(top) {
                                 return Ok(InitResult::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1350,7 +1359,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if version != top.version {
+                        if !self.frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1399,7 +1408,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top.pin.read();
                         let version = top.pin.content_version();
-                        if version != top.version {
+                        if !self.frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1428,7 +1437,7 @@ impl RangeIter {
                             }
                             self.stack[idx].next = 1;
                             if !self.push_in_other_blob(child_guid, p_bytes.as_slice())? {
-                                return Ok(InitResult::Restart);
+                                self.pop_frame();
                             }
                         }
                     }
@@ -1454,7 +1463,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if version != top.version {
+                        if !self.frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1512,7 +1521,7 @@ impl RangeIter {
                         let kv = {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
-                            if top.pin.content_version() != top.version {
+                            if !self.frame_content_still_valid(top) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1651,7 +1660,7 @@ impl RangeIter {
                             let top = &self.stack[idx];
                             let guard = top_pin.read();
                             let version = top_pin.content_version();
-                            if version != top.version {
+                            if !self.frame_version_still_valid(top, version) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1699,7 +1708,7 @@ impl RangeIter {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
                             let version = top.pin.content_version();
-                            if version != top.version {
+                            if !self.frame_version_still_valid(top, version) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1714,8 +1723,9 @@ impl RangeIter {
                             )
                         };
                         self.stack[idx].next = 1;
-                        let Some(child_pin) = self.pin_scan_or_restart(child_guid)? else {
-                            return Ok(RangeAdvance::Restart);
+                        let Some(child_pin) = self.pin_scan_child(child_guid)? else {
+                            self.pop_frame();
+                            continue;
                         };
                         child_pin.prefetch_header();
                         let child_can_rollup = {
@@ -1751,7 +1761,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if version != top.version {
+                        if !self.frame_version_still_valid(top, version) {
                             return Ok(RangeAdvance::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1779,18 +1789,20 @@ impl RangeIter {
                                 // drained, collect the upcoming child-blob guids
                                 // from this (cached) parent so they can be pinned
                                 // concurrently (device queue depth) below.
-                                let prefetch_guids =
-                                    if child_ntype == NodeType::Blob && self.prefetch.is_empty() {
-                                        collect_blob_child_window(
-                                            frame,
-                                            top.off,
-                                            top_ntype,
-                                            child_off,
-                                            next_cursor,
-                                        )
-                                    } else {
-                                        Vec::new()
-                                    };
+                                let prefetch_guids = if !self.snapshot_cursor
+                                    && child_ntype == NodeType::Blob
+                                    && self.prefetch.is_empty()
+                                {
+                                    collect_blob_child_window(
+                                        frame,
+                                        top.off,
+                                        top_ntype,
+                                        child_off,
+                                        next_cursor,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
                                 Some((
                                     byte,
                                     child_off,
@@ -1865,7 +1877,7 @@ impl RangeIter {
     }
 
     fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<bool> {
-        let Some(child_pin) = self.pin_scan_or_restart(child_guid)? else {
+        let Some(child_pin) = self.pin_scan_child(child_guid)? else {
             return Ok(false);
         };
         child_pin.prefetch_header();
@@ -1873,7 +1885,7 @@ impl RangeIter {
         Ok(true)
     }
 
-    fn pin_scan_or_restart(&mut self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+    fn pin_scan_child(&mut self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
         // Consume a read-ahead pin if one was warmed for this child.
         if let Some(pin) = self.prefetch.remove(&child_guid) {
             return Ok(Some(pin));
@@ -1912,9 +1924,20 @@ impl RangeIter {
     }
 
     fn path_is_still_valid(&self) -> bool {
+        if self.snapshot_cursor {
+            return true;
+        }
         self.stack
             .iter()
             .all(|frame| frame.pin.validate_content_version(frame.version))
+    }
+
+    fn frame_content_still_valid(&self, frame: &Frame) -> bool {
+        self.snapshot_cursor || frame.pin.content_version() == frame.version
+    }
+
+    fn frame_version_still_valid(&self, frame: &Frame, current_version: u64) -> bool {
+        self.snapshot_cursor || current_version == frame.version
     }
 
     fn restart_cursor(&mut self) {

@@ -15,10 +15,11 @@ tempfile = "3"
 rocksdb = { version = "0.24", default-features = false, optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 sled = { version = "0.34", optional = true }
+heed = { version = "0.20", optional = true }
 
 [features]
 default = ["comparators"]
-comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled"]
+comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled", "dep:heed"]
 io-uring = ["holt/io-uring"]
 
 [[bench]]
