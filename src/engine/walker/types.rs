@@ -1,5 +1,6 @@
 //! Walker types — public outcomes + internal signals.
 
+use crate::api::errors::Error;
 use crate::layout::{BlobGuid, NodeType};
 use crate::store::blob_store::AlignedBlobBuf;
 
@@ -126,6 +127,16 @@ pub(super) struct EraseReturn {
     pub(super) signal: EraseSignal,
     /// `true` iff a live leaf was tombstoned during the descent.
     pub(super) mutated: bool,
+}
+
+pub(super) const STALE_BLOB_CROSSING: &str = "stale blob crossing";
+
+pub(super) const fn stale_blob_crossing(where_: &'static str) -> Error {
+    Error::Internal(where_)
+}
+
+pub(super) fn is_stale_blob_crossing(error: &Error) -> bool {
+    matches!(error, Error::Internal(msg) if msg.starts_with(STALE_BLOB_CROSSING))
 }
 
 /// What kind of edge the parent of a victim subtree has.

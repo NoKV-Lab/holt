@@ -12,6 +12,7 @@ use super::migrate::blob_needs_compaction;
 use super::readers::{child_offset, ntype_of, read_leaf_key_ref, read_prefix};
 use super::route::{pin_route_parent, validate_route_edge};
 use super::spillover::{compact_blob, spillover_blob};
+use super::types::{is_stale_blob_crossing, stale_blob_crossing};
 use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
@@ -107,7 +108,37 @@ pub fn insert_multi_conditional(
     if value.len() > u16::MAX as usize {
         return Err(Error::ValueTooLong { len: value.len() });
     }
+    let mut restarts = 0u32;
+    loop {
+        match insert_multi_conditional_once(bm, root_pin, route_cache, key, value, seq, condition) {
+            Err(e) if is_stale_blob_crossing(&e) => {
+                if let Some(cache) = route_cache {
+                    cache.clear();
+                }
+                bm.note_optimistic_restart();
+                restarts = restarts.saturating_add(1);
+                if restarts >= 128 {
+                    return Err(e);
+                }
+                if restarts % 16 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            out => return out,
+        }
+    }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn insert_multi_conditional_once(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    value: &[u8],
+    seq: u64,
+    condition: InsertCondition,
+) -> Result<InsertOutcome> {
     let mut blob_hops = 0u64;
     let mut max_cross_blob_depth = 0usize;
 
@@ -179,6 +210,12 @@ fn try_insert_from_root_router(
     };
     let child_pin = match bm.pin(crossing.child_guid) {
         Ok(pin) => pin,
+        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+            drop(root_read);
+            return Err(stale_blob_crossing(
+                "stale blob crossing: insert root router",
+            ));
+        }
         Err(e) if is_blob_store_not_found(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
@@ -302,6 +339,11 @@ fn try_insert_from_optimistic_route(
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
+        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(route.child_guid) => {
+            drop(parent_guard);
+            cache.invalidate(key, route);
+            return Err(stale_blob_crossing("stale blob crossing: insert route"));
+        }
         Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
@@ -402,7 +444,33 @@ pub(crate) fn insert_multi_batch_conditional(
             });
         }
     }
+    let mut restarts = 0u32;
+    loop {
+        match insert_multi_batch_conditional_once(bm, root_pin, route_cache, items) {
+            Err(e) if is_stale_blob_crossing(&e) => {
+                if let Some(cache) = route_cache {
+                    cache.clear();
+                }
+                bm.note_optimistic_restart();
+                restarts = restarts.saturating_add(1);
+                if restarts >= 128 {
+                    return Err(e);
+                }
+                if restarts % 16 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            out => return out,
+        }
+    }
+}
 
+pub(crate) fn insert_multi_batch_conditional_once(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    items: &[InsertBatchItem<'_>],
+) -> Result<InsertBatchOutcome> {
     let batched = try_insert_batch_from_first_blob(bm, root_pin, route_cache, items)?;
     if batched.applied != 0 {
         return Ok(batched);
@@ -470,6 +538,14 @@ fn try_insert_batch_from_first_blob(
             let run_len = same_child_prefix_run_len(items, crossing.child_depth);
             let child_pin = match bm.pin(crossing.child_guid) {
                 Ok(pin) => pin,
+                Err(e)
+                    if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) =>
+                {
+                    drop(root_read);
+                    return Err(stale_blob_crossing(
+                        "stale blob crossing: insert batch root router",
+                    ));
+                }
                 Err(e) if is_blob_store_not_found(&e) => {
                     drop(root_read);
                     return insert_batch_from_root(bm, root_pin, items);
@@ -544,6 +620,13 @@ fn try_insert_batch_from_route(
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
+        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(route.child_guid) => {
+            drop(parent_guard);
+            cache.invalidate(first_key, route);
+            return Err(stale_blob_crossing(
+                "stale blob crossing: insert batch route",
+            ));
+        }
         Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(first_key, route);
@@ -803,7 +886,19 @@ fn cross_and_insert(
     blob_hops: &mut u64,
     max_cross_blob_depth: &mut usize,
 ) -> Result<InsertOutcome> {
-    let child_pin = bm.pin(crossing.child_guid)?;
+    let child_pin = match bm.pin(crossing.child_guid) {
+        Ok(pin) => pin,
+        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+            drop(parent_guard);
+            if parent_dirty {
+                bm.mark_dirty_cached(current_guid, seq, current_entry);
+            }
+            return Err(stale_blob_crossing(
+                "stale blob crossing: insert deep child",
+            ));
+        }
+        Err(e) => return Err(e.with_blob_guid(crossing.child_guid)),
+    };
     child_pin.prefetch_header();
     let child_guard = child_pin.write();
 

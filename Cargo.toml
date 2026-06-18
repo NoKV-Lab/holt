@@ -1,6 +1,6 @@
 [package]
 name = "holt"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.82"
 autobenches = false
@@ -8,8 +8,8 @@ description = "An adaptive-radix-tree metadata storage engine for path-shaped ke
 license = "MIT"
 authors = ["the holt contributors"]
 readme = "README.md"
-repository = "https://github.com/feichai0017/holt"
-homepage = "https://github.com/feichai0017/holt"
+repository = "https://github.com/NoKV-Lab/holt"
+homepage = "https://github.com/NoKV-Lab/holt"
 documentation = "https://docs.rs/holt"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]

@@ -838,6 +838,12 @@ impl BufferManager {
             .has_delete_fence(&guid)
     }
 
+    /// True while `guid` is logically unlinked from the live tree but
+    /// still fenced by the deferred-delete protocol.
+    pub(crate) fn has_delete_fence(&self, guid: BlobGuid) -> bool {
+        self.is_pending_delete(guid)
+    }
+
     fn pending_delete_not_found(guid: BlobGuid) -> Error {
         Error::BlobStoreIo(std::io::Error::new(
             std::io::ErrorKind::NotFound,

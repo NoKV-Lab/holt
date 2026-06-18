@@ -86,7 +86,15 @@ impl std::fmt::Debug for DB {
 
 impl DB {
     /// Open a multi-tree database using the supplied configuration.
-    pub fn open(cfg: TreeConfig) -> Result<Self> {
+    pub fn open(mut cfg: TreeConfig) -> Result<Self> {
+        // The background merge queue is keyed only by blob GUID. In a
+        // multi-tree DB, a queued parent may become unreachable from all
+        // live roots while still sharing children with a live tree or a
+        // snapshot. DB-wide merge therefore runs through `DB::compact`,
+        // which walks from live roots; the background checkpointer only
+        // drains dirty bytes and pending deletes.
+        cfg.checkpoint.auto_merge = false;
+
         let bm = Tree::open_buffer_manager(&cfg)?;
         let mut open_stats = OpenStats::default();
 
@@ -332,7 +340,7 @@ impl DB {
                 .collect::<Vec<_>>();
             let mut trees = HashMap::with_capacity(scoped.len());
             for (_, name, prefix, tree) in scoped {
-                trees.insert(name, tree.snapshot_unlocked_unfenced(prefix)?);
+                trees.insert(name, tree.snapshot_unlocked(prefix)?);
             }
             DBView { trees }
         };

@@ -151,6 +151,13 @@ where
         let (child_pin, child_depth) = match cold_lookup_or_pin(bm, key, crossing, &mut consume)? {
             ColdLookupOrPin::Done(result) => return Ok(result),
             ColdLookupOrPin::Pin { pin, depth } => (pin, depth),
+            ColdLookupOrPin::Restart => {
+                if let Some(cache) = route_cache {
+                    cache.clear();
+                }
+                bm.note_optimistic_restart();
+                continue 'restart;
+            }
         };
 
         // Cross-blob hops. Same pattern; on a torn read we restart
@@ -217,6 +224,11 @@ where
     ) {
         Ok(ColdLookupOrPin::Done(result)) => return Ok(RouteLookup::Done(result)),
         Ok(ColdLookupOrPin::Pin { pin, .. }) => pin,
+        Ok(ColdLookupOrPin::Restart) => {
+            drop(parent_guard);
+            cache.clear();
+            return Ok(RouteLookup::Restart);
+        }
         Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
@@ -257,6 +269,10 @@ where
         let (next_pin, next_depth) = match cold_lookup_or_pin(bm, key, crossing, consume)? {
             ColdLookupOrPin::Done(result) => return Ok(RouteLookup::Done(result)),
             ColdLookupOrPin::Pin { pin, depth } => (pin, depth),
+            ColdLookupOrPin::Restart => {
+                cache.clear();
+                return Ok(RouteLookup::Restart);
+            }
         };
         match lookup_from_pinned_blob(bm, Some(cache), key, next_pin, next_depth, consume)? {
             CrossBlobLookup::Done(result) => Ok(RouteLookup::Done(result)),
@@ -303,6 +319,12 @@ where
         };
         match cold_lookup_or_pin(bm, key, crossing, consume)? {
             ColdLookupOrPin::Done(result) => return Ok(CrossBlobLookup::Done(result)),
+            ColdLookupOrPin::Restart => {
+                if let Some(cache) = route_cache {
+                    cache.clear();
+                }
+                return Ok(CrossBlobLookup::Restart);
+            }
             ColdLookupOrPin::Pin {
                 pin: child_pin,
                 depth: child_depth,
@@ -356,6 +378,7 @@ fn validate_child_crossing(
 enum ColdLookupOrPin<R> {
     Done(Option<R>),
     Pin { pin: Arc<CachedBlob>, depth: usize },
+    Restart,
 }
 
 fn cold_lookup_or_pin<R, F>(
@@ -370,7 +393,13 @@ where
     // Only exact point lookups (a user-style key) take the cold path;
     // range/prefix/non-exact searches pin directly.
     if key.user_bytes().is_none() {
-        let pin = bm.pin(crossing.child_guid)?;
+        let pin = match bm.pin(crossing.child_guid) {
+            Ok(pin) => pin,
+            Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+                return Ok(ColdLookupOrPin::Restart);
+            }
+            Err(e) => return Err(e),
+        };
         pin.prefetch_header();
         return Ok(ColdLookupOrPin::Pin {
             pin,
@@ -385,7 +414,13 @@ where
         // uncertainty falls back to the authoritative full pin.
         match cold_read_routed(bm, child_guid, key, child_depth) {
             ColdBlobLookup::Unknown => {
-                let pin = bm.pin(child_guid)?;
+                let pin = match bm.pin(child_guid) {
+                    Ok(pin) => pin,
+                    Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(child_guid) => {
+                        return Ok(ColdLookupOrPin::Restart);
+                    }
+                    Err(e) => return Err(e),
+                };
                 pin.prefetch_header();
                 return Ok(ColdLookupOrPin::Pin {
                     pin,

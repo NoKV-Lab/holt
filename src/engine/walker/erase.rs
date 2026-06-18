@@ -14,6 +14,7 @@ use super::readers::{
     read_prefix,
 };
 use super::route::{pin_route_parent, validate_route_edge};
+use super::types::{is_stale_blob_crossing, stale_blob_crossing};
 use super::types::{EraseCondition, EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
@@ -66,6 +67,35 @@ pub fn erase_multi(
 /// `Tree::delete_if_version` so the version check and tombstone
 /// write happen under the same exclusive blob latch.
 pub fn erase_multi_conditional(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    seq: u64,
+    condition: EraseCondition,
+) -> Result<EraseOutcome> {
+    let mut restarts = 0u32;
+    loop {
+        match erase_multi_conditional_once(bm, root_pin, route_cache, key, seq, condition) {
+            Err(e) if is_stale_blob_crossing(&e) => {
+                if let Some(cache) = route_cache {
+                    cache.clear();
+                }
+                bm.note_optimistic_restart();
+                restarts = restarts.saturating_add(1);
+                if restarts >= 128 {
+                    return Err(e);
+                }
+                if restarts % 16 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            out => return out,
+        }
+    }
+}
+
+fn erase_multi_conditional_once(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     route_cache: Option<&RouteCache>,
@@ -343,7 +373,16 @@ fn lock_coupled_erase_in_blob(
     let r = match step {
         EraseStep::Done(r) => r,
         EraseStep::Crossing(crossing) => {
-            let child_pin = bm.pin(crossing.child_guid)?;
+            let child_pin = match bm.pin(crossing.child_guid) {
+                Ok(pin) => pin,
+                Err(e)
+                    if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) =>
+                {
+                    drop(guard);
+                    return Err(stale_blob_crossing("stale blob crossing: erase deep child"));
+                }
+                Err(e) => return Err(e.with_blob_guid(crossing.child_guid)),
+            };
             child_pin.prefetch_header();
             let child_guard = child_pin.write();
 

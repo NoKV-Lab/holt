@@ -7,6 +7,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.7.2] — 2026-06-18
+
+### Fixed
+
+- Fixed nightly DB/crash soak failures where stale cross-blob routes could reach
+  a delete-fenced blob. `DB` no longer runs GUID-only background auto-merge;
+  DB-wide merge stays rooted in live trees through explicit compaction. The
+  route cache is now restricted to root-child crossings, and walkers restart
+  from the root when they encounter a delete-fenced child instead of treating it
+  as `NotFound`.
+- `DB::view` now uses the same fenced snapshot capture path as `Tree::view`,
+  so multi-tree views cannot capture parent/child topology from mixed write
+  generations.
+- Merge eligibility now rejects snapshot-shared child blobs, preventing
+  maintenance from deleting a blob still referenced by a live snapshot.
+
 ## [0.7.1] — 2026-06-12
 
 ### Fixed

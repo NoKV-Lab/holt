@@ -29,6 +29,7 @@ use crate::store::{
 };
 
 use super::cast;
+use super::cow::child_is_snapshot_shared;
 use super::readers::child_offset;
 use super::types::MakeBlobOutcome;
 use super::writers::{write_prefix_chain, write_struct_at};
@@ -372,6 +373,9 @@ pub fn is_mergeable(
 ) -> Result<bool> {
     let bn = read_blob_node(parent_frame, parent_bn_off)?;
     let child_pin = bm.pin(bn.child_blob_guid)?;
+    if child_is_snapshot_shared(bm, child_pin.as_ref()) {
+        return Ok(false);
+    }
     let guard = child_pin.read();
     let child_frame = BlobFrameRef::wrap(guard.as_slice());
 

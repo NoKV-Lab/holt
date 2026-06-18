@@ -1,10 +1,10 @@
-//! Small parent-validated route cache for path-shaped metadata keys.
+//! Small root-validated route cache for path-shaped metadata keys.
 //!
 //! A hit is only a candidate. Callers must pin the cached parent,
 //! hold its shared latch, verify the parent content version, and
-//! then pin the child before using the shortcut. That keeps the
-//! cached parent->child edge stable while still allowing deeper
-//! prefix anchors than the root-only path.
+//! then pin the child before using the shortcut. The cache only keeps
+//! root-child crossings: deeper parent edges can remain internally
+//! stable even after the parent becomes unreachable from the live root.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -118,6 +118,9 @@ impl RouteCache {
             for &len in &entries.lengths {
                 if let Some(prefix) = key.user_prefix(len) {
                     if let Some(entry) = entries.map.get(prefix) {
+                        if entry.parent_depth != 0 {
+                            continue;
+                        }
                         self.hits.fetch_add(1, Ordering::Relaxed);
                         return Some(RouteHit {
                             parent_guid: entry.parent_guid,
@@ -155,6 +158,17 @@ impl RouteCache {
         entries.map.remove(prefix);
         entries.order.retain(|known| known.as_slice() != prefix);
         rebuild_prefix_lengths(&mut entries);
+    }
+
+    /// Drop every cached route. Used when a deeper lock-coupled
+    /// walker discovers a delete-fenced child that is not represented
+    /// by the top-level route candidate it entered through.
+    pub(crate) fn clear(&self) {
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.write().unwrap();
+        entries.map.clear();
+        entries.order.clear();
+        entries.lengths.clear();
     }
 
     /// Refresh the parent version after the caller revalidated that
@@ -195,6 +209,9 @@ impl RouteCache {
         child_guid: BlobGuid,
         child_depth: usize,
     ) {
+        if parent_depth != 0 {
+            return;
+        }
         let Some(prefix) = key.user_prefix(child_depth) else {
             return;
         };
@@ -591,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn different_parent_depth_does_not_prune_longer_route() {
+    fn non_root_parent_routes_are_not_cached() {
         let cache = RouteCache::new();
         cache.learn(
             SearchKey::user(b"bucket-00/path/deeper/file"),
@@ -611,6 +628,7 @@ mod tests {
         );
 
         let stats = cache.stats();
-        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.learns, 1);
     }
 }
