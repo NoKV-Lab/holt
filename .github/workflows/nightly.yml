@@ -177,15 +177,18 @@ jobs:
 
       - name: holt-soak db-normal
         run: |
+          # DB normal does a full oracle verification across every named
+          # tree after reopen. Keep this bounded on hosted runners; the
+          # long DB durability coverage lives in the DB crash soak above.
           cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
             --mode db-normal \
             --dir target/holt-soak-db-nightly \
             --reset \
             --duration-secs "$SOAK_SECONDS" \
-            --keys 500000 \
-            --ops 1000000 \
-            --threads 8 \
-            --buffer-pool 128 \
+            --keys 20000 \
+            --ops 50000 \
+            --threads 4 \
+            --buffer-pool 64 \
             --wal-sync false
 
   fuzz-long:
