@@ -1255,12 +1255,16 @@ impl BufferManager {
     /// Returns `false` — meaning the caller must fall back to [`pin`]
     /// (which reads the authoritative resident/full-frame image) —
     /// when the blob is pending-delete, already resident in cache (a
-    /// dirty cache image may be newer than the on-disk frame), or
+    /// dirty cache image may be newer than the on-disk frame), the
+    /// store still has unflushed data/manifest state, or the blob is
     /// protected/pending a structural op.
     ///
     /// [`pin`]: Self::pin
     pub(crate) fn cold_read_eligible(&self, guid: BlobGuid) -> bool {
-        if self.is_pending_delete(guid) || self.cache.contains_key(&guid) {
+        if self.store.needs_flush()
+            || self.is_pending_delete(guid)
+            || self.cache.contains_key(&guid)
+        {
             return false;
         }
         let state = self.mutation_shard(guid).lock().unwrap();
@@ -2057,11 +2061,69 @@ mod tests {
     use super::*;
     use crate::store::blob_store::MemoryBlobStore;
     use crate::store::PAGE_4K;
+    use std::sync::atomic::AtomicBool;
 
     fn make_buf(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
         b.as_mut_slice()[100] = byte_at_100;
         b
+    }
+
+    struct FlushPendingStore {
+        inner: MemoryBlobStore,
+        pending: AtomicBool,
+    }
+
+    impl FlushPendingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                pending: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl BlobStore for FlushPendingStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
+            self.inner.read_blobs(guids, dsts)
+        }
+
+        fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+            self.inner.read_blob_range(guid, byte_offset, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.pending.store(true, Ordering::Release);
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.pending.store(true, Ordering::Release);
+            self.inner.write_blobs(writes)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.pending.store(true, Ordering::Release);
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()?;
+            self.pending.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.pending.load(Ordering::Acquire) || self.inner.needs_flush()
+        }
     }
 
     #[test]
@@ -2086,6 +2148,26 @@ mod tests {
 
         assert_eq!(budget.cold_page_bytes, 0);
         assert_eq!(budget.blob_slots, 256);
+    }
+
+    #[test]
+    fn cold_read_eligible_waits_for_store_flush() {
+        let guid = [0xCE; 16];
+        let inner = Arc::new(FlushPendingStore::new());
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store: Arc<dyn BlobStore> = inner.clone();
+        let bm = BufferManager::new_file(store, 128, AlignedBlobBuf::zeroed);
+
+        assert!(
+            !bm.cold_read_eligible(guid),
+            "partial cold reads must not bypass a store with unflushed data or manifest state",
+        );
+
+        inner.flush().unwrap();
+        assert!(
+            bm.cold_read_eligible(guid),
+            "once the store is durable and the blob is not cached/protected, cold reads may proceed",
+        );
     }
 
     #[test]
