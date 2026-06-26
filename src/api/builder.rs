@@ -74,7 +74,8 @@ impl TreeBuilder {
 
     /// Open with a caller-supplied [`BlobStore`] (overrides the
     /// builder's storage mode).
-    pub fn open_with_blob_store(self, store: Arc<dyn BlobStore>) -> Result<Tree> {
+    pub fn open_with_blob_store(mut self, store: Arc<dyn BlobStore>) -> Result<Tree> {
+        self.cfg.memory_flush_on_write = true;
         Tree::open_with_blob_store(self.cfg, store)
     }
 }

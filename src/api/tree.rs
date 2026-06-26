@@ -38,7 +38,7 @@ use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
-    WriteThroughEntry,
+    WriteDeltaEntry, WriteThroughEntry,
 };
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
@@ -681,6 +681,12 @@ impl Tree {
     /// values.
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
         self.ensure_live()?;
+        if let Some(delta) = self.store.lookup_write_delta(self.tree_id, key) {
+            return Ok(match delta {
+                WriteDeltaEntry::Put { seq, .. } => Some(RecordVersion::new(seq)),
+                WriteDeltaEntry::Delete { .. } => None,
+            });
+        }
         let search = engine::SearchKey::user(key);
         engine::lookup_multi_with(
             &self.store,
@@ -692,6 +698,15 @@ impl Tree {
     }
 
     fn lookup_record_unlocked(&self, key: &[u8]) -> Result<Option<Record>> {
+        if let Some(delta) = self.store.lookup_write_delta(self.tree_id, key) {
+            return Ok(match delta {
+                WriteDeltaEntry::Put { value, seq } => Some(Record {
+                    value,
+                    version: RecordVersion::new(seq),
+                }),
+                WriteDeltaEntry::Delete { .. } => None,
+            });
+        }
         let search = engine::SearchKey::user(key);
         engine::lookup_multi_with(
             &self.store,
@@ -725,8 +740,12 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_inner_conditional(key, value, engine::InsertCondition::Always)
-            .map(|_| ())
+        if self.can_stage_blind_write() {
+            self.put_blind_deferred(key, value)
+        } else {
+            self.put_inner_conditional(key, value, engine::InsertCondition::Always)
+                .map(|_| ())
+        }
     }
 
     /// Insert `(key, value)` only when `key` has no live record.
@@ -735,6 +754,7 @@ impl Tree {
     /// when a live value already existed. The existence check and
     /// insert happen under the target blob's exclusive latch.
     pub fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.flush_write_delta_for_tree()?;
         self.put_inner_conditional(key, value, engine::InsertCondition::IfAbsent)
             .map(|outcome| outcome.mutated)
     }
@@ -750,6 +770,7 @@ impl Tree {
     /// keys within `entries` create once; later copies report
     /// `AlreadyExists`.
     pub fn put_many_if_absent(&self, entries: &[(&[u8], &[u8])]) -> Result<Vec<PutOutcome>> {
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _mutation = self.mutation_gate.enter_exclusive();
@@ -793,12 +814,55 @@ impl Tree {
         expected_version: RecordVersion,
         value: &[u8],
     ) -> Result<bool> {
+        self.flush_write_delta_for_tree()?;
         self.put_inner_conditional(
             key,
             value,
             engine::InsertCondition::IfVersion(expected_version.as_u64()),
         )
         .map(|outcome| outcome.mutated)
+    }
+
+    fn can_stage_blind_write(&self) -> bool {
+        self.journal.is_some() && !self.cfg.is_memory() && !self.cfg.memory_flush_on_write
+    }
+
+    pub(crate) fn flush_write_delta_for_tree(&self) -> Result<()> {
+        if self.store.write_delta_count_for_tree(self.tree_id) == 0 {
+            return Ok(());
+        }
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_live()?;
+        let _tree_mutation = self.mutation_gate.enter_batch();
+        let _commit = self.commit_gate.enter_writer();
+        self.store.flush_write_deltas_for_tree(self.tree_id)
+    }
+
+    fn put_blind_deferred(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        Self::validate_insert_shape(key, value)?;
+        let ack = {
+            let _mutation = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
+            let _tree_mutation = self.mutation_gate.enter_shared();
+            let _endpoint = self.endpoint_locks.lock_key(key);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let journal = self
+                .journal
+                .as_ref()
+                .expect("can_stage_blind_write requires journal");
+            let _commit = self.commit_gate.enter_writer();
+            let mut record =
+                journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
+            encode_insert_record(&mut record, seq, self.tree_id, key, value);
+            let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+            self.store
+                .stage_write_delta_put(self.tree_id, self.root_guid, key, value, seq);
+            ack
+        };
+        if let Some(ack) = ack {
+            ack.wait()?;
+        }
+        Ok(())
     }
 
     fn put_inner_conditional(
@@ -882,8 +946,12 @@ impl Tree {
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        self.delete_inner_conditional(key, engine::EraseCondition::Always)
-            .map(|outcome| outcome.mutated)
+        if self.can_stage_blind_write() {
+            self.delete_blind_deferred(key)
+        } else {
+            self.delete_inner_conditional(key, engine::EraseCondition::Always)
+                .map(|outcome| outcome.mutated)
+        }
     }
 
     /// Remove `key` only when the live record currently carries
@@ -893,11 +961,40 @@ impl Tree {
     /// tombstoned, or has been updated since the caller obtained
     /// the version.
     pub fn delete_if_version(&self, key: &[u8], expected_version: RecordVersion) -> Result<bool> {
+        self.flush_write_delta_for_tree()?;
         self.delete_inner_conditional(
             key,
             engine::EraseCondition::IfVersion(expected_version.as_u64()),
         )
         .map(|outcome| outcome.mutated)
+    }
+
+    fn delete_blind_deferred(&self, key: &[u8]) -> Result<bool> {
+        let ack = {
+            let _mutation = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
+            let _tree_mutation = self.mutation_gate.enter_shared();
+            let _endpoint = self.endpoint_locks.lock_key(key);
+            if self.lookup_record_unlocked(key)?.is_none() {
+                return Ok(false);
+            }
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let journal = self
+                .journal
+                .as_ref()
+                .expect("can_stage_blind_write requires journal");
+            let _commit = self.commit_gate.enter_writer();
+            let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
+            encode_erase_record(&mut record, seq, self.tree_id, key);
+            let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+            self.store
+                .stage_write_delta_delete(self.tree_id, self.root_guid, key, seq);
+            ack
+        };
+        if let Some(ack) = ack {
+            ack.wait()?;
+        }
+        Ok(true)
     }
 
     fn delete_inner_conditional(
@@ -992,6 +1089,7 @@ impl Tree {
     /// single `RenameObject` WAL record so its erase + insert phases
     /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
+        self.flush_write_delta_for_tree()?;
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
 
@@ -1150,6 +1248,7 @@ impl Tree {
     }
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
@@ -1641,14 +1740,18 @@ impl Tree {
     /// current cursor. It is, however, monotonic with respect to
     /// already-emitted keys and rollups.
     pub fn range(&self) -> RangeBuilder {
-        RangeBuilder::new(
+        let builder = RangeBuilder::new(
             Arc::clone(&self.store),
             Arc::clone(&self.root_pin),
             self.root_guid,
             Arc::clone(&self.maintenance_gate),
         )
         .with_mutation_gate(Arc::clone(&self.mutation_gate))
-        .with_liveness(Arc::clone(&self.dropped))
+        .with_liveness(Arc::clone(&self.dropped));
+        match self.flush_write_delta_for_tree() {
+            Ok(()) => builder,
+            Err(e) => builder.with_preflight_error(e),
+        }
     }
 
     /// Shorthand for `tree.range().prefix(p)` — the
@@ -1736,6 +1839,7 @@ impl Tree {
     /// `prefix = b""` for a whole-tree snapshot. The snapshot stays valid
     /// until its handle is dropped (or [`Snapshot::retire`] is called).
     pub fn snapshot(&self, prefix: &[u8]) -> Result<Snapshot> {
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         // Freeze live writers so the root frame is byte-stable for the
@@ -1759,6 +1863,7 @@ impl Tree {
         if self.tree_id != 0 {
             return Err(Error::GcRequiresStandaloneTree);
         }
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         // Freeze writers so the reachable set is stable across the walk.
@@ -1831,6 +1936,7 @@ impl Tree {
     /// [`AtomicBatch::assert_prefix_empty`] inside [`Self::atomic`] when
     /// the emptiness check must be atomic with subsequent writes.
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_shared();
@@ -2074,10 +2180,14 @@ impl Tree {
         Option<u64>,
     )> {
         if let Some(journal) = journal {
+            let wal_up_to = {
+                let _commit = commit_gate.enter_checkpoint();
+                journal.queued_work()
+            };
+            store.flush_write_deltas()?;
             let _commit = commit_gate.enter_checkpoint();
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
-            let wal_up_to = journal.queued_work();
             match store.snapshot_dirty_versions(&snap_dirty) {
                 Ok(versioned_snap) => {
                     Ok((snap_dirty, snap_pending, versioned_snap, Some(wal_up_to)))
@@ -2089,6 +2199,7 @@ impl Tree {
                 }
             }
         } else {
+            store.flush_write_deltas()?;
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
             match store.snapshot_dirty_versions(&snap_dirty) {
@@ -2247,6 +2358,7 @@ impl Tree {
                 if store.dirty_count() == 0
                     && store.flushing_count() == 0
                     && store.pending_delete_count() == 0
+                    && store.write_delta_count() == 0
                     && !store.needs_flush()
                 {
                     journal.truncate()?;
@@ -2270,6 +2382,7 @@ impl Tree {
     /// another's are read. Acceptable for observability; pause writes
     /// externally if you need a quiescent snapshot.
     pub fn stats(&self) -> Result<TreeStats> {
+        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         let aggregate = self.collect_blob_stats_silent()?;
         let bm: BufferStats = self.store.stats();
@@ -2325,6 +2438,7 @@ impl Tree {
             blobs: aggregate.blobs,
             bm_dirty_count: bm.dirty_count,
             bm_pending_delete_count: bm.pending_delete_count,
+            bm_write_delta_count: bm.write_delta_count,
             bm_cache_hits: bm.cache_hits,
             bm_cache_misses: bm.cache_misses,
             bm_full_blob_reads: bm.full_blob_reads,

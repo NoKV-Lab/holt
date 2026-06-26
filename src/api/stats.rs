@@ -116,6 +116,9 @@ pub struct TreeStats {
     /// queued deletes and deletes already claimed by a checkpoint
     /// epoch but not yet completed.
     pub bm_pending_delete_count: usize,
+    /// Deferred blind writes waiting to be merged into ART blob
+    /// frames. WAL truncation waits for this to reach zero.
+    pub bm_write_delta_count: usize,
     /// Cumulative cache lookups served from BM cache without
     /// going to the inner store. Read by external observers to
     /// derive a hit rate (`bm_cache_hits / (bm_cache_hits +
@@ -299,6 +302,9 @@ pub struct DBStats {
     pub bm_dirty_count: usize,
     /// Number of deferred deletes across every tree.
     pub bm_pending_delete_count: usize,
+    /// Deferred blind writes waiting to be merged into ART blob
+    /// frames. WAL truncation waits for this to reach zero.
+    pub bm_write_delta_count: usize,
     /// Shared BufferManager cache hits.
     pub bm_cache_hits: u64,
     /// Shared BufferManager cache misses.

@@ -130,6 +130,7 @@ mod guid_hash;
 mod mutation;
 mod residency;
 mod telemetry;
+mod write_delta;
 
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -140,6 +141,7 @@ use dashmap::DashMap;
 use guid_hash::GuidBuildHasher;
 
 use crate::api::errors::{Error, Result};
+use crate::engine;
 use crate::layout::{BlobGuid, HEADER_SIZE, PAGE_SIZE};
 use crate::store::{BlobFrameRef, PAGE_4K};
 
@@ -153,6 +155,9 @@ use mutation::{
 };
 use residency::RouteResidency;
 use telemetry::Telemetry;
+use write_delta::{DeltaEntry, DeltaOp, WriteDelta};
+
+pub(crate) use write_delta::DeltaEntry as WriteDeltaEntry;
 
 /// Sentinel seq for dirty / pending-delete entries that originate
 /// from purely structural mutations (compact, merge pass) — they
@@ -301,6 +306,7 @@ pub(crate) struct BufferStats {
     pub(crate) eviction_skips_protected: u64,
     pub(crate) eviction_skips_route_resident: u64,
     pub(crate) admission_protects: u64,
+    pub(crate) write_delta_count: usize,
 }
 
 /// Frequency-aware blob cache; see the module docs.
@@ -343,6 +349,14 @@ pub struct BufferManager {
     /// one short critical section with no global dirty mutex on the
     /// persistent write hot path.
     mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
+    /// Deferred blind point writes. These are logical WAL-backed
+    /// mutations that have been acknowledged to the caller but not
+    /// merged into ART blob frames yet. Reads consult both pending and
+    /// in-flight flush entries before the base tree, so checkpoint can
+    /// publish a flush snapshot quickly and merge blob bytes outside
+    /// the foreground writer gate.
+    write_delta: WriteDelta,
+    write_delta_flush: Mutex<()>,
     delete_fence_total: AtomicUsize,
     /// Rotating shard cursors for advisory maintenance queues.
     /// Without this, a fixed shard-0-first drain can starve later
@@ -616,6 +630,8 @@ impl BufferManager {
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
+            write_delta: WriteDelta::default(),
+            write_delta_flush: Mutex::new(()),
             delete_fence_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
             merge_candidate_cursor: AtomicUsize::new(0),
@@ -775,6 +791,7 @@ impl BufferManager {
             eviction_skips_protected: self.telemetry.eviction_skips_protected(),
             eviction_skips_route_resident: self.telemetry.eviction_skips_route_resident(),
             admission_protects: self.telemetry.admission_protects(),
+            write_delta_count: self.write_delta.len(),
         }
     }
 
@@ -1407,6 +1424,108 @@ impl BufferManager {
     }
 
     // ---------- dirty tracking ----------
+
+    /// Stage a WAL-backed blind put without immediately reading and
+    /// mutating its target blob. The latest staged op for the same
+    /// `(tree_id, key)` wins; checkpoint later merges the logical op
+    /// into ART frames under `CommitGate` before it may truncate WAL.
+    pub(crate) fn stage_write_delta_put(
+        &self,
+        tree_id: u64,
+        root_guid: BlobGuid,
+        key: &[u8],
+        value: &[u8],
+        seq: u64,
+    ) {
+        self.write_delta
+            .stage_put(tree_id, root_guid, key, value, seq);
+    }
+
+    /// Stage a WAL-backed blind delete. See
+    /// [`Self::stage_write_delta_put`].
+    pub(crate) fn stage_write_delta_delete(
+        &self,
+        tree_id: u64,
+        root_guid: BlobGuid,
+        key: &[u8],
+        seq: u64,
+    ) {
+        self.write_delta.stage_delete(tree_id, root_guid, key, seq);
+    }
+
+    pub(crate) fn lookup_write_delta(&self, tree_id: u64, key: &[u8]) -> Option<DeltaEntry> {
+        self.write_delta.get(tree_id, key)
+    }
+
+    pub(crate) fn write_delta_count(&self) -> usize {
+        self.write_delta.len()
+    }
+
+    pub(crate) fn write_delta_count_for_tree(&self, tree_id: u64) -> usize {
+        self.write_delta.tree_len(tree_id)
+    }
+
+    pub(crate) fn flush_write_deltas(&self) -> Result<()> {
+        let _flush = self.write_delta_flush.lock().unwrap();
+        let ops = self.write_delta.begin_flush_all();
+        self.apply_write_delta_ops(ops)
+    }
+
+    pub(crate) fn flush_write_deltas_for_tree(&self, tree_id: u64) -> Result<()> {
+        let _flush = self.write_delta_flush.lock().unwrap();
+        let ops = self.write_delta.begin_flush_tree(tree_id);
+        self.apply_write_delta_ops(ops)
+    }
+
+    fn apply_write_delta_ops(&self, ops: Vec<DeltaOp>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        if let Err(e) = self.apply_write_delta_ops_inner(&ops) {
+            self.write_delta.abort_flush(ops);
+            return Err(e);
+        }
+        self.write_delta.finish_flush(&ops);
+        Ok(())
+    }
+
+    fn apply_write_delta_ops_inner(&self, ops: &[DeltaOp]) -> Result<()> {
+        let mut root_pins: HashMap<BlobGuid, Arc<CachedBlob>> = HashMap::new();
+        for op in ops {
+            let root_pin = match root_pins.entry(op.root_guid) {
+                Entry::Occupied(entry) => Arc::clone(entry.get()),
+                Entry::Vacant(entry) => Arc::clone(entry.insert(self.pin(op.root_guid)?)),
+            };
+            match &op.entry {
+                DeltaEntry::Put { value, seq } => {
+                    let outcome = engine::insert_multi(
+                        self,
+                        &root_pin,
+                        None,
+                        engine::SearchKey::user(&op.key),
+                        value,
+                        *seq,
+                    )?;
+                    if outcome.root_dirty {
+                        self.mark_dirty_cached(op.root_guid, *seq, root_pin.as_ref());
+                    }
+                }
+                DeltaEntry::Delete { seq } => {
+                    let outcome = engine::erase_multi(
+                        self,
+                        &root_pin,
+                        None,
+                        engine::SearchKey::user(&op.key),
+                        *seq,
+                    )?;
+                    if outcome.mutated && outcome.root_dirty {
+                        self.mark_dirty_cached(op.root_guid, *seq, root_pin.as_ref());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Tag `guid` as dirty at WAL seq `seq`.
     ///

@@ -338,6 +338,12 @@ impl DB {
                 .iter()
                 .map(|(_, gate)| gate.enter_exclusive())
                 .collect::<Vec<_>>();
+            {
+                let _commit = self.commit_gate.enter_writer();
+                for (tree_id, _, _, _) in &scoped {
+                    self.store.flush_write_deltas_for_tree(*tree_id)?;
+                }
+            }
             let mut trees = HashMap::with_capacity(scoped.len());
             for (_, name, prefix, tree) in scoped {
                 trees.insert(name, tree.snapshot_unlocked(prefix));
@@ -377,6 +383,12 @@ impl DB {
             .iter()
             .map(|(_, gate)| gate.enter_exclusive())
             .collect();
+        {
+            let _commit = self.commit_gate.enter_writer();
+            for (tree_id, _) in &scoped {
+                self.store.flush_write_deltas_for_tree(*tree_id)?;
+            }
+        }
 
         let mut reachable: HashSet<BlobGuid> = HashSet::new();
         reachable.insert(root_guid_for_tree_id(DB_CATALOG_TREE_ID));
@@ -426,6 +438,12 @@ impl DB {
                 .iter()
                 .map(|(_, gate)| gate.enter_exclusive())
                 .collect();
+            {
+                let _commit = self.commit_gate.enter_writer();
+                for (_, tree_id, _) in &families {
+                    self.store.flush_write_deltas_for_tree(*tree_id)?;
+                }
+            }
 
             let mut snaps = Vec::with_capacity(families.len());
             for (name, _, tree) in &families {
@@ -547,6 +565,7 @@ impl DB {
                 .count(),
             bm_dirty_count: bm.dirty_count,
             bm_pending_delete_count: bm.pending_delete_count,
+            bm_write_delta_count: bm.write_delta_count,
             bm_cache_hits: bm.cache_hits,
             bm_cache_misses: bm.cache_misses,
             bm_full_blob_reads: bm.full_blob_reads,
@@ -749,6 +768,12 @@ impl DB {
             .iter()
             .map(|(_, gate)| gate.enter_batch())
             .collect::<Vec<_>>();
+        {
+            let _commit = self.commit_gate.enter_writer();
+            for group in &groups {
+                self.store.flush_write_deltas_for_tree(group.tree_id)?;
+            }
+        }
         let count = count_wal_ops(&groups);
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
         if !Self::preflight_batch_groups(&groups, base_seq)? {

@@ -169,6 +169,7 @@ impl Pipeline {
         if shared.bm.dirty_count() == 0
             && shared.bm.flushing_count() == 0
             && shared.bm.pending_delete_count() == 0
+            && shared.bm.write_delta_count() == 0
             && !shared.bm.needs_flush()
         {
             journal.truncate()?;
@@ -246,10 +247,21 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     // watermark but use the same version-checked clone path.
     let (mut snap, mut pending, versioned_snap, wal_up_to) = if let Some(journal) = &shared.journal
     {
+        let _maintenance = shared.maintenance_gate.enter_shared();
+        let wal_up_to = {
+            let _commit = shared.commit_gate.enter_checkpoint();
+            journal.queued_work()
+        };
+        if let Err(e) = shared.bm.flush_write_deltas() {
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            shared
+                .last_round_micros
+                .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            return Err(e);
+        }
         let _commit = shared.commit_gate.enter_checkpoint();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
-        let wal_up_to = journal.queued_work();
         let versioned_snap = match shared.bm.snapshot_dirty_versions(&snap) {
             Ok(versioned) => versioned,
             Err(e) => {
@@ -264,6 +276,14 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         };
         (snap, pending, versioned_snap, Some(wal_up_to))
     } else {
+        let _maintenance = shared.maintenance_gate.enter_shared();
+        if let Err(e) = shared.bm.flush_write_deltas() {
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            shared
+                .last_round_micros
+                .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            return Err(e);
+        }
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
         let versioned_snap = match shared.bm.snapshot_dirty_versions(&snap) {

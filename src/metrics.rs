@@ -47,6 +47,7 @@
 //! | `holt_blob_overfull_children`            | gauge   | `TreeStats::overfull_child_blobs`       |
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
+//! | `holt_bm_write_delta_count`             | gauge   | `TreeStats::bm_write_delta_count`      |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
 //! | `holt_bm_full_blob_reads_total`         | counter | `TreeStats::bm_full_blob_reads`        |
@@ -254,6 +255,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Number of blobs queued for deferred store deletion.",
         "gauge",
         stats.bm_pending_delete_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_write_delta_count",
+        "Number of deferred blind writes waiting for ART merge.",
+        "gauge",
+        stats.bm_write_delta_count as u64,
     );
     metric(
         &mut out,
@@ -756,6 +764,7 @@ mod tests {
             blobs: Vec::new(),
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
+            bm_write_delta_count: 3,
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
             bm_full_blob_reads: 20,
@@ -837,6 +846,7 @@ mod tests {
         assert!(out.contains("# TYPE holt_blob_count gauge\n"));
         assert!(out.contains("holt_blob_count 3\n"));
         // Monotonic counters keep the `_total` suffix...
+        assert!(out.contains("holt_bm_write_delta_count 3\n"));
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_full_blob_reads_total 20\n"));
         assert!(out.contains("holt_bm_full_blob_read_bytes_total 10485760\n"));

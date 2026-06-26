@@ -21,8 +21,8 @@ pub(crate) use blob_frame::{
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
 pub(crate) use blob_store::ColdBlobLookup;
 pub(crate) use buffer_manager::{
-    BlobWriteGuard, BufferStats, DirtySnapshotEntry, WriteThroughEntry, WriteThroughStatus,
-    STRUCTURAL_SEQ,
+    BlobWriteGuard, BufferStats, DirtySnapshotEntry, WriteDeltaEntry, WriteThroughEntry,
+    WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};
 pub(crate) use cold::{ColdIndexAnswer, ColdIndexHit, ColdIndexStamp};

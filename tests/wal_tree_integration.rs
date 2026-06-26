@@ -118,6 +118,22 @@ fn db_checkpoint_flushes_replayed_multi_tree_without_tree_handles() {
 }
 
 #[test]
+fn db_view_flushes_deferred_tree_writes_before_snapshot() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(durable_cfg(dir.path())).unwrap();
+    let objects = db.create_tree("objects").unwrap();
+
+    objects.put(b"bucket/live", b"etag").unwrap();
+
+    db.view(&[("objects", b"bucket/")], |view| {
+        let objects = view.tree("objects").unwrap();
+        assert_eq!(objects.get(b"bucket/live")?.as_deref(), Some(&b"etag"[..]));
+        Ok::<(), holt::Error>(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn db_drop_tree_survives_checkpoint_and_reopen() {
     let dir = tempdir().unwrap();
     {
@@ -295,6 +311,69 @@ fn persistent_put_then_reopen_via_wal_replay() {
             );
         }
     }
+}
+
+#[test]
+fn deferred_put_is_visible_to_point_and_scan_before_checkpoint() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let tree = Tree::open(cfg).unwrap();
+
+    tree.put(b"bucket/a/001", b"one").unwrap();
+
+    assert_eq!(
+        tree.get(b"bucket/a/001").unwrap().as_deref(),
+        Some(&b"one"[..]),
+        "point lookup must consult deferred writes before base ART",
+    );
+
+    let listed: Vec<_> = tree
+        .scan(b"bucket/a/")
+        .into_iter()
+        .map(|entry| match entry.unwrap() {
+            holt::RangeEntry::Key { key, value, .. } => (key, value),
+            holt::RangeEntry::CommonPrefix(_) => unreachable!("no delimiter"),
+            _ => unreachable!("unknown range entry"),
+        })
+        .collect();
+    assert_eq!(listed, vec![(b"bucket/a/001".to_vec(), b"one".to_vec())]);
+}
+
+#[test]
+fn checkpoint_merges_deferred_put_before_truncating_wal() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"checkpoint/deferred", b"value").unwrap();
+        tree.checkpoint().unwrap();
+        assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert_eq!(
+        tree.get(b"checkpoint/deferred").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+}
+
+#[test]
+fn deferred_delete_survives_checkpoint_and_reopen() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"delete/me", b"value").unwrap();
+        tree.checkpoint().unwrap();
+        assert!(tree.delete(b"delete/me").unwrap());
+        assert_eq!(tree.get(b"delete/me").unwrap(), None);
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert_eq!(tree.get(b"delete/me").unwrap(), None);
 }
 
 #[test]

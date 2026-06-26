@@ -359,6 +359,7 @@ pub struct RangeBuilder {
     maintenance_gate: Arc<Gate>,
     mutation_gate: Option<Arc<Gate>>,
     dropped: Option<Arc<AtomicBool>>,
+    preflight_error: Option<Error>,
     snapshot_cursor: bool,
     prefix: KeyBuf,
     start_after: Option<KeyBuf>,
@@ -383,6 +384,7 @@ impl RangeBuilder {
             maintenance_gate,
             mutation_gate: None,
             dropped: None,
+            preflight_error: None,
             snapshot_cursor: false,
             prefix: KeyBuf::new(),
             start_after: None,
@@ -397,6 +399,11 @@ impl RangeBuilder {
 
     pub(crate) fn with_mutation_gate(mut self, mutation_gate: Arc<Gate>) -> Self {
         self.mutation_gate = Some(mutation_gate);
+        self
+    }
+
+    pub(crate) fn with_preflight_error(mut self, error: Error) -> Self {
+        self.preflight_error = Some(error);
         self
     }
 
@@ -461,6 +468,7 @@ impl RangeBuilder {
             maintenance_gate: self.maintenance_gate,
             mutation_gate: self.mutation_gate,
             dropped: self.dropped,
+            preflight_error: self.preflight_error,
             snapshot_cursor: self.snapshot_cursor,
             stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
@@ -567,34 +575,36 @@ impl KeyRangeBuilder {
         let start_after = builder.inner.start_after.as_deref();
         let delimiter = builder.inner.delimiter;
 
-        if let (Some(cache), Some(epoch)) = (&builder.prefix_list_cache, &builder.epoch) {
-            let current_epoch = epoch.load(Ordering::Acquire);
-            // Count the served entries by kind in a wrapper so the cache
-            // stays unaware of stats. On a hit `visited`/`restarts` stay
-            // zero — nothing was walked.
-            let mut stats = ScanStats::default();
-            let hit = {
-                let mut counting = |entry: KeyRangeEntryRef<'_>| {
-                    match entry {
-                        KeyRangeEntryRef::Key { .. } => stats.returned += 1,
-                        KeyRangeEntryRef::CommonPrefix(_) => stats.rollup += 1,
-                    }
-                    visitor(entry)
+        if builder.inner.preflight_error.is_none() {
+            if let (Some(cache), Some(epoch)) = (&builder.prefix_list_cache, &builder.epoch) {
+                let current_epoch = epoch.load(Ordering::Acquire);
+                // Count the served entries by kind in a wrapper so the cache
+                // stays unaware of stats. On a hit `visited`/`restarts` stay
+                // zero — nothing was walked.
+                let mut stats = ScanStats::default();
+                let hit = {
+                    let mut counting = |entry: KeyRangeEntryRef<'_>| {
+                        match entry {
+                            KeyRangeEntryRef::Key { .. } => stats.returned += 1,
+                            KeyRangeEntryRef::CommonPrefix(_) => stats.rollup += 1,
+                        }
+                        visitor(entry)
+                    };
+                    cache.visit(
+                        current_epoch,
+                        prefix,
+                        start_after,
+                        delimiter,
+                        limit,
+                        &mut counting,
+                    )?
                 };
-                cache.visit(
-                    current_epoch,
-                    prefix,
-                    start_after,
-                    delimiter,
-                    limit,
-                    &mut counting,
-                )?
-            };
-            if hit.is_some() {
-                return Ok(KeyScanOutcome {
-                    stats,
-                    cache_hit: true,
-                });
+                if hit.is_some() {
+                    return Ok(KeyScanOutcome {
+                        stats,
+                        cache_hit: true,
+                    });
+                }
             }
         }
 
@@ -716,6 +726,7 @@ pub struct RangeIter {
     maintenance_gate: Arc<Gate>,
     mutation_gate: Option<Arc<Gate>>,
     dropped: Option<Arc<AtomicBool>>,
+    preflight_error: Option<Error>,
     snapshot_cursor: bool,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
@@ -1072,6 +1083,9 @@ impl RangeIter {
     }
 
     fn next_step(&mut self) -> Result<RangeAdvance> {
+        if let Some(error) = self.preflight_error.take() {
+            return Err(error);
+        }
         if !self.initialized {
             match self.init_descent()? {
                 InitResult::Ready => {

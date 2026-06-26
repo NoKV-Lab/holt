@@ -106,7 +106,7 @@ impl TreeConfig {
             storage: Storage::File { dir: dir.into() },
             buffer_pool_size: DEFAULT_FILE_BUFFER_POOL_SIZE,
             durability: Durability::Wal { sync: false },
-            memory_flush_on_write: true,
+            memory_flush_on_write: false,
             checkpoint: CheckpointConfig::default(),
         }
     }
@@ -152,6 +152,7 @@ mod tests {
     fn file_backed_default_buffer_pool_is_service_sized() {
         let cfg = TreeConfig::new("/tmp/holt");
         assert_eq!(cfg.buffer_pool_size, 256);
+        assert!(!cfg.memory_flush_on_write);
     }
 
     #[test]

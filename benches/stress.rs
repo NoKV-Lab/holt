@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use heed::types::Bytes;
 #[cfg(feature = "comparators")]
 use heed::{Database as LmdbDatabase, Env as LmdbEnv, EnvFlags, EnvOpenOptions};
-use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig};
+use holt::{KeyRangeEntryRef, RangeEntry, Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 #[cfg(feature = "comparators")]
 use rocksdb::{BlockBasedOptions, Cache, Options, WriteBatch, WriteOptions, DB};
@@ -1140,16 +1140,16 @@ fn time_repeated(n: usize, mut f: impl FnMut()) -> Duration {
 
 fn holt_list_keys(tree: &Tree, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
-    for entry in tree.scan_keys(prefix) {
-        match entry.expect("holt list") {
-            KeyRangeEntry::Key { .. } => seen += 1,
-            KeyRangeEntry::CommonPrefix(_) => unreachable!("plain list has no delimiter"),
-            _ => unreachable!("KeyRangeEntry got a new variant"),
-        }
-        if seen >= take {
-            break;
-        }
-    }
+    tree.scan_keys(prefix)
+        .visit(take, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { .. } => seen += 1,
+                KeyRangeEntryRef::CommonPrefix(_) => unreachable!("plain list has no delimiter"),
+                _ => unreachable!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })
+        .expect("holt list");
     seen
 }
 
