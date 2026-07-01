@@ -25,4 +25,6 @@ pub(crate) use buffer_manager::{
     WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};
-pub(crate) use read_index::{ReadIndex, ReadIndexAnswer, ReadIndexHit, ReadIndexStamp};
+pub(crate) use read_index::{
+    PrefixLiveness, ReadIndex, ReadIndexAnswer, ReadIndexHit, ReadIndexStamp,
+};

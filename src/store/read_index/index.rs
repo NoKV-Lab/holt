@@ -11,7 +11,7 @@ use crate::layout::{
 use crate::store::{decode_child_off, BlobFrameRef};
 
 const MAGIC: [u8; 8] = *b"HOLTCI01";
-const VERSION: u16 = 11;
+const VERSION: u16 = 12;
 const HEADER_LEN: usize = 8 + 2 + 2 + 4 + ReadIndexStamp::ENCODED_LEN + 4 + 4 + 4 + 4 + 4 + 4;
 const BLOOM_BYTES: usize = 2048;
 const BLOOM_BITS: usize = BLOOM_BYTES * 8;
@@ -28,6 +28,7 @@ const SHARDS: usize = 16;
 const VALUE_INLINE: u32 = 0;
 const VALUE_SEGMENT: u32 = 1;
 const VALUE_BLOB: u32 = 2;
+const COMPONENT_DELIMITER_PRIORITY: &[u8] = b"/:|#@\\";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadIndexStamp {
@@ -136,6 +137,12 @@ struct CrossingEntry {
     child_guid: BlobGuid,
 }
 
+#[derive(Debug, Clone)]
+struct ComponentEntry {
+    delimiter: u8,
+    prefix: Box<[u8]>,
+}
+
 struct BuildLeaf {
     hash: u64,
     value_source: u32,
@@ -171,7 +178,7 @@ pub(crate) struct ReadIndex {
     buckets: Box<[BucketEntry]>,
     base_prefix: Box<[u8]>,
     crossings: Box<[CrossingEntry]>,
-    components: Box<[Box<[u8]>]>,
+    components: Box<[ComponentEntry]>,
     bytes: usize,
 }
 
@@ -191,6 +198,13 @@ pub(crate) enum ReadIndexHit {
         value_len: u32,
         seq: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixLiveness {
+    Present,
+    Absent,
+    Unknown,
 }
 
 impl ReadIndex {
@@ -318,9 +332,13 @@ impl ReadIndex {
         let mut component_input = component_bytes;
         let mut components = Vec::with_capacity(decoded.component_count);
         for _ in 0..decoded.component_count {
+            let delimiter = take_u8(&mut component_input)?;
             let len = take_u32(&mut component_input)? as usize;
             let component = take(&mut component_input, len)?.to_vec().into_boxed_slice();
-            components.push(component);
+            components.push(ComponentEntry {
+                delimiter,
+                prefix: component,
+            });
         }
         if !component_input.is_empty() || !input.is_empty() {
             return Err(Error::node_corrupt("read index: directory trailing bytes"));
@@ -336,7 +354,7 @@ impl ReadIndex {
                 .sum::<usize>()
             + components
                 .iter()
-                .map(|entry| size_of::<Box<[u8]>>() + entry.len())
+                .map(|entry| size_of::<ComponentEntry>() + entry.prefix.len())
                 .sum::<usize>();
         Ok(Self {
             stamp: decoded.stamp,
@@ -387,11 +405,11 @@ impl ReadIndex {
         delimiter: u8,
         lower_bound: Option<(&[u8], bool)>,
     ) -> Option<&[u8]> {
-        if delimiter != b'/' {
-            return None;
-        }
         self.components.iter().find_map(|component| {
-            let component = component.as_ref();
+            if component.delimiter != delimiter {
+                return None;
+            }
+            let component = component.prefix.as_ref();
             if component.len() <= prefix.len() || !component.starts_with(prefix) {
                 return None;
             }
@@ -407,6 +425,43 @@ impl ReadIndex {
             }
             Some(component)
         })
+    }
+
+    pub(crate) fn prefix_liveness(&self, prefix: &[u8]) -> PrefixLiveness {
+        if prefix.is_empty() && self.has_indexed_leaf() {
+            return PrefixLiveness::Present;
+        }
+
+        if self.has_indexed_leaf() {
+            let base = user_key_prefix(&self.base_prefix);
+            if base.starts_with(prefix) {
+                return PrefixLiveness::Present;
+            }
+            if !prefix.starts_with(base) {
+                return if self.crossings.is_empty() {
+                    PrefixLiveness::Absent
+                } else {
+                    PrefixLiveness::Unknown
+                };
+            }
+            if component_prefix_present(&self.components, prefix) {
+                return PrefixLiveness::Present;
+            }
+            if component_prefix_absent(&self.components, prefix) {
+                return if self.crossings.is_empty() {
+                    PrefixLiveness::Absent
+                } else {
+                    PrefixLiveness::Unknown
+                };
+            }
+            return PrefixLiveness::Unknown;
+        }
+
+        if self.crossings.is_empty() {
+            PrefixLiveness::Absent
+        } else {
+            PrefixLiveness::Unknown
+        }
     }
 
     pub(crate) fn stamp(&self) -> ReadIndexStamp {
@@ -805,32 +860,40 @@ fn encode_crossings(crossings: &[CrossingEntry]) -> Result<Vec<u8>> {
 }
 
 fn encode_components(leaves: &[BuildLeaf]) -> Result<Vec<u8>> {
-    let mut components = BTreeSet::<Vec<u8>>::new();
+    let mut grouped = HashMap::<u8, BTreeSet<Vec<u8>>>::new();
     for leaf in leaves {
         let key = leaf.key.strip_suffix(&[0]).unwrap_or(&leaf.key);
-        let mut start = 0usize;
-        while let Some(pos) = key[start..].iter().position(|&b| b == b'/') {
-            let end = start + pos + 1;
-            if end < key.len() {
-                components.insert(key[..end].to_vec());
+        for (idx, &byte) in key.iter().enumerate() {
+            let end = idx + 1;
+            if end < key.len() && is_component_delimiter(byte) {
+                grouped.entry(byte).or_default().insert(key[..end].to_vec());
             }
-            start = end;
         }
     }
 
-    let bytes = components
-        .iter()
-        .try_fold(0usize, |acc, component| {
-            acc.checked_add(4)?.checked_add(component.len())
-        })
-        .unwrap_or(MAX_COMPONENT_BYTES + 1);
-    if bytes > MAX_COMPONENT_BYTES {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::with_capacity(bytes);
-    for component in components {
-        put_u32_checked(&mut out, component.len(), "read index component")?;
-        out.extend_from_slice(&component);
+    let mut out = Vec::new();
+    let mut delimiters: Vec<u8> = grouped.keys().copied().collect();
+    delimiters.sort_by_key(|&delimiter| component_delimiter_rank(delimiter));
+    for delimiter in delimiters {
+        let Some(components) = grouped.remove(&delimiter) else {
+            continue;
+        };
+        let bytes = components
+            .iter()
+            .try_fold(0usize, |acc, component| {
+                acc.checked_add(1)?
+                    .checked_add(4)?
+                    .checked_add(component.len())
+            })
+            .unwrap_or(MAX_COMPONENT_BYTES + 1);
+        if out.len().saturating_add(bytes) > MAX_COMPONENT_BYTES {
+            continue;
+        }
+        for component in components {
+            out.push(delimiter);
+            put_u32_checked(&mut out, component.len(), "read index component")?;
+            out.extend_from_slice(&component);
+        }
     }
     Ok(out)
 }
@@ -839,11 +902,53 @@ fn component_count(bytes: &[u8]) -> Result<usize> {
     let mut input = bytes;
     let mut count = 0usize;
     while !input.is_empty() {
+        let _delimiter = take_u8(&mut input)?;
         let len = take_u32(&mut input)? as usize;
         let _ = take(&mut input, len)?;
         count += 1;
     }
     Ok(count)
+}
+
+fn is_component_delimiter(byte: u8) -> bool {
+    COMPONENT_DELIMITER_PRIORITY.contains(&byte)
+}
+
+fn component_delimiter_rank(byte: u8) -> usize {
+    COMPONENT_DELIMITER_PRIORITY
+        .iter()
+        .position(|&candidate| candidate == byte)
+        .unwrap_or(COMPONENT_DELIMITER_PRIORITY.len())
+}
+
+fn user_key_prefix(key: &[u8]) -> &[u8] {
+    key.strip_suffix(&[0]).unwrap_or(key)
+}
+
+fn component_prefix_present(components: &[ComponentEntry], prefix: &[u8]) -> bool {
+    components
+        .iter()
+        .any(|component| component.prefix.starts_with(prefix))
+}
+
+fn component_prefix_absent(components: &[ComponentEntry], prefix: &[u8]) -> bool {
+    let Some(&delimiter) = prefix.last() else {
+        return false;
+    };
+    if !is_component_delimiter(delimiter) {
+        return false;
+    }
+    let mut saw_group = false;
+    for component in components {
+        if component.delimiter != delimiter {
+            continue;
+        }
+        saw_group = true;
+        if component.prefix.starts_with(prefix) {
+            return false;
+        }
+    }
+    saw_group
 }
 
 fn encode_bloom(leaves: &[BuildLeaf]) -> Box<[u8; BLOOM_BYTES]> {
@@ -1095,6 +1200,10 @@ fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
     let (head, tail) = input.split_at(len);
     *input = tail;
     Ok(head)
+}
+
+fn take_u8(input: &mut &[u8]) -> Result<u8> {
+    Ok(take(input, 1)?[0])
 }
 
 fn take_u16(input: &mut &[u8]) -> Result<u16> {
@@ -1434,8 +1543,14 @@ mod tests {
             base_prefix: Box::new([]),
             crossings: Box::new([]),
             components: vec![
-                b"bucket/a/".to_vec().into_boxed_slice(),
-                b"bucket/b/".to_vec().into_boxed_slice(),
+                ComponentEntry {
+                    delimiter: b'/',
+                    prefix: b"bucket/a/".to_vec().into_boxed_slice(),
+                },
+                ComponentEntry {
+                    delimiter: b'/',
+                    prefix: b"bucket/b/".to_vec().into_boxed_slice(),
+                },
             ]
             .into_boxed_slice(),
             bytes: 0,
@@ -1450,6 +1565,85 @@ mod tests {
             Some(b"bucket/b/".as_slice())
         );
         assert_eq!(index.next_component_rollup(b"bucket/", b':', None), None);
+    }
+
+    #[test]
+    fn component_summary_supports_colon_delimiter() {
+        let leaves = vec![
+            BuildLeaf {
+                hash: hash_exact_key(b"tenant:bucket:object-0001\0"),
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"one"),
+                key: b"tenant:bucket:object-0001\0".to_vec().into_boxed_slice(),
+                value: Some(b"one".to_vec().into_boxed_slice()),
+                seq: 7,
+            },
+            BuildLeaf {
+                hash: hash_exact_key(b"tenant:logs:object-0001\0"),
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"two"),
+                key: b"tenant:logs:object-0001\0".to_vec().into_boxed_slice(),
+                value: Some(b"two".to_vec().into_boxed_slice()),
+                seq: 8,
+            },
+        ];
+        let components = encode_components(&leaves).unwrap();
+        let mut input = components.as_slice();
+        let mut decoded = Vec::new();
+        while !input.is_empty() {
+            let delimiter = take_u8(&mut input).unwrap();
+            let len = take_u32(&mut input).unwrap() as usize;
+            decoded.push((delimiter, take(&mut input, len).unwrap().to_vec()));
+        }
+        assert!(decoded.contains(&(b':', b"tenant:".to_vec())));
+        assert!(decoded.contains(&(b':', b"tenant:bucket:".to_vec())));
+    }
+
+    #[test]
+    fn prefix_liveness_uses_base_prefix_and_components() {
+        let index = ReadIndex {
+            stamp: ReadIndexStamp {
+                root_slot: 0,
+                num_slots: 0,
+                space_used: 0,
+                compact_times: 0,
+                dead_bytes: 0,
+                gap_space: 0,
+                tombstone_leaf_cnt: 0,
+                created_epoch: 0,
+                blob_guid: [0; 16],
+                routing_off: 0,
+                routing_len: 0,
+                leaf_region_start: 0,
+                routing_unfit: 0,
+            },
+            bloom: Box::new([0; BLOOM_BYTES]),
+            buckets: vec![BucketEntry { off: 0, len: 12 }].into_boxed_slice(),
+            base_prefix: b"bucket/a".to_vec().into_boxed_slice(),
+            crossings: Box::new([]),
+            components: vec![ComponentEntry {
+                delimiter: b'/',
+                prefix: b"bucket/a/".to_vec().into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+            bytes: 0,
+        };
+
+        assert_eq!(index.prefix_liveness(b"bucket/"), PrefixLiveness::Present);
+        assert_eq!(index.prefix_liveness(b"bucket/a/"), PrefixLiveness::Present);
+        assert_eq!(index.prefix_liveness(b"bucket/z/"), PrefixLiveness::Absent);
+        assert_eq!(
+            index.prefix_liveness(b"bucket/a/missing/"),
+            PrefixLiveness::Absent
+        );
+        assert_eq!(
+            index.prefix_liveness(b"bucket/a/file"),
+            PrefixLiveness::Unknown
+        );
     }
 
     #[test]

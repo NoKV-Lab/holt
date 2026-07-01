@@ -218,7 +218,44 @@ fn indexed_component_summary_rolls_child_blob_directories_with_one_routing_pin()
 }
 
 #[test]
-fn is_prefix_empty_populates_limit_one_prefix_cache() {
+fn colon_component_summary_rolls_child_blob_directories_with_one_routing_pin() {
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path());
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let value = vec![5u8; 128];
+        for d in 0..8u32 {
+            for i in 0..900u32 {
+                tree.put(format!("tenant:dir-{d}:file-{i:04}").as_bytes(), &value)
+                    .unwrap();
+            }
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let mut prefixes = Vec::new();
+    let outcome = tree
+        .scan_keys(b"tenant:")
+        .delimiter(b':')
+        .visit_with_outcome(8, |entry| {
+            if let holt::KeyRangeEntryRef::CommonPrefix(prefix) = entry {
+                prefixes.push(prefix.to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(outcome.stats.rollup, 8, "prefixes={prefixes:?}");
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.bm_scan_full_blob_reads <= 1,
+        "colon component summary should avoid child leaf scans; full_blob_reads={}",
+        stats.bm_scan_full_blob_reads,
+    );
+}
+
+#[test]
+fn prefix_empty_does_not_pollute_limit_one_prefix_cache() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"dir/child", b"v").unwrap();
 
@@ -228,9 +265,40 @@ fn is_prefix_empty_populates_limit_one_prefix_cache() {
         .scan_keys(b"dir/")
         .visit_with_outcome(1, |_| Ok(()))
         .unwrap();
-    assert!(outcome.cache_hit);
+    assert!(!outcome.cache_hit);
     assert_eq!(outcome.stats.returned, 1);
-    assert_eq!(outcome.stats.visited, 0);
+    assert_eq!(outcome.stats.visited, 1);
+}
+
+#[test]
+fn prefix_empty_uses_read_index_liveness_after_reopen() {
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path());
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let value = vec![3u8; 128];
+        for d in 0..8u32 {
+            for i in 0..900u32 {
+                tree.put(format!("bucket/a{d}/file-{i:04}").as_bytes(), &value)
+                    .unwrap();
+            }
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert!(!tree.is_prefix_empty(b"bucket/a3/").unwrap());
+    assert!(tree.is_prefix_empty(b"bucket/z/").unwrap());
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.bm_scan_full_blob_reads <= 1,
+        "prefix liveness should use read-index summaries before pinning child blobs; full_blob_reads={}",
+        stats.bm_scan_full_blob_reads,
+    );
+    assert!(
+        stats.bm_read_index_loads > 0 || stats.bm_read_index_cache_hits > 0,
+        "prefix liveness should consult read-index summaries"
+    );
 }
 
 #[test]

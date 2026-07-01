@@ -1480,8 +1480,8 @@ impl Tree {
     }
 
     fn base_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
-        let mut iter = self.scan_keys(prefix).into_iter();
-        Ok(iter.next_unlocked().transpose()?.is_none())
+        let outcome = self.scan_keys(prefix).prefix_exists_unlocked()?;
+        Ok(outcome.stats.returned + outcome.stats.rollup == 0)
     }
 
     fn validate_insert_shape(key: &[u8], value: &[u8]) -> Result<()> {
@@ -1960,12 +1960,8 @@ impl Tree {
     /// [`AtomicBatch::assert_prefix_empty`] inside [`Self::atomic`] when
     /// the emptiness check must be atomic with subsequent writes.
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
-        let mut found = false;
-        self.scan_keys(prefix).visit(1, |_| {
-            found = true;
-            Ok(())
-        })?;
-        Ok(!found)
+        let outcome = self.scan_keys(prefix).prefix_exists()?;
+        Ok(outcome.stats.returned + outcome.stats.rollup == 0)
     }
 
     /// Drain the BM dirty map and synchronously push entries to

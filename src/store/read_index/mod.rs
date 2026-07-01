@@ -7,5 +7,7 @@
 mod index;
 mod page_cache;
 
-pub(crate) use index::{ReadIndex, ReadIndexAnswer, ReadIndexCache, ReadIndexHit, ReadIndexStamp};
+pub(crate) use index::{
+    PrefixLiveness, ReadIndex, ReadIndexAnswer, ReadIndexCache, ReadIndexHit, ReadIndexStamp,
+};
 pub(crate) use page_cache::ReadPageCache;

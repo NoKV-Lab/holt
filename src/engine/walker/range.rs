@@ -29,7 +29,9 @@ use crate::api::atomic::RecordVersion;
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::{CommitGate, Gate};
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
-use crate::store::{decode_child_off, BlobFrameRef, BufferManager, CachedBlob, WriteDeltaKeyState};
+use crate::store::{
+    decode_child_off, BlobFrameRef, BufferManager, CachedBlob, PrefixLiveness, WriteDeltaKeyState,
+};
 
 use smallvec::SmallVec;
 
@@ -324,6 +326,7 @@ enum RangeProjection {
     Records,
     KeysOnly,
     KeyRefs,
+    Liveness,
 }
 
 enum ProjectedRangeEntry {
@@ -601,6 +604,44 @@ impl KeyRangeBuilder {
     where
         F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
     {
+        self.visit_with_projection(limit, RangeProjection::KeyRefs, &mut visitor)
+    }
+
+    pub(crate) fn prefix_exists(self) -> Result<KeyScanOutcome> {
+        let builder = self;
+        builder.inner.ensure_live()?;
+        if builder.inner.preflight_error.is_none() {
+            builder.inner.flush_write_deltas_if_needed(true)?;
+        }
+        let maintenance_gate = Arc::clone(&builder.inner.maintenance_gate);
+        let mutation_gate = builder.inner.mutation_gate.clone();
+        let _maintenance = maintenance_gate.enter_shared();
+        let _tree_mutation = mutation_gate.as_ref().map(|gate| gate.enter_shared());
+        builder.prefix_exists_unlocked()
+    }
+
+    pub(crate) fn prefix_exists_unlocked(self) -> Result<KeyScanOutcome> {
+        let mut iter = KeyRangeIter {
+            inner: self
+                .inner
+                .into_iter_with_projection(RangeProjection::Liveness),
+        };
+        let _ = iter.inner.count_key_entries_unlocked(1)?;
+        Ok(KeyScanOutcome {
+            stats: iter.stats(),
+            cache_hit: false,
+        })
+    }
+
+    fn visit_with_projection<F>(
+        self,
+        limit: usize,
+        projection: RangeProjection,
+        visitor: &mut F,
+    ) -> Result<KeyScanOutcome>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
         if limit == 0 {
             return Ok(KeyScanOutcome::default());
         }
@@ -614,7 +655,9 @@ impl KeyRangeBuilder {
         let start_after = builder.inner.start_after.as_deref();
         let delimiter = builder.inner.delimiter;
 
-        if builder.inner.preflight_error.is_none() {
+        let use_prefix_cache = projection == RangeProjection::KeyRefs;
+
+        if use_prefix_cache && builder.inner.preflight_error.is_none() {
             if let (Some(cache), Some(epoch)) = (&builder.prefix_list_cache, &builder.epoch) {
                 let current_epoch = epoch.load(Ordering::Acquire);
                 // Count the served entries by kind in a wrapper so the cache
@@ -647,12 +690,14 @@ impl KeyRangeBuilder {
             }
         }
 
-        let mut cached =
-            if builder.prefix_list_cache.is_some() && PrefixListCache::cacheable_limit(limit) {
-                Some(Vec::with_capacity(limit))
-            } else {
-                None
-            };
+        let mut cached = if use_prefix_cache
+            && builder.prefix_list_cache.is_some()
+            && PrefixListCache::cacheable_limit(limit)
+        {
+            Some(Vec::with_capacity(limit))
+        } else {
+            None
+        };
         let cache_prefix = cached.as_ref().map(|_| builder.inner.prefix.clone());
         let cache_start_after = cached
             .as_ref()
@@ -665,11 +710,9 @@ impl KeyRangeBuilder {
         let _maintenance = maintenance_gate.enter_shared();
         let _tree_mutation = mutation_gate.as_ref().map(|gate| gate.enter_shared());
         let mut iter = KeyRangeIter {
-            inner: builder
-                .inner
-                .into_iter_with_projection(RangeProjection::KeyRefs),
+            inner: builder.inner.into_iter_with_projection(projection),
         };
-        iter.visit_key_entries_unlocked(limit, |entry| {
+        iter.visit_key_entries_unlocked_with_projection(limit, projection, |entry| {
             let Some(entry) = overlay_key_entry(&bm, tree_id, entry) else {
                 return Ok(());
             };
@@ -774,16 +817,16 @@ impl KeyRangeIter {
             .map(|entry| entry.map(ProjectedRangeEntry::into_key))
     }
 
-    /// Visit key-only entries without entering `maintenance_gate`.
-    ///
-    /// Caller must hold the tree's shared maintenance guard for the
-    /// whole call. Entries borrow from the cursor's scratch buffer and
-    /// are invalid after the callback returns.
-    pub(crate) fn visit_key_entries_unlocked<F>(&mut self, limit: usize, visit: F) -> Result<usize>
+    fn visit_key_entries_unlocked_with_projection<F>(
+        &mut self,
+        limit: usize,
+        projection: RangeProjection,
+        visit: F,
+    ) -> Result<usize>
     where
         F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
     {
-        self.inner.projection = RangeProjection::KeyRefs;
+        self.inner.projection = projection;
         self.inner.visit_key_entries_unlocked(limit, visit)
     }
 }
@@ -901,7 +944,7 @@ fn project_range_leaf(
             let (k, v) = leaf_extent(frame, off)?;
             (k, Some(v))
         }
-        RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
+        RangeProjection::KeysOnly | RangeProjection::KeyRefs | RangeProjection::Liveness => {
             (leaf_key_extent(frame, off)?, None)
         }
     };
@@ -927,7 +970,10 @@ fn project_range_leaf(
     if let Some(d) = delimiter {
         let rest = &user_key[prefix.len()..];
         if let Some(idx) = simd::find_byte(rest, d, 0) {
-            if matches!(projection, RangeProjection::KeyRefs) {
+            if matches!(
+                projection,
+                RangeProjection::KeyRefs | RangeProjection::Liveness
+            ) {
                 emit_buf.clear();
                 emit_buf.extend_from_slice(&user_key[..=prefix.len() + idx]);
                 return Ok(LeafAction::KeyRefCommonPrefix);
@@ -936,7 +982,10 @@ fn project_range_leaf(
             return Ok(LeafAction::CommonPrefix(common));
         }
     }
-    if matches!(projection, RangeProjection::KeyRefs) {
+    if matches!(
+        projection,
+        RangeProjection::KeyRefs | RangeProjection::Liveness
+    ) {
         emit_buf.clear();
         emit_buf.extend_from_slice(user_key);
         return Ok(LeafAction::KeyRef {
@@ -1285,6 +1334,33 @@ impl RangeIter {
         Ok(emitted)
     }
 
+    fn count_key_entries_unlocked(&mut self, limit: usize) -> Result<usize> {
+        let mut emitted = 0usize;
+        while emitted < limit {
+            let step = loop {
+                if self.terminated {
+                    return Ok(emitted);
+                }
+                match self.next_step()? {
+                    RangeAdvance::Restart => self.restart_cursor(),
+                    other => break other,
+                }
+            };
+            match step {
+                RangeAdvance::Done => {
+                    self.terminated = true;
+                    return Ok(emitted);
+                }
+                RangeAdvance::KeyRef(_) => emitted += 1,
+                RangeAdvance::Entry(_) => {
+                    unreachable!("owned entry emitted from borrowed key projection")
+                }
+                RangeAdvance::Restart => unreachable!("restart handled by inner loop"),
+            }
+        }
+        Ok(emitted)
+    }
+
     fn init_descent(&mut self) -> Result<InitResult> {
         let seek_start = self.effective_seek_start();
         if matches!(seek_start, SeekStart::Empty) {
@@ -1410,7 +1486,9 @@ impl RangeIter {
             RangeProjection::KeysOnly => RangeAdvance::Entry(ProjectedRangeEntry::Key(
                 KeyRangeEntry::CommonPrefix(self.emit_buf.clone()),
             )),
-            RangeProjection::KeyRefs => RangeAdvance::KeyRef(KeyRefKind::CommonPrefix),
+            RangeProjection::KeyRefs | RangeProjection::Liveness => {
+                RangeAdvance::KeyRef(KeyRefKind::CommonPrefix)
+            }
         }
     }
 
@@ -1506,6 +1584,25 @@ impl RangeIter {
         self.emit_buf.clear();
         self.emit_buf.extend_from_slice(candidate);
         Some(epoch)
+    }
+
+    fn prefix_liveness_for_child(&self, child_guid: BlobGuid) -> Option<(PrefixLiveness, u64)> {
+        if self.projection != RangeProjection::Liveness
+            || self.delimiter.is_some()
+            || self.lower_bound.is_some()
+        {
+            return None;
+        }
+        let (index, epoch) = self.bm.read_index_for_liveness(child_guid)?;
+        Some((index.prefix_liveness(&self.prefix), epoch))
+    }
+
+    fn prefix_liveness_advance(&mut self) -> RangeAdvance {
+        self.emit_buf.clear();
+        self.emit_buf.extend_from_slice(&self.prefix);
+        self.stats.visited += 1;
+        self.stats.rollup += 1;
+        RangeAdvance::KeyRef(KeyRefKind::CommonPrefix)
     }
 
     fn cold_rollup_segment(&self, blob_prefix: &[u8], base_prefix: &[u8]) -> Vec<u8> {
@@ -1675,6 +1772,21 @@ impl RangeIter {
                         SegmentRelation::Continue | SegmentRelation::Min => {
                             if self.segment_has_allowed_rollup_candidate(p_bytes.as_slice()) {
                                 return Ok(InitResult::Ready);
+                            }
+                            if let Some((liveness, epoch)) =
+                                self.prefix_liveness_for_child(child_guid)
+                            {
+                                if self.bm.read_index_liveness_token_valid(child_guid, epoch) {
+                                    match liveness {
+                                        PrefixLiveness::Present => return Ok(InitResult::Ready),
+                                        PrefixLiveness::Absent => {
+                                            self.stack[idx].next = 1;
+                                            self.pop_frame();
+                                            continue;
+                                        }
+                                        PrefixLiveness::Unknown => {}
+                                    }
+                                }
                             }
                             if let Some(candidate) = self
                                 .indexed_blob_rollup_candidate_key(child_guid, p_bytes.as_slice())
@@ -1862,7 +1974,7 @@ impl RangeIter {
                                             version,
                                         })
                                     }
-                                    RangeProjection::KeyRefs => {
+                                    RangeProjection::KeyRefs | RangeProjection::Liveness => {
                                         unreachable!(
                                             "borrowed key projection uses LeafAction::KeyRef"
                                         )
@@ -1907,7 +2019,7 @@ impl RangeIter {
                                     RangeProjection::KeysOnly => ProjectedRangeEntry::Key(
                                         KeyRangeEntry::CommonPrefix(common),
                                     ),
-                                    RangeProjection::KeyRefs => unreachable!(
+                                    RangeProjection::KeyRefs | RangeProjection::Liveness => unreachable!(
                                         "borrowed key projection uses LeafAction::KeyRefCommonPrefix"
                                     ),
                                 };
@@ -2064,6 +2176,24 @@ impl RangeIter {
                                     self.reseek_after_emit();
                                 }
                                 return Ok(self.common_prefix_advance_from_emit());
+                            }
+                        }
+                        if let Some((liveness, epoch)) = self.prefix_liveness_for_child(child_guid)
+                        {
+                            if self.bm.read_index_liveness_token_valid(child_guid, epoch) {
+                                match liveness {
+                                    PrefixLiveness::Present => {
+                                        if !self.path_is_still_valid() {
+                                            return Ok(RangeAdvance::Restart);
+                                        }
+                                        return Ok(self.prefix_liveness_advance());
+                                    }
+                                    PrefixLiveness::Absent => {
+                                        self.pop_frame();
+                                        continue;
+                                    }
+                                    PrefixLiveness::Unknown => {}
+                                }
                             }
                         }
                         let Some(child_pin) = self.pin_scan_child(child_guid)? else {
