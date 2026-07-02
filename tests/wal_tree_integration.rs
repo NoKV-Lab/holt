@@ -1196,6 +1196,148 @@ fn spillover_new_blobs_deferred_to_store_until_checkpoint() {
 }
 
 #[test]
+fn k8s_shaped_hot_prefix_updates_do_not_expose_spillover_gap() {
+    let dir = tempdir().unwrap();
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.durability = Durability::Wal { sync: false };
+    let tree = Tree::open(cfg).unwrap();
+
+    let prefixes = [
+        "/registry/p0",
+        "/registry/p1",
+        "/registry/p2",
+        "/registry/p3",
+        "/registry/p4",
+        "/registry/p5",
+        "/registry/p6",
+        "/registry/p7",
+    ];
+    let mut value = vec![0u8; 24 * 1024];
+
+    for i in 0..768u64 {
+        let prefix = prefixes[(i as usize) % prefixes.len()];
+        let obj = i / prefixes.len() as u64;
+        value.fill((i & 0xff) as u8);
+        put_k8s_update(&tree, prefix, obj, i + 1, &value);
+    }
+
+    tree.checkpoint().unwrap();
+
+    for round in 0..64u64 {
+        assert!(tree
+            .atomic(|batch| {
+                for slot in 0..16u64 {
+                    let prefix = prefixes[((round + slot) as usize) % prefixes.len()];
+                    let obj = (round * 16 + slot) % 128;
+                    let rev = round * 16 + slot + 1024;
+                    value.fill((rev & 0xff) as u8);
+                    let object_key = format!("{prefix}/objects/{obj:08}");
+                    let head_key = format!("{prefix}/heads/{obj:08}");
+                    let event_key = format!("{prefix}/watch/{rev:012}");
+                    let head_value = format!("rev={rev};object={object_key}");
+                    batch.put(object_key.as_bytes(), &value);
+                    batch.put(head_key.as_bytes(), head_value.as_bytes());
+                    batch.put(event_key.as_bytes(), object_key.as_bytes());
+                }
+            })
+            .unwrap());
+    }
+
+    for prefix in prefixes {
+        for obj in 0..8u64 {
+            let head_key = format!("{prefix}/heads/{obj:08}");
+            assert!(tree.get(head_key.as_bytes()).unwrap().is_some());
+        }
+    }
+}
+
+fn put_k8s_update(tree: &Tree, prefix: &str, obj: u64, rev: u64, value: &[u8]) {
+    assert!(tree
+        .atomic(|batch| {
+            let object_key = format!("{prefix}/objects/{obj:08}");
+            let head_key = format!("{prefix}/heads/{obj:08}");
+            let event_key = format!("{prefix}/watch/{rev:012}");
+            let head_value = format!("rev={rev};object={object_key}");
+            batch.put(object_key.as_bytes(), value);
+            batch.put(head_key.as_bytes(), head_value.as_bytes());
+            batch.put(event_key.as_bytes(), object_key.as_bytes());
+        })
+        .unwrap());
+}
+
+#[test]
+#[ignore = "heavy issue #23 reproducer; run explicitly in release mode"]
+fn issue_23_k8s_shaped_spillover_reproducer() {
+    let dir = tempdir().unwrap();
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.durability = Durability::Wal { sync: false };
+    let tree = Arc::new(Tree::open(cfg).unwrap());
+    let prefixes = [
+        "/registry/p0",
+        "/registry/p1",
+        "/registry/p2",
+        "/registry/p3",
+        "/registry/p4",
+        "/registry/p5",
+        "/registry/p6",
+        "/registry/p7",
+    ];
+
+    for i in 0..20_000u64 {
+        let prefix = prefixes[(i as usize) % prefixes.len()];
+        let obj = i / prefixes.len() as u64;
+        let mut value = vec![0u8; issue_23_value_len(i)];
+        value.fill((i & 0xff) as u8);
+        put_k8s_update(&tree, prefix, obj, i + 1, &value);
+    }
+
+    tree.checkpoint().unwrap();
+
+    let barrier = Arc::new(Barrier::new(5));
+    let mut handles = Vec::new();
+    for worker in 0..4u64 {
+        let tree = Arc::clone(&tree);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for round in 0..128u64 {
+                let base = 20_000 + worker * 128 * 16 + round * 16;
+                assert!(tree
+                    .atomic(|batch| {
+                        for slot in 0..16u64 {
+                            let rev = base + slot + 1;
+                            let prefix = prefixes[((rev + worker) as usize) % prefixes.len()];
+                            let obj = rev % 2_500;
+                            let mut value = vec![0u8; issue_23_value_len(rev)];
+                            value.fill((rev & 0xff) as u8);
+                            let object_key = format!("{prefix}/objects/{obj:08}");
+                            let head_key = format!("{prefix}/heads/{obj:08}");
+                            let event_key = format!("{prefix}/watch/{rev:012}");
+                            let head_value = format!("rev={rev};object={object_key}");
+                            batch.put(object_key.as_bytes(), &value);
+                            batch.put(head_key.as_bytes(), head_value.as_bytes());
+                            batch.put(event_key.as_bytes(), object_key.as_bytes());
+                        }
+                    })
+                    .unwrap());
+            }
+        }));
+    }
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    tree.checkpoint().unwrap();
+    let stats = tree.stats().unwrap();
+    assert!(stats.blob_count > 1);
+}
+
+fn issue_23_value_len(seed: u64) -> usize {
+    20 * 1024 + ((seed as usize * 7919) % (20 * 1024 + 1))
+}
+
+#[test]
 fn compact_does_not_leak_pre_wal_state_to_store() {
     // Regression test: `Tree::compact` used to call
     // `bm.commit(*guid)` for every touched blob, which pushes
