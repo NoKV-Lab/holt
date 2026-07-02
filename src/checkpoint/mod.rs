@@ -146,16 +146,15 @@ pub struct CheckpointConfig {
     /// checkpoint epochs once tail-reclaimable space crosses
     /// [`Self::auto_vacuum_min_free_bytes`].
     ///
-    /// Vacuum is a physical-space maintenance action only: it trims
-    /// packed-file tails and, on Linux, punches reusable middle-slot
-    /// holes. A failed auto-vacuum logs a warning but does not make
-    /// the completed checkpoint fail.
+    /// Vacuum is a physical-space maintenance action only: it relocates
+    /// live high-water slots into lower reusable holes, trims packed-file
+    /// tails, and, on Linux, punches remaining reusable middle-slot holes.
+    /// A failed auto-vacuum logs a warning but does not make the completed
+    /// checkpoint fail.
     pub auto_vacuum: bool,
     /// Tail-reclaimable store space required before automatic
-    /// vacuum is attempted. Default 256 MiB. Reusable middle slots
-    /// are hole-punched by explicit [`crate::Tree::vacuum`] /
-    /// [`crate::DB::vacuum`]; auto-vacuum keys off tail bytes so it
-    /// does not repeatedly revisit already-sparse middle holes.
+    /// vacuum is attempted. Default 256 MiB. Auto-vacuum keys off tail
+    /// bytes so it does not repeatedly revisit already-sparse middle holes.
     pub auto_vacuum_min_free_bytes: u64,
 }
 

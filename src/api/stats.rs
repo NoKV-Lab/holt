@@ -121,11 +121,10 @@ pub struct StoreStats {
 /// Physical space reclaimed by an explicit vacuum pass.
 ///
 /// `gc` only makes unreachable slots reusable. `vacuum` first runs
-/// that logical reclamation path, then asks the file store to drop
-/// trailing reusable slots from its packed files and, on Linux,
-/// releases physical blocks for reusable middle slots with hole
-/// punching. Middle slots remain logically addressable for future
-/// reuse.
+/// that logical reclamation path, then asks the file store to
+/// relocate live high-water slots into reusable middle holes, drop
+/// the now-free packed-file tail, and, on Linux, release any
+/// remaining reusable middle blocks with hole punching.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VacuumStats {
     /// Unreachable blob frames logically removed before the physical
@@ -134,6 +133,11 @@ pub struct VacuumStats {
     pub unreachable_blobs: usize,
     /// Manifest slots trimmed from the packed-file tail.
     pub slots_trimmed: u64,
+    /// Live blob slots relocated from the high-water tail into
+    /// reusable middle holes before tail trimming.
+    pub slots_relocated: u64,
+    /// Bytes copied while relocating live blob slots.
+    pub bytes_relocated: u64,
     /// Bytes removed from store files. Counts `blobs.dat`,
     /// `read.idx`, and `value.seg` truncation.
     pub bytes_truncated: u64,

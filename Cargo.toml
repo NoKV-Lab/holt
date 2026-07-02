@@ -34,13 +34,12 @@ crossbeam-channel = "0.5"
 dashmap = "6"
 # Hardware-accelerated CRC32 for WAL record footers.
 crc32fast = "1.4"
+# Unix file-store flags, direct I/O, preallocation, and sparse-file reclamation.
+libc = "0.2"
 # Inline storage for short range prefixes/start markers.
 smallvec = "1"
 # Optional structured events for rare structural paths.
 tracing = { version = "0.1", default-features = false, optional = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

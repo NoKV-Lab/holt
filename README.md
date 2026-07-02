@@ -69,9 +69,9 @@ system built for that shape.
 holt = "0.8"
 ```
 
-File-backed trees are Unix-oriented. Linux uses the `io-uring` feature
-by default when available; non-Linux Unix targets use the normal file
-backend. In-memory trees are available for tests and ephemeral indexes.
+File-backed trees are Unix-only. Linux uses the `io-uring` feature by
+default when available; non-Linux Unix targets use the normal file backend.
+In-memory trees are available for tests and ephemeral indexes.
 
 ## Quick Start
 

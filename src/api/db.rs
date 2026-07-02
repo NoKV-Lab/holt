@@ -409,9 +409,10 @@ impl DB {
     /// This is the DB-wide analog of [`Tree::vacuum`](crate::Tree::vacuum):
     /// it collects reachability across the catalog, every live named tree,
     /// and live snapshots, checkpoints the shared store, then asks the
-    /// file backend to truncate durably free packed-file tails and, where
-    /// supported, hole-punch reusable middle slots. Live blobs are never
-    /// moved.
+    /// file backend to relocate live high-water slots into lower reusable
+    /// holes, truncate durably free packed-file tails, and, where supported,
+    /// hole-punch remaining reusable middle slots. GUID/key visibility is
+    /// unchanged.
     pub fn vacuum(&self) -> Result<VacuumStats> {
         let unreachable = self.gc()?;
         self.checkpoint()?;

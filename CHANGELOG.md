@@ -16,7 +16,8 @@ fine-grained per-commit history is in `git log`.
   checkpoint and physically trims trailing reusable slots from `blobs.dat`,
   `read.idx`, and `value.seg`.
 - Added store-space observability for physical allocated bytes, tail
-  reclaimable slots/bytes, and reusable middle slots.
+  reclaimable slots/bytes, reusable middle slots, and vacuum relocation
+  counters.
 
 ### Fixed
 
@@ -24,8 +25,14 @@ fine-grained per-commit history is in `git log`.
   truncate packed accelerator/data files after tail-slot reclamation. This
   prevents long-running delete/compact workloads from staying pinned to their
   historical slot high-water mark after the tail is durably free.
-- File-backed vacuum now hole-punches reusable middle slots on Linux, returning
-  physical filesystem blocks without changing logical slot addresses.
+- File-backed vacuum now compacts live high-water slots into lower reusable
+  holes before tail truncation, carrying `read.idx` and `value.seg`
+  accelerator slots with the authoritative blob slot. This reduces packed-file
+  high-water bloat after delete-heavy workloads instead of relying on future
+  writes to reuse middle holes.
+- After slot compaction, file-backed vacuum hole-punches any remaining reusable
+  middle slots on Linux, returning physical filesystem blocks without changing
+  live GUID mappings.
 - Background checkpointing now opportunistically auto-vacuums when
   tail-reclaimable space crosses the configured threshold.
 - WAL group-commit flushing no longer issues duplicate fsyncs when a sync

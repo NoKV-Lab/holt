@@ -234,9 +234,10 @@ pub trait BlobStore: Send + Sync {
     /// Reclaim physical store space that is already logically free.
     ///
     /// The default is a no-op for memory/custom stores. File-backed
-    /// stores trim trailing free slots from packed files and, where
-    /// supported, release physical blocks for reusable middle slots.
-    /// Vacuum does not move live blobs or change GUID mappings.
+    /// stores may relocate live high-water slots into lower reusable
+    /// holes before trimming packed-file tails and, where supported,
+    /// release physical blocks for reusable middle slots. GUID
+    /// mappings remain authoritative and stable.
     fn vacuum(&self) -> Result<VacuumStats> {
         Ok(VacuumStats::default())
     }

@@ -1909,10 +1909,11 @@ impl Tree {
     ///
     /// [`Self::gc`] only makes unreachable blob frames reusable. `vacuum`
     /// follows that with a checkpoint and store-level physical cleanup:
+    /// live high-water slots may be relocated into lower reusable holes,
     /// packed-file tails that are durably free are truncated, and on
-    /// Linux reusable middle slots are hole-punched while keeping their
-    /// logical slot numbers available for future reuse. It never moves
-    /// live blobs.
+    /// Linux any remaining reusable middle slots are hole-punched. This
+    /// can change physical slot addresses inside the file backend, but
+    /// GUID/key visibility is unchanged.
     ///
     /// Only supported on standalone trees. Named trees inside a
     /// [`DB`](crate::DB) share one store; use [`DB::vacuum`](crate::DB::vacuum)
