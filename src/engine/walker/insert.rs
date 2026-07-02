@@ -23,7 +23,7 @@ use super::MAX_SPILLOVER_ATTEMPTS;
 use crate::engine::RouteCache;
 use crate::store::BlobWriteGuard;
 use crate::store::{decode_child_off, encode_child_off};
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::{AllocError, BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
 
@@ -751,6 +751,79 @@ enum InsertStep {
     Crossing(InsertBlobCrossing),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InsertAllocMiss {
+    Space,
+    Slots,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReclaimSnapshot {
+    num_slots: u16,
+    space_used: u32,
+    dead_bytes: u32,
+    tombstone_leaf_cnt: u32,
+}
+
+fn reclaim_snapshot(guard: &mut BlobWriteGuard<'_>) -> ReclaimSnapshot {
+    let frame = guard.frame();
+    let h = frame.header();
+    ReclaimSnapshot {
+        num_slots: h.num_slots,
+        space_used: h.space_used,
+        dead_bytes: h.dead_bytes,
+        tombstone_leaf_cnt: h.tombstone_leaf_cnt,
+    }
+}
+
+fn compact_made_retry_worthwhile(
+    miss: InsertAllocMiss,
+    before: ReclaimSnapshot,
+    after: ReclaimSnapshot,
+) -> bool {
+    match miss {
+        InsertAllocMiss::Space => {
+            after.space_used < before.space_used
+                || after.dead_bytes < before.dead_bytes
+                || after.tombstone_leaf_cnt < before.tombstone_leaf_cnt
+        }
+        InsertAllocMiss::Slots => after.num_slots < before.num_slots,
+    }
+}
+
+fn should_compact_before_spillover(miss: InsertAllocMiss, before: ReclaimSnapshot) -> bool {
+    match miss {
+        InsertAllocMiss::Space => before.dead_bytes != 0 || before.tombstone_leaf_cnt != 0,
+        InsertAllocMiss::Slots => true,
+    }
+}
+
+fn reclaim_or_spillover(
+    bm: &BufferManager,
+    guard: &mut BlobWriteGuard<'_>,
+    current_guid: crate::layout::BlobGuid,
+    seq: u64,
+    miss: InsertAllocMiss,
+) -> Result<()> {
+    let before = reclaim_snapshot(guard);
+    if should_compact_before_spillover(miss, before) {
+        compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
+        let after = reclaim_snapshot(guard);
+        if compact_made_retry_worthwhile(miss, before, after) {
+            return Ok(());
+        }
+    }
+
+    {
+        let mut frame = guard.frame();
+        spillover_blob(bm, &mut frame, seq).map_err(|e| e.with_blob_guid(current_guid))?;
+    }
+    bm.note_merge_candidate(current_guid);
+    bm.note_spillover();
+    compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // hot-path helper mirrors insert_at's call shape
 fn lock_coupled_insert_in_blob(
     bm: &BufferManager,
@@ -780,25 +853,25 @@ fn lock_coupled_insert_in_blob(
         };
         match r {
             Ok(InsertStep::Done(out)) => {
-                let needs_compaction = {
+                let (blob_dirty, needs_compaction) = {
                     let mut frame = guard.frame();
                     if out.mutated {
                         frame.header_mut().root_slot = encode_child_off(out.off_after);
-                        blob_needs_compaction(frame.as_ref())
+                        (true, blob_needs_compaction(frame.as_ref()))
                     } else {
-                        false
+                        (current_dirty, false)
                     }
                 };
                 drop(guard);
                 if needs_compaction {
                     bm.note_compaction_candidate(current_guid);
                 }
-                if out.mutated && !is_top_blob {
+                if blob_dirty && !is_top_blob {
                     bm.mark_dirty_cached(current_guid, seq, current_entry);
                 }
 
                 return Ok(InsertOutcome {
-                    root_dirty: is_top_blob && out.mutated,
+                    root_dirty: is_top_blob && blob_dirty,
                     mutated: out.mutated,
                 });
             }
@@ -819,41 +892,13 @@ fn lock_coupled_insert_in_blob(
                     max_cross_blob_depth,
                 );
             }
-            Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
-                {
-                    let mut frame = guard.frame();
-                    spillover_blob(bm, &mut frame, seq)
-                        .map_err(|e| e.with_blob_guid(current_guid))?;
-                }
-                bm.note_merge_candidate(current_guid);
-                bm.note_spillover();
-                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+            Err(Error::Alloc(AllocError::OutOfSpace { .. })) => {
+                reclaim_or_spillover(bm, &mut guard, current_guid, seq, InsertAllocMiss::Space)?;
                 current_dirty = true;
             }
-            Err(Error::Alloc(crate::store::AllocError::OutOfSlots)) => {
-                // The slot table filled. Structural ops abandon old nodes
-                // (offset-addressing R1 = abandon-on-free); those dead
-                // slots are reclaimed only by compaction, and under
-                // concurrent write pressure the *background* compactor
-                // can be starved of this blob's exclusive latch — so
-                // reclaim inline here, where we already hold it. If
-                // compaction frees slots the retry proceeds; only if the
-                // blob is genuinely full of *live* nodes do we spill a
-                // subtree out (now with post-compaction slot headroom for
-                // the spillover BlobNode).
-                let before = guard.frame().header().num_slots;
-                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+            Err(Error::Alloc(AllocError::OutOfSlots)) => {
+                reclaim_or_spillover(bm, &mut guard, current_guid, seq, InsertAllocMiss::Slots)?;
                 current_dirty = true;
-                if guard.frame().header().num_slots >= before {
-                    {
-                        let mut frame = guard.frame();
-                        spillover_blob(bm, &mut frame, seq)
-                            .map_err(|e| e.with_blob_guid(current_guid))?;
-                    }
-                    bm.note_merge_candidate(current_guid);
-                    bm.note_spillover();
-                    compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
-                }
             }
             Err(e) => return Err(e.with_blob_guid(current_guid)),
         }

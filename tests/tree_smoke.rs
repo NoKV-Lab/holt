@@ -1581,6 +1581,25 @@ fn atomic_insert_run_handles_blob_spillover() {
 }
 
 #[test]
+fn large_same_key_update_churn_compacts_before_spillover() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let key = b"registry/hot/object";
+    let mut value = vec![0u8; 32 * 1024];
+
+    for rev in 0..48u8 {
+        value.fill(rev);
+        tree.put(key, &value).unwrap();
+    }
+
+    assert_eq!(tree.get(key).unwrap().as_deref(), Some(&value[..]));
+    assert_eq!(
+        tree.stats().unwrap().blob_count,
+        1,
+        "same-key churn should reclaim local dead bytes instead of spilling"
+    );
+}
+
+#[test]
 fn is_prefix_empty_tracks_live_keys() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     assert!(tree.is_prefix_empty(b"dir/").unwrap());
