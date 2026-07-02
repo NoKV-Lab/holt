@@ -132,8 +132,7 @@ impl Shared {
         // which (addr-before-records publish ordering) is >= end(rc), so the
         // copy drains >= rc records and `base + rc` is a safe lower bound.
         let rc = self.ring.committed_records();
-        let want_sync =
-            self.sync_target.load(Ordering::Acquire) > self.flushed.load(Ordering::Acquire);
+        let written_to = self.record_base + rc;
 
         let mut sink_err: Option<&'static str> = None;
         let mut freed_space = false;
@@ -150,11 +149,13 @@ impl Shared {
                 return;
             }
             if copied > 0 {
-                self.written
-                    .fetch_max(self.record_base + rc, Ordering::AcqRel);
+                self.written.fetch_max(written_to, Ordering::AcqRel);
                 self.batches.fetch_add(1, Ordering::Relaxed);
                 freed_space = true;
             }
+            let sync_target = self.sync_target.load(Ordering::Acquire);
+            let flushed = self.flushed.load(Ordering::Acquire);
+            let want_sync = sync_target > flushed && written_to >= sync_target;
             if want_sync {
                 if w.flush().is_err() {
                     drop(w);
@@ -162,11 +163,10 @@ impl Shared {
                     return;
                 }
                 self.syncs.fetch_add(1, Ordering::Relaxed);
-                self.flushed
-                    .fetch_max(self.record_base + rc, Ordering::AcqRel);
+                self.flushed.fetch_max(written_to, Ordering::AcqRel);
             }
         }
-        if want_sync {
+        if self.flushed.load(Ordering::Acquire) >= self.sync_target.load(Ordering::Acquire) {
             let _g = self.flushed_mx.lock().unwrap();
             self.flushed_cv.notify_all();
         }

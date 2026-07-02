@@ -22,6 +22,11 @@ fine-grained per-commit history is in `git log`.
   truncate packed accelerator/data files after tail-slot reclamation. This
   prevents long-running delete/compact workloads from staying pinned to their
   historical slot high-water mark after the tail is durably free.
+- WAL group-commit flushing no longer issues duplicate fsyncs when a sync
+  target is visible before the corresponding committed ring records are
+  readable by the flusher. The concurrent durability regression now checks the
+  stable invariant (`syncs <= appends`) instead of assuming scheduler-dependent
+  batching.
 
 ## [0.8.1] — 2026-07-01
 
