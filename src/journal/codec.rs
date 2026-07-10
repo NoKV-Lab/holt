@@ -1037,7 +1037,7 @@ mod tests {
             WalOp::Batch { ops } => {
                 assert_eq!(ops.len(), 3);
                 match &ops[0] {
-                    WalOp::Insert { key, value: _, .. } => {
+                    WalOp::Insert { key, .. } => {
                         assert_eq!(key, b"a");
                     }
                     other => panic!("expected Insert, got {other:?}"),
