@@ -343,47 +343,45 @@ parent-validated `route_cache` — which collapses a deep walk to a
 single prefix-anchor edge for hot prefixes without caching raw
 pointers.
 
-### Checkpoint — 7-phase protocol
+### Checkpoint — durable dependency protocol
 
-Both `Tree::checkpoint` (synchronous, caller-driven) and the
-background `Checkpointer` round follow the same seven-phase
-protocol, strictly ordered around the W2D invariant:
+`Tree::checkpoint` and the background `Checkpointer` share the same W2D
+ordering, while the background path pipelines complete `CheckpointEpoch`
+objects through a bounded planner → I/O queue:
 
-1. **Snapshot + journal flush** under `CommitGate` checkpoint
-   mode. Drain live dirty entries into the checkpoint snapshot,
-   move them into the in-flight `flushing` protection set, drain
-   pending deletes, force the journal durable, and clone the
-   snapshotted blob bytes before releasing the gate. Flush failure
-   restores both snapshots.
-2. **Batched per-blob write-through** with CAS-on-seq.
-   Successful writes release the matching `flushing` protection;
-   racing writers' fresh dirty entries survive for the next round.
-   Failures are restored to live dirty.
-3. **Pre-delete sync** — `store.flush` (data file fdatasync +
-   manifest persist) so the writes from phase 2 are stable.
-   Failure restores `pending`.
-4. **Abort-on-dirty-failure gate.** Any phase-2 failure restores
-   `pending` and returns without touching the manifest. A failed
-   parent write must not propagate to its child's manifest
-   delete — that would leave the on-disk parent referencing a
-   slot the manifest no longer has, and WAL replay's walker
-   descent through the BlobNode crossing would fail.
-5. **Apply pending deletes** — manifest mutation in-memory.
-6. **Post-delete sync** if any delete actually applied. Failure
-   restores the already-applied entries (`execute_pending_delete`
-   is idempotent on retry).
-7. **Conditional WAL truncate** — only if `dirty_count == 0`
-   AND `pending_delete_count == 0` *now*. A racing writer or a
-   restored failure keeps the WAL alive until a future round.
+1. **Capture intent** under `CommitGate` checkpoint mode: drain dirty and
+   pending logical-delete state, install in-flight protection, record content
+   versions, and force the matching WAL watermark durable. A failure restores
+   the complete capture.
+2. **Clone version-matched bytes** outside the commit gate. A racing mutation
+   restores the stale item instead of letting old bytes retire newer debt.
+3. **Build dependency waves** from physical BlobNode edges. Missing children,
+   self-cycles, and longer cycles fail closed; children are always submitted
+   before parents, including no-WAL checkpoints.
+4. **Write each wave with CAS-on-version.** Successful writes retire only their
+   matching dirty/flushing ownership. External dirty children defer their
+   parents to a later epoch rather than publishing a dangling durable edge.
+5. **Pre-delete sync** persists data and manifest additions before any logical
+   delete can remove an old child mapping.
+6. **Apply pending logical deletes**, then run a second sync if any manifest
+   delete applied. Structural merge children never enter this queue: they stay
+   in parent-scoped orphan staging until the rewritten parent is dirty and a
+   clean durable frontier is proven.
+7. **Retire epochs in FIFO order.** An epoch error restores all unreported
+   dirty/delete ownership, and a later epoch cannot advance the WAL watermark
+   past it.
+8. **Conditional WAL truncate** requires an empty pipeline plus zero dirty,
+   flushing, pending-delete, orphan-staging, and write-delta debt and no store
+   flush debt.
+9. **Bounded exact reclaim** drains retired COW/structural GUIDs while the
+   maintenance fence still excludes topology changes. Pinned GUIDs return to
+   the FIFO; crash leftovers are handled by an explicit full reachability GC.
 
-The background checkpointer is 3 threads: a planner running the
-seven phases, a dedicated I/O worker processing
-`IoTask::FlushBatchAndSync` + `IoTask::Sync` from a bounded
-`crossbeam-channel` queue, and a cold-blob eviction sweep on the
-same `clock_tick` mechanism.
-`Drop` joins the planner and runs one final synchronous round on
-the calling thread so dirty state between the last bg round and
-shutdown doesn't get lost.
+The background checkpointer has three threads: a planner/orchestrator, an I/O
+worker that executes complete dependency-ordered epochs from a bounded
+`crossbeam-channel`, and an independent cold-blob eviction sweep. `Drop` joins
+the planner and runs a final synchronous round so state admitted after the last
+idle round is not lost.
 
 `Tree::compact` is online with respect to point reads and
 foreground writers through `maintenance_gate`. Range iterators
@@ -424,12 +422,15 @@ cursor path forces a rebuild from the monotonic lower bound. This
 is stronger than the upstream-style "invalid iterator" surface
 because stale paths are handled internally. It is still not MVCC:
 a long scan can observe keys committed after iterator creation if
-they sort after the current cursor.
+they sort after the current cursor. Each cursor step holds the shared
+maintenance/mutation gates only for that step; an iterator paused in
+caller code does not block structural maintenance.
 
 For stable read transactions, `Tree::view(prefix, |view| ...)`
-captures the prefix's reachable blob frames into a private in-memory
-store and then scans that copy. This pays copy cost proportional to
-the observed prefix instead of adding per-write MVCC chains.
+copies one root frame and shares descendants with the live tree.
+Subsequent live writes fork only snapshot-visible frames. Cloned views
+and owned cursors keep the snapshot epoch lease alive after the callback
+or main snapshot handle returns, until the final derived handle drops.
 
 ## 8. BlobStore abstraction
 

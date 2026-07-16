@@ -18,6 +18,22 @@ fine-grained per-commit history is in `git log`.
 - Added store-space observability for physical allocated bytes, tail
   reclaimable slots/bytes, reusable middle slots, and vacuum relocation
   counters.
+- Added GC observability for current orphan backlog, cumulative physical
+  reclamation, and the deferred count from the most recent full reachability
+  sweep. The latter is intentionally not reset by exact FIFO reclaim.
+
+### Changed
+
+- **Breaking stats API hardening.** `TreeStats`, `DBStats`, and `OpenStats` are
+  now `#[non_exhaustive]`; `TreeStats`/`DBStats` add GC lifecycle fields and
+  `OpenStats` adds DB epoch-recovery duration. External code that constructed
+  these returned telemetry structs or destructured them without `..` must use
+  field access/non-exhaustive matching instead. This one-time break makes
+  future telemetry additions semver-compatible without compatibility shims.
+- GC Prometheus names follow their actual contracts:
+  `holt_bm_gc_reclaimed_total` is the cumulative full-sweep plus exact-reclaim
+  counter, while `holt_bm_gc_last_full_sweep_deferred_count` is a gauge for
+  the most recently completed full reachability sweep only.
 
 ### Fixed
 

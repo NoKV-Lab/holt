@@ -380,9 +380,10 @@ single-node embedded library, no always-on MVCC version chains.
 
 ### Completed — Scoped snapshot view
 
-- `Tree::view(prefix, |view| ...)` captures the blob frames reachable
-  for a prefix, releases the live tree, and serves point reads and
-  scans from the private frame set.
+- `Tree::view(prefix, |view| ...)` performs one root-frame copy, shares
+  descendants, and serves stable point reads/scans while first writes fork
+  snapshot-visible frames. Cloned views and owned cursors extend the epoch
+  lease beyond the callback until their final handle drops.
 - Ordinary `range()` / `range_keys()` remain the hot restart-on-conflict
   iterators; `View` is the explicit stable-read path for list/readdir.
 
