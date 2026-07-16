@@ -428,9 +428,12 @@ caller code does not block structural maintenance.
 
 For stable read transactions, `Tree::view(prefix, |view| ...)`
 copies one root frame and shares descendants with the live tree.
-Subsequent live writes fork only snapshot-visible frames. Cloned views
-and owned cursors keep the snapshot epoch lease alive after the callback
-or main snapshot handle returns, until the final derived handle drops.
+Subsequent live writes validate the parent edge and fork only
+snapshot-visible frames on demand. Cloned views, range builders, and owned
+cursors keep the process-local snapshot epoch lease alive after the callback
+or main snapshot handle returns, until the final derived handle drops. Epoch
+retirement only makes detached frames eligible for later checkpoint/GC
+reclamation.
 
 ## 8. BlobStore abstraction
 
