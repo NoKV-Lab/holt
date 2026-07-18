@@ -1,0 +1,19 @@
+[package]
+name = "holt-node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Node.js bindings for the holt metadata engine."
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+holt = { path = "../..", default-features = false }
+napi = { version = "3", default-features = false, features = ["napi9"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

@@ -24,7 +24,7 @@ targets = [
 ]
 
 [workspace]
-members = [".", "crates/holt-ffi"]
+members = [".", "crates/holt-ffi", "packages/holt-node"]
 exclude = ["benches", "fuzz", "tools/soak", "verified"]
 
 [dependencies]
