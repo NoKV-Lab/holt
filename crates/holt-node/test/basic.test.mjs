@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Tree } from "../index.js";
+import { Database, Tree } from "../index.js";
 
 test("memory CRUD and conditional update", () => {
   const tree = Tree.openMemory();
@@ -32,4 +32,30 @@ test("prefix and delimiter scans", () => {
     ],
   );
   tree.close();
+});
+
+test("database creates and isolates named trees", () => {
+  const db = Database.openMemory();
+  const objects = db.createTree("objects");
+  const sessions = db.openOrCreateTree("sessions");
+  const key = Buffer.from("same-key");
+
+  objects.put(key, Buffer.from("object-value"));
+  sessions.put(key, Buffer.from("session-value"));
+  assert.deepEqual(objects.get(key), Buffer.from("object-value"));
+  assert.deepEqual(sessions.get(key), Buffer.from("session-value"));
+  assert.deepEqual(db.listTrees().sort(), ["objects", "sessions"]);
+
+  const secondObjectsHandle = db.openTree("objects");
+  assert.deepEqual(secondObjectsHandle.get(key), Buffer.from("object-value"));
+  secondObjectsHandle.close();
+
+  db.dropTree("sessions");
+  assert.deepEqual(db.listTrees(), ["objects"]);
+  assert.throws(() => sessions.get(key), /dropped/i);
+
+  sessions.close();
+  objects.close();
+  db.close();
+  db.close();
 });

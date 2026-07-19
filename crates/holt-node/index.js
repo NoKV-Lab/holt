@@ -587,4 +587,5 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.Database = nativeBinding.Database
 module.exports.Tree = nativeBinding.Tree

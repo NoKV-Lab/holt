@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use holt::{KeyRangeEntry, RangeEntry, Tree as CoreTree, TreeBuilder};
+use holt::{
+    KeyRangeEntry, RangeEntry, Tree as CoreTree, TreeBuilder, TreeConfig, DB as CoreDatabase,
+};
 use napi::bindgen_prelude::{BigInt, Buffer, Error, Result, Status, Uint8Array};
 use napi_derive::napi;
 
@@ -40,7 +42,7 @@ fn from_bigint(value: BigInt) -> Result<u64> {
     Ok(value)
 }
 
-/// Options for opening a file-backed tree.
+/// Options for opening a file-backed tree or database.
 #[napi(object)]
 pub struct TreeOptions {
     /// Force the WAL to sync before acknowledging each write.
@@ -78,6 +80,94 @@ pub struct ScanEntry {
     pub version: BigInt,
 }
 
+/// A Node.js handle to a Holt multi-tree database.
+#[napi]
+pub struct Database {
+    inner: Option<CoreDatabase>,
+}
+
+#[napi]
+impl Database {
+    /// Open a file-backed multi-tree database.
+    #[napi(factory)]
+    pub fn open(path: String, options: Option<TreeOptions>) -> Result<Self> {
+        let wal_sync = options
+            .and_then(|options| options.wal_sync)
+            .unwrap_or(false);
+        let mut config = TreeConfig::new(path);
+        config.durability = holt::Durability::Wal { sync: wal_sync };
+        CoreDatabase::open(config)
+            .map(|inner| Self { inner: Some(inner) })
+            .map_err(js_error)
+    }
+
+    /// Open a volatile in-memory multi-tree database.
+    #[napi(factory)]
+    pub fn open_memory() -> Result<Self> {
+        CoreDatabase::open(TreeConfig::memory())
+            .map(|inner| Self { inner: Some(inner) })
+            .map_err(js_error)
+    }
+
+    /// Explicitly release the database handle. Existing Tree handles remain
+    /// usable until they are closed or their named tree is dropped.
+    #[napi]
+    pub fn close(&mut self) {
+        self.inner = None;
+    }
+
+    /// Create a new named tree.
+    #[napi(js_name = "createTree")]
+    pub fn create_tree(&self, name: String) -> Result<Tree> {
+        self.core()?
+            .create_tree(&name)
+            .map(Tree::from_core)
+            .map_err(js_error)
+    }
+
+    /// Open an existing named tree.
+    #[napi(js_name = "openTree")]
+    pub fn open_tree(&self, name: String) -> Result<Tree> {
+        self.core()?
+            .open_tree(&name)
+            .map(Tree::from_core)
+            .map_err(js_error)
+    }
+
+    /// Open a named tree, creating it when it does not exist.
+    #[napi(js_name = "openOrCreateTree")]
+    pub fn open_or_create_tree(&self, name: String) -> Result<Tree> {
+        self.core()?
+            .open_or_create_tree(&name)
+            .map(Tree::from_core)
+            .map_err(js_error)
+    }
+
+    /// List all live named trees.
+    #[napi(js_name = "listTrees")]
+    pub fn list_trees(&self) -> Result<Vec<String>> {
+        self.core()?.list_trees().map_err(js_error)
+    }
+
+    /// Drop a named tree and fence existing handles to it.
+    #[napi(js_name = "dropTree")]
+    pub fn drop_tree(&self, name: String) -> Result<()> {
+        self.core()?.drop_tree(&name).map_err(js_error)
+    }
+
+    /// Flush every named tree and the shared WAL to the backing store.
+    #[napi]
+    pub fn checkpoint(&self) -> Result<()> {
+        self.core()?.checkpoint().map_err(js_error)
+    }
+
+    fn core(&self) -> Result<&CoreDatabase> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Holt database is closed"))
+    }
+}
+
 /// A Node.js handle to one Holt tree.
 #[napi]
 pub struct Tree {
@@ -86,6 +176,10 @@ pub struct Tree {
 
 #[napi]
 impl Tree {
+    fn from_core(inner: CoreTree) -> Self {
+        Self { inner: Some(inner) }
+    }
+
     /// Open a file-backed tree.
     #[napi(factory)]
     pub fn open(path: String, options: Option<TreeOptions>) -> Result<Self> {
