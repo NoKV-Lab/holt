@@ -14,11 +14,11 @@ handle. It is currently Unix-only, matching Holt's file-store support.
 ```ts
 import { Tree } from "@holt/node";
 
-const tree = Tree.openMemory();
-tree.put(Buffer.from("bucket/a"), Buffer.from("metadata"));
-console.log(tree.get(Buffer.from("bucket/a"))?.toString());
-console.log(tree.scanKeys(Buffer.from("bucket/")));
-tree.close();
+const tree = await Tree.openMemory();
+await tree.put(Buffer.from("bucket/a"), Buffer.from("metadata"));
+console.log((await tree.get(Buffer.from("bucket/a")))?.toString());
+console.log(await tree.scanKeys(Buffer.from("bucket/")));
+await tree.close();
 ```
 
 Multiple named trees can share one database, WAL, and checkpoint boundary:
@@ -26,19 +26,23 @@ Multiple named trees can share one database, WAL, and checkpoint boundary:
 ```ts
 import { Database } from "@holt/node";
 
-const db = Database.open("/var/lib/app/holt", { walSync: true });
-const objects = db.openOrCreateTree("objects");
-const sessions = db.openOrCreateTree("sessions");
+const db = await Database.open("/var/lib/app/holt", { walSync: true });
+const objects = await db.openOrCreateTree("objects");
+const sessions = await db.openOrCreateTree("sessions");
 
-objects.put(Buffer.from("bucket/a"), Buffer.from("object metadata"));
-sessions.put(Buffer.from("session/1"), Buffer.from("session metadata"));
+await objects.put(Buffer.from("bucket/a"), Buffer.from("object metadata"));
+await sessions.put(Buffer.from("session/1"), Buffer.from("session metadata"));
 
-console.log(db.listTrees());
-db.checkpoint();
-objects.close();
-sessions.close();
-db.close();
+console.log(await db.listTrees());
+await db.checkpoint();
+await objects.close();
+await sessions.close();
+await db.close();
 ```
+
+All storage operations return Promises and execute on native worker threads,
+so file I/O, WAL sync, replay, checkpoints, and scans do not block the Node.js
+event loop.
 
 Build the native artifact locally with:
 

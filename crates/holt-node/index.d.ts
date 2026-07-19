@@ -2,53 +2,59 @@
 /* eslint-disable */
 /** A Node.js handle to a Holt multi-tree database. */
 export declare class Database {
-  /** Open a file-backed multi-tree database. */
-  static open(path: string, options?: TreeOptions | undefined | null): Database
-  /** Open a volatile in-memory multi-tree database. */
-  static openMemory(): Database
   /**
-   * Explicitly release the database handle. Existing Tree handles remain
-   * usable until they are closed or their named tree is dropped.
+   * Open a file-backed multi-tree database without blocking the Node.js
+   * event loop.
    */
-  close(): void
-  /** Create a new named tree. */
-  createTree(name: string): Tree
-  /** Open an existing named tree. */
-  openTree(name: string): Tree
-  /** Open a named tree, creating it when it does not exist. */
-  openOrCreateTree(name: string): Tree
-  /** List all live named trees. */
-  listTrees(): Array<string>
-  /** Drop a named tree and fence existing handles to it. */
-  dropTree(name: string): void
-  /** Flush every named tree and the shared WAL to the backing store. */
-  checkpoint(): void
+  static open(path: string, options?: TreeOptions | undefined | null): Promise<Database>
+  /**
+   * Open a volatile in-memory multi-tree database without blocking the
+   * Node.js event loop.
+   */
+  static openMemory(): Promise<Database>
+  /**
+   * Explicitly release the database handle on a worker thread. Existing
+   * Tree handles remain usable until they are closed or dropped.
+   */
+  close(): Promise<void>
+  /** Create a new named tree on a worker thread. */
+  createTree(name: string): Promise<Tree>
+  /** Open an existing named tree on a worker thread. */
+  openTree(name: string): Promise<Tree>
+  /** Open a named tree on a worker thread, creating it when absent. */
+  openOrCreateTree(name: string): Promise<Tree>
+  /** List all live named trees on a worker thread. */
+  listTrees(): Promise<Array<string>>
+  /** Drop a named tree and fence existing handles on a worker thread. */
+  dropTree(name: string): Promise<void>
+  /** Flush every named tree and the shared WAL on a worker thread. */
+  checkpoint(): Promise<void>
 }
 
 /** A Node.js handle to one Holt tree. */
 export declare class Tree {
-  /** Open a file-backed tree. */
-  static open(path: string, options?: TreeOptions | undefined | null): Tree
-  /** Open a volatile in-memory tree. */
-  static openMemory(): Tree
-  /** Explicitly release the native tree handle. This is idempotent. */
-  close(): void
-  /** Return the value stored at `key`, or null when the key is absent. */
-  get(key: Uint8Array): Buffer | null
-  /** Return the value and conditional-write version for `key`. */
-  getRecord(key: Uint8Array): Record | null
-  /** Insert or replace a value. */
-  put(key: Uint8Array, value: Uint8Array): void
-  /** Delete a key and return whether a live record existed. */
-  delete(key: Uint8Array): boolean
-  /** Compare the current version and replace the value if it matches. */
-  compareAndPut(key: Uint8Array, version: bigint, value: Uint8Array): boolean
-  /** Flush dirty frames and the WAL to the backing store. */
-  checkpoint(): void
-  /** Scan keys under an optional prefix. */
-  scanKeys(prefix?: Uint8Array | undefined | null, options?: ScanOptions | undefined | null): Array<ScanEntry>
-  /** Scan records under an optional prefix. */
-  scanRecords(prefix?: Uint8Array | undefined | null, options?: ScanOptions | undefined | null): Array<ScanEntry>
+  /** Open a file-backed tree without blocking the Node.js event loop. */
+  static open(path: string, options?: TreeOptions | undefined | null): Promise<Tree>
+  /** Open a volatile in-memory tree without blocking the Node.js event loop. */
+  static openMemory(): Promise<Tree>
+  /** Explicitly release the native tree handle on a worker thread. */
+  close(): Promise<void>
+  /** Return the value at `key` from a worker thread. */
+  get(key: Uint8Array): Promise<Buffer | null>
+  /** Return the value and conditional-write version from a worker thread. */
+  getRecord(key: Uint8Array): Promise<Record | null>
+  /** Insert or replace a value on a worker thread. */
+  put(key: Uint8Array, value: Uint8Array): Promise<void>
+  /** Delete a key on a worker thread and return whether it existed. */
+  delete(key: Uint8Array): Promise<boolean>
+  /** Compare the current version and replace the value on a worker thread. */
+  compareAndPut(key: Uint8Array, version: bigint, value: Uint8Array): Promise<boolean>
+  /** Flush dirty frames and the WAL on a worker thread. */
+  checkpoint(): Promise<void>
+  /** Scan keys on a worker thread. */
+  scanKeys(prefix?: Uint8Array | undefined | null, options?: ScanOptions | undefined | null): Promise<Array<ScanEntry>>
+  /** Scan records on a worker thread. */
+  scanRecords(prefix?: Uint8Array | undefined | null, options?: ScanOptions | undefined | null): Promise<Array<ScanEntry>>
 }
 
 /** A live value and its conditional-write version. */
