@@ -1,0 +1,31 @@
+{
+  "name": "@holt/node",
+  "version": "0.1.0",
+  "description": "Node.js bindings for the Holt metadata engine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EnderRomantice/holt.git",
+    "directory": "crates/holt-node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "npm"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.0"
+  },
+  "optionalDependencies": {}
+}
