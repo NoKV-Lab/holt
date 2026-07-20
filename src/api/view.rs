@@ -1,8 +1,18 @@
 //! Scoped read transaction.
 //!
-//! `View` captures a prefix subtree as immutable blob frames, then
-//! reads from that private frame set. It gives stable list/readdir
-//! semantics without keeping a live-tree read lock or MVCC chains.
+//! A `View` is backed by the same copy-on-write capture as [`crate::Snapshot`]:
+//! capture copies the root frame to a fresh process-local identity while its
+//! descendants initially remain shared with the live tree. Before a live write
+//! mutates a shared descendant, Holt validates the exact parent edge under its
+//! exclusive latch, forks that frame, and repoints the live parent so the view
+//! continues to reach the frozen image.
+//!
+//! The view, its clones, and derived range builders and owned cursors share a
+//! process-local snapshot-epoch lease. Only the final derived handle releases
+//! the lease and permits epoch retirement; persisted detached frames remain
+//! subject to the checkpoint/GC reclaim frontier. This gives stable
+//! list/readdir semantics without holding a live-tree read lock or retaining
+//! MVCC chains.
 
 use std::sync::Arc;
 
@@ -16,9 +26,11 @@ use crate::store::{BufferManager, CachedBlob, SnapshotLease};
 
 /// Immutable read transaction over one captured prefix.
 ///
-/// Created by [`crate::Tree::view`]. Subsequent live-tree writes do
-/// not affect it. Clones and owned range cursors retain the underlying
-/// snapshot epoch until the final derived handle is dropped.
+/// Created by [`crate::Tree::view`] or exposed by [`crate::Snapshot::view`].
+/// Its root frame is a private process-local copy, while descendants are
+/// initially shared and protected by write-time copy-on-write. Clones and
+/// derived range builders or owned cursors retain the underlying epoch lease;
+/// the epoch can retire only after the final such handle is dropped.
 #[derive(Clone)]
 pub struct View {
     scope: Vec<u8>,
@@ -80,6 +92,9 @@ impl View {
     }
 
     /// Open a record range over the view's captured prefix.
+    ///
+    /// The returned builder owns the view's epoch lease and may safely outlive
+    /// the `View` from which it was derived.
     pub fn range(&self) -> ViewRangeBuilder {
         ViewRangeBuilder {
             inner: self.range_builder(&self.scope),
@@ -87,6 +102,9 @@ impl View {
     }
 
     /// Open a record range for a narrower prefix inside the view.
+    ///
+    /// The returned builder owns the view's epoch lease and may safely outlive
+    /// the `View` from which it was derived.
     pub fn scan(&self, prefix: &[u8]) -> Result<ViewRangeBuilder> {
         self.ensure_in_scope(prefix)?;
         Ok(ViewRangeBuilder {
@@ -95,6 +113,9 @@ impl View {
     }
 
     /// Open a key-only range over the view's captured prefix.
+    ///
+    /// The returned builder owns the view's epoch lease and may safely outlive
+    /// the `View` from which it was derived.
     pub fn range_keys(&self) -> ViewKeyRangeBuilder {
         ViewKeyRangeBuilder {
             inner: KeyRangeBuilder::new(self.range_builder(&self.scope)),
@@ -102,6 +123,9 @@ impl View {
     }
 
     /// Open a key-only range for a narrower prefix inside the view.
+    ///
+    /// The returned builder owns the view's epoch lease and may safely outlive
+    /// the `View` from which it was derived.
     pub fn scan_keys(&self, prefix: &[u8]) -> Result<ViewKeyRangeBuilder> {
         self.ensure_in_scope(prefix)?;
         Ok(ViewKeyRangeBuilder {
@@ -174,6 +198,11 @@ impl View {
 }
 
 /// Record range builder scoped to a [`View`].
+///
+/// The builder retains the view's process-local epoch lease. Consuming it
+/// transfers that lease to the owned iterator, so neither shared descendants
+/// nor their retired copy-on-write images may be reclaimed while either
+/// handle is live.
 #[must_use = "ViewRangeBuilder is lazy — call `.into_iter()` or use it in a `for` loop"]
 pub struct ViewRangeBuilder {
     inner: RangeBuilder,
@@ -203,6 +232,11 @@ impl IntoIterator for ViewRangeBuilder {
 }
 
 /// Key-only range builder scoped to a [`View`].
+///
+/// The builder retains the view's process-local epoch lease. Consuming it
+/// transfers that lease to the owned iterator, so neither shared descendants
+/// nor their retired copy-on-write images may be reclaimed while either
+/// handle is live.
 #[must_use = "ViewKeyRangeBuilder is lazy — call `.into_iter()`, `.visit()`, or use it in a `for` loop"]
 pub struct ViewKeyRangeBuilder {
     inner: KeyRangeBuilder,
