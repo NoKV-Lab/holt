@@ -61,10 +61,13 @@ pub enum IndexedBlobLookup {
 /// # Contract
 /// - `read_blob` / `write_blob` always operate on a full
 ///   `PAGE_SIZE`-byte frame. Partial I/O is not supported.
-/// - `write_blob` replaces the full frame visible to later
-///   `read_blob` calls after it returns. The trait does not require
-///   power-loss atomicity for a 512 KB frame; Holt's WAL/checkpoint
-///   protocol is the recovery source of truth.
+/// - `write_blob` replaces the full frame visible to later `read_blob`
+///   calls after it returns. Until [`Self::flush`] succeeds, a crash may
+///   recover either the previous frame or the replacement.
+/// - After [`Self::flush`] succeeds, every GUID must recover to one complete
+///   frame image. Persistent implementations must not expose a partially
+///   overwritten frame after power loss: Holt's logical WAL can redo changes
+///   only from a structurally valid base image.
 /// - `flush` blocks until **every** write that returned before the
 ///   call is durable on the underlying medium.
 pub trait BlobStore: Send + Sync {

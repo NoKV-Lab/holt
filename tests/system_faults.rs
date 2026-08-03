@@ -62,6 +62,17 @@ fn write_bytes_at(path: &Path, offset: u64, bytes: &[u8]) {
     file.sync_all().unwrap();
 }
 
+fn corrupt_blob_roots(path: &Path) {
+    const BLOB_SIZE: u64 = 0x80000;
+    const ROOT_SLOT_OFFSET: u64 = 0x56;
+
+    let slots = fs::metadata(path).unwrap().len() / BLOB_SIZE;
+    assert!(slots > 0, "checkpoint must write at least one blob frame");
+    for slot in 0..slots {
+        write_bytes_at(path, slot * BLOB_SIZE + ROOT_SLOT_OFFSET, &[0, 0]);
+    }
+}
+
 fn remove_read_accelerators(path: &Path) {
     let _ = fs::remove_file(path.join("read.idx"));
     let _ = fs::remove_file(path.join("value.seg"));
@@ -96,9 +107,9 @@ fn corrupt_blob_image_is_rejected_on_open_or_read() {
     let dir = tempdir().unwrap();
     let cfg = build_checkpointed_tree(dir.path());
     remove_read_accelerators(dir.path());
-    // Root blob starts at offset 0. BlobHeader::root_slot lives at
-    // +0x56; zeroing it makes the authoritative root pointer invalid.
-    write_bytes_at(&dir.path().join("blobs.dat"), 0x56, &[0, 0]);
+    // Shadow rewrites can move the live GUID to any physical slot. Corrupt
+    // every frame so the active manifest mapping cannot select a valid copy.
+    corrupt_blob_roots(&dir.path().join("blobs.dat"));
 
     if let Ok(tree) = Tree::open(cfg) {
         assert!(

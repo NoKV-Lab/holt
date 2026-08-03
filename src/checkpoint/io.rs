@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronous_child_first_manifest_survives_torn_parent_tail() {
+    fn synchronous_child_first_torn_parent_set_recovers_old_parent() {
         let dir = tempfile::tempdir().unwrap();
         let parent: BlobGuid = [
             0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E,
@@ -1157,8 +1157,8 @@ mod tests {
                 Err(e) => panic!("unexpected open error: {e}"),
             };
             // Keep an old durable parent mapping in the manifest. The later
-            // checkpoint overwrites that same slot with a parent that points
-            // at a newly-created child.
+            // checkpoint writes a shadow parent slot that points at a newly
+            // created child, then publishes that slot in the manifest.
             file.write_blob(parent, &child_blob(parent, 1)).unwrap();
             file.flush().unwrap();
 
@@ -1192,9 +1192,9 @@ mod tests {
         );
 
         // Keep the child Set and only a torn prefix of the later parent Set.
-        // Reopen truncates that tail to the last complete record. The parent
-        // data slot may already contain its new child edge, so the child must
-        // still be present in the recovered manifest.
+        // Reopen truncates that tail to the last complete record, so the old
+        // parent image remains authoritative. The published child is an
+        // unreachable orphan that a later clean-frontier reclaim may delete.
         const MANIFEST_RECORD_HEADER_SIZE: u64 = 9;
         let rewritten_parent_record =
             u64::try_from(parent_positions[1]).unwrap() - MANIFEST_RECORD_HEADER_SIZE;
@@ -1212,7 +1212,10 @@ mod tests {
         let children =
             engine::collect_blob_children_from_frame(BlobFrameRef::wrap(parent_bytes.as_slice()))
                 .unwrap();
-        assert_eq!(children, vec![child]);
+        assert!(
+            children.is_empty(),
+            "the torn remap must preserve the old parent"
+        );
         let mut child_bytes = AlignedBlobBuf::zeroed();
         reopened.read_blob(child, &mut child_bytes).unwrap();
     }

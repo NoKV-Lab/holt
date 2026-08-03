@@ -49,12 +49,14 @@
 //!   append small set/delete deltas to `manifest.log` and fsync it
 //!   instead of rewriting the whole map. When the log grows well
 //!   past the snapshot size it compacts into `manifest.bin` via
-//!   tmp+rename and truncates the log.
+//!   tmp+rename and truncates the log. Blob replacement uses shadow
+//!   paging: write and sync a fresh slot, publish its mapping, then
+//!   make the old slot reusable only after the manifest delta is durable.
 //! - **Read accelerators** are fixed-slot and rebuildable. `read.idx`
 //!   and `value.seg` share the same manifest slot as `blobs.dat`.
-//!   Rewriting or deleting a blob clears the read-index header before
-//!   the authoritative frame changes; checkpoint publication writes
-//!   value bytes first and the index header last. Slot reuse is the
+//!   A shadow slot's stale accelerator header is cleared before its
+//!   mapping is published; checkpoint publication writes value bytes
+//!   first and the index header last. Slot reuse is the
 //!   normal reclamation mechanism, avoiding an append-only value-segment
 //!   GC. Explicit `vacuum` compacts live high-water slots into lower
 //!   reusable holes, carries their advisory read accelerators with the
@@ -202,9 +204,9 @@ pub struct FileBlobStore {
     read_index_file: File,
     value_segment_file: File,
     manifest: RwLock<Manifest>,
-    /// Tracks whether `manifest.bin` needs a rewrite. Data-only
-    /// overwrites of existing blobs leave this false, avoiding
-    /// manifest I/O on pure data overwrites.
+    /// Tracks GUID-to-slot updates that still need durable publication.
+    /// Every blob rewrite uses a fresh shadow slot, so both inserts and
+    /// replacements leave manifest work until [`Self::flush_locked`].
     manifest_dirty: AtomicBool,
     /// Monotonic counter bumped before each data-file write.
     /// `flush` syncs up to the observed epoch instead of clearing
@@ -219,10 +221,10 @@ pub struct FileBlobStore {
     /// not on the read path; checkpoint I/O already funnels through
     /// one worker, and Linux `io_uring` also has one SQ owner.
     data_io_lock: Mutex<()>,
-    /// Protects physical slot remapping. Readers hold the shared
-    /// side from GUID→slot resolution through the positional read.
-    /// Vacuum/defrag holds the exclusive side while copying live
-    /// slots and publishing the manifest remap.
+    /// Protects physical slot reuse and vacuum remapping. Readers hold the
+    /// shared side from GUID-to-slot resolution through positional I/O.
+    /// Reclamation drains those readers before an old slot enters the reusable
+    /// pool; vacuum holds the exclusive side while relocating live slots.
     slot_io_lock: RwLock<()>,
     /// Highest slot count the packed data file has been
     /// best-effort preallocated to.
@@ -253,11 +255,11 @@ struct Manifest {
     /// holes as ranges so a sparse high-water manifest does not
     /// expand into one `u64` per free slot.
     reusable_slots: ReusableSlots,
-    /// Slots removed from `slots` by `delete_blob` but not yet
-    /// durable in `manifest.bin`. They become reusable only after
-    /// `flush` successfully persists the manifest rewrite; reusing
-    /// them earlier could corrupt crash recovery by overwriting a
-    /// slot still referenced by the old on-disk manifest.
+    /// Slots superseded by a shadow rewrite or removed by `delete_blob`, but
+    /// whose replacement/delete is not yet durable in the manifest. They
+    /// become reusable only after `flush` persists the corresponding delta;
+    /// reusing them earlier could overwrite a slot still referenced by the
+    /// last durable manifest.
     pending_free_slots: Vec<u64>,
     /// Path to the manifest file (for tmp+rename writes).
     path: PathBuf,
@@ -582,19 +584,20 @@ impl FileBlobStore {
         self.slot_io_lock.write().unwrap()
     }
 
-    fn remove_read_accelerators_best_effort(&self, guid: BlobGuid) {
-        let _ = self.clear_read_accelerator_slots(guid);
-    }
-
     fn clear_read_accelerator_slots(&self, guid: BlobGuid) -> Result<()> {
-        self.clear_read_index_slot(guid)?;
-        self.clear_value_segment_slot(guid)
-    }
-
-    fn clear_read_index_slot(&self, guid: BlobGuid) -> Result<()> {
-        let Some(offset) = self.read_index_offset_of(guid) else {
+        let Some(entry) = self.manifest.read().unwrap().entries.get(&guid).copied() else {
             return Ok(());
         };
+        self.clear_read_accelerator_slot(entry.slot)
+    }
+
+    fn clear_read_accelerator_slot(&self, slot: u64) -> Result<()> {
+        self.clear_read_index_slot(slot)?;
+        self.clear_value_segment_slot(slot)
+    }
+
+    fn clear_read_index_slot(&self, slot: u64) -> Result<()> {
+        let offset = slot.saturating_mul(u64::from(PAGE_SIZE));
         if offset >= file_len(&self.read_index_file) {
             return Ok(());
         }
@@ -602,10 +605,8 @@ impl FileBlobStore {
         self.write_read_index_aligned(offset, &zeros)
     }
 
-    fn clear_value_segment_slot(&self, guid: BlobGuid) -> Result<()> {
-        let Some(offset) = self.value_segment_offset_of(guid) else {
-            return Ok(());
-        };
+    fn clear_value_segment_slot(&self, slot: u64) -> Result<()> {
+        let offset = slot.saturating_mul(u64::from(PAGE_SIZE));
         if offset >= file_len(&self.value_segment_file) {
             return Ok(());
         }
@@ -623,37 +624,45 @@ impl FileBlobStore {
         })
     }
 
-    fn assign_write_entry(&self, guid: BlobGuid) -> ManifestEntry {
-        let mut m = self.manifest.write().unwrap();
-        let entry = m.assign_write_entry(guid);
-        m.pending_log.push(ManifestDelta::Set {
-            guid,
-            slot: entry.slot,
-        });
-        self.manifest_dirty.store(true, Ordering::Release);
-        entry
-    }
-
-    fn assign_write_entries(
+    fn reserve_write_entries(
         &self,
         guids: impl IntoIterator<Item = BlobGuid>,
-    ) -> Vec<ManifestEntry> {
+    ) -> Vec<ReservedManifestEntry> {
         let mut m = self.manifest.write().unwrap();
-        let mut out = Vec::new();
-        let mut dirty = false;
-        for guid in guids {
-            let entry = m.assign_write_entry(guid);
-            m.pending_log.push(ManifestDelta::Set {
+        guids
+            .into_iter()
+            .map(|guid| ReservedManifestEntry {
                 guid,
-                slot: entry.slot,
-            });
-            dirty = true;
-            out.push(entry);
+                slot: m.allocate_slot(),
+            })
+            .collect()
+    }
+
+    fn release_reserved_slots(&self, slots: impl IntoIterator<Item = u64>) {
+        let mut slots: Vec<_> = slots.into_iter().collect();
+        if slots.is_empty() {
+            return;
         }
-        if dirty {
-            self.manifest_dirty.store(true, Ordering::Release);
+        let mut m = self.manifest.write().unwrap();
+        m.reusable_slots.append_slots(&mut slots);
+        m.trim_trailing_free_slots();
+    }
+
+    fn publish_blob_writes(&self, writes: &[PreparedBlobWrite<'_>]) {
+        if writes.is_empty() {
+            return;
         }
-        out
+        let mut m = self.manifest.write().unwrap();
+        for write in writes {
+            m.publish_write_entry(write.guid, write.slot);
+        }
+        self.manifest_dirty.store(true, Ordering::Release);
+    }
+
+    fn clear_reserved_read_accelerators(&self, writes: &[PreparedBlobWrite<'_>]) {
+        for write in writes {
+            let _ = self.clear_read_accelerator_slot(write.slot);
+        }
     }
 
     fn mark_data_write_started(&self) -> u64 {
@@ -677,17 +686,23 @@ impl FileBlobStore {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
-        let entries = self.assign_write_entries(writes.iter().map(|(guid, _)| *guid));
+        let entries = self.reserve_write_entries(writes.iter().map(|(guid, _)| *guid));
         if let Some(required_slots) = entries
             .iter()
             .map(|entry| entry.slot.saturating_add(1))
             .max()
         {
-            self.ensure_data_capacity(required_slots)?;
+            if let Err(error) = self.ensure_data_capacity(required_slots) {
+                self.release_reserved_slots(entries.iter().map(|entry| entry.slot));
+                return Err(error);
+            }
         }
         let mut io = Vec::with_capacity(writes.len());
-        for ((_guid, src), entry) in writes.iter().zip(entries) {
+        for ((guid, src), entry) in writes.iter().zip(entries) {
+            debug_assert_eq!(*guid, entry.guid);
             io.push(PreparedBlobWrite {
+                guid: entry.guid,
+                slot: entry.slot,
                 offset: entry.slot * u64::from(PAGE_SIZE),
                 src,
             });
@@ -866,6 +881,7 @@ impl FileBlobStore {
             self.mark_data_synced(epoch);
         }
 
+        let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
             let mut m = self.manifest.write().unwrap();
             if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
@@ -873,7 +889,15 @@ impl FileBlobStore {
                 return Err(e);
             }
             m.pending_log.clear();
-            m.publish_pending_free_slots();
+            publish_free_slots = !m.pending_free_slots.is_empty();
+        }
+        if publish_free_slots {
+            // A reader may still be completing I/O through the previous
+            // mapping. Drain it after the remap is durable and before the old
+            // slot enters the allocator; new readers already resolve the new
+            // mapping and therefore cannot prolong this fence.
+            let _slot = self.enter_slot_write();
+            self.manifest.write().unwrap().publish_pending_free_slots();
         }
         Ok(())
     }
@@ -1443,26 +1467,31 @@ impl BlobStore for FileBlobStore {
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        self.remove_read_accelerators_best_effort(guid);
-        let entry = self.assign_write_entry(guid);
-        let offset = entry.slot * u64::from(PAGE_SIZE);
-        self.ensure_data_capacity(entry.slot.saturating_add(1))?;
+        let writes = [(guid, src)];
+        let prepared = self.prepare_blob_writes(&writes)?;
+        self.clear_reserved_read_accelerators(&prepared);
         self.mark_data_write_started();
-        self.pwrite_at(offset, src)?;
+        if let Err(error) = self.pwrite_at(prepared[0].offset, src) {
+            self.release_reserved_slots(prepared.iter().map(|write| write.slot));
+            return Err(error);
+        }
+        self.publish_blob_writes(&prepared);
         Ok(())
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        let io = self.prepare_blob_writes(writes)?;
-        if io.is_empty() {
+        let prepared = self.prepare_blob_writes(writes)?;
+        if prepared.is_empty() {
             return Ok(());
         }
-        for (guid, _) in writes {
-            self.remove_read_accelerators_best_effort(*guid);
-        }
+        self.clear_reserved_read_accelerators(&prepared);
         self.mark_data_write_started();
-        self.pwrite_many_at(&io)?;
+        if let Err(error) = self.pwrite_many_at(&prepared) {
+            self.release_reserved_slots(prepared.iter().map(|write| write.slot));
+            return Err(error);
+        }
+        self.publish_blob_writes(&prepared);
         Ok(())
     }
 
@@ -1474,31 +1503,34 @@ impl BlobStore for FileBlobStore {
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
-            let io = self.prepare_blob_writes(writes)?;
-            for (guid, _) in writes {
-                self.remove_read_accelerators_best_effort(*guid);
-            }
+            let prepared = self.prepare_blob_writes(writes)?;
+            self.clear_reserved_read_accelerators(&prepared);
             let epoch = self.mark_data_write_started();
-            self.pwrite_many_and_sync_at(&io)?;
+            if let Err(error) = self.pwrite_many_and_sync_at(&prepared) {
+                self.release_reserved_slots(prepared.iter().map(|write| write.slot));
+                return Err(error);
+            }
             self.mark_data_synced(epoch);
+            self.publish_blob_writes(&prepared);
             Ok(())
         }
 
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         {
-            let io = self.prepare_blob_writes(writes)?;
-            for (guid, _) in writes {
-                self.remove_read_accelerators_best_effort(*guid);
-            }
+            let prepared = self.prepare_blob_writes(writes)?;
+            self.clear_reserved_read_accelerators(&prepared);
             self.mark_data_write_started();
-            self.pwrite_many_at(&io)?;
+            if let Err(error) = self.pwrite_many_at(&prepared) {
+                self.release_reserved_slots(prepared.iter().map(|write| write.slot));
+                return Err(error);
+            }
+            self.publish_blob_writes(&prepared);
             Ok(())
         }
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        self.remove_read_accelerators_best_effort(guid);
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
             m.pending_free_slots.push(entry.slot);
@@ -1630,8 +1662,16 @@ impl BlobStore for FileBlobStore {
 
 #[derive(Clone, Copy)]
 struct PreparedBlobWrite<'a> {
+    guid: BlobGuid,
+    slot: u64,
     offset: u64,
     src: &'a AlignedBlobBuf,
+}
+
+#[derive(Clone, Copy)]
+struct ReservedManifestEntry {
+    guid: BlobGuid,
+    slot: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1704,17 +1744,12 @@ impl Manifest {
         Ok((entries, next_slot))
     }
 
-    fn assign_write_entry(&mut self, guid: BlobGuid) -> ManifestEntry {
-        // Re-writing an existing blob reuses its slot (COW overwrite in
-        // place); a new blob gets a fresh slot.
-        if let Some(entry) = self.entries.get(&guid) {
-            return *entry;
+    fn publish_write_entry(&mut self, guid: BlobGuid, slot: u64) {
+        if let Some(old) = self.entries.insert(guid, ManifestEntry { slot }) {
+            debug_assert_ne!(old.slot, slot, "shadow write must use a fresh slot");
+            self.pending_free_slots.push(old.slot);
         }
-        let entry = ManifestEntry {
-            slot: self.allocate_slot(),
-        };
-        self.entries.insert(guid, entry);
-        entry
+        self.pending_log.push(ManifestDelta::Set { guid, slot });
     }
 
     fn allocate_slot(&mut self) -> u64 {
@@ -2324,14 +2359,17 @@ mod tests {
     }
 
     #[test]
-    fn write_replaces_existing_in_place() {
+    fn write_replaces_existing_through_shadow_slot() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
             return;
         };
         let g: BlobGuid = [0x33; 16];
         b.write_blob(g, &buf_with(1)).unwrap();
+        let first_slot = b.entry_of(g).unwrap().slot;
         b.write_blob(g, &buf_with(2)).unwrap();
+        let second_slot = b.entry_of(g).unwrap().slot;
+        assert_ne!(first_slot, second_slot);
         b.flush().unwrap();
         assert_eq!(b.len(), 1);
         let mut dst = AlignedBlobBuf::zeroed();
@@ -2340,7 +2378,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_reuses_slot_on_rewrite_and_persists() {
+    fn manifest_publishes_fresh_slot_on_rewrite_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let g: BlobGuid = [0x34; 16];
         {
@@ -2350,8 +2388,35 @@ mod tests {
             b.write_blob(g, &buf_with(1)).unwrap();
             assert_eq!(b.entry_of(g).unwrap().slot, 0);
             b.write_blob(g, &buf_with(2)).unwrap();
-            assert_eq!(b.entry_of(g).unwrap().slot, 0, "rewrite reuses the slot");
+            assert_eq!(b.entry_of(g).unwrap().slot, 1, "rewrite uses a shadow slot");
             b.flush().unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(b.entry_of(g).unwrap().slot, 1);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2, "last write persists across reopen");
+    }
+
+    #[test]
+    fn unflushed_shadow_rewrite_recovers_previous_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let g: BlobGuid = [0x36; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g, &buf_with(1)).unwrap();
+            b.flush().unwrap();
+            assert_eq!(b.entry_of(g).unwrap().slot, 0);
+
+            b.write_blob(g, &buf_with(2)).unwrap();
+            assert_eq!(b.entry_of(g).unwrap().slot, 1);
+            // Simulate process loss after the new frame write but before the
+            // GUID-to-slot manifest update reaches durable storage.
         }
 
         let Some(b) = try_open(dir.path()) else {
@@ -2360,7 +2425,137 @@ mod tests {
         assert_eq!(b.entry_of(g).unwrap().slot, 0);
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
-        assert_eq!(dst.as_slice()[100], 2, "last write persists across reopen");
+        assert_eq!(dst.as_slice()[100], 1);
+    }
+
+    #[test]
+    fn corrupt_unpublished_shadow_cannot_replace_durable_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let g: BlobGuid = [0x3C; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g, &buf_with(1)).unwrap();
+            b.flush().unwrap();
+
+            b.write_blob(g, &buf_with(2)).unwrap();
+            let shadow = b.entry_of(g).unwrap().slot;
+            b.pwrite_at(shadow * u64::from(PAGE_SIZE), &AlignedBlobBuf::zeroed())
+                .unwrap();
+            b.sync_data_file().unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(b.entry_of(g).unwrap().slot, 0);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 1);
+    }
+
+    #[test]
+    fn repeated_shadow_rewrites_reuse_two_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x37; 16];
+        b.write_blob(g, &buf_with(0)).unwrap();
+        b.flush().unwrap();
+
+        for value in 1..=64 {
+            b.write_blob(g, &buf_with(value)).unwrap();
+            b.flush().unwrap();
+        }
+
+        let stats = b.store_stats();
+        assert_eq!(stats.live_slots, 1);
+        assert_eq!(stats.next_slot, 2, "one live blob needs one shadow slot");
+        assert_eq!(stats.reusable_slots, 1);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 64);
+    }
+
+    #[test]
+    fn replaced_slot_is_reused_only_after_manifest_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let first: BlobGuid = [0x38; 16];
+        let second: BlobGuid = [0x39; 16];
+        let third: BlobGuid = [0x3A; 16];
+
+        b.write_blob(first, &buf_with(1)).unwrap();
+        b.flush().unwrap();
+        assert_eq!(b.entry_of(first).unwrap().slot, 0);
+
+        b.write_blob(first, &buf_with(2)).unwrap();
+        assert_eq!(b.entry_of(first).unwrap().slot, 1);
+        b.write_blob(second, &buf_with(3)).unwrap();
+        assert_eq!(
+            b.entry_of(second).unwrap().slot,
+            2,
+            "the durable old slot must not be reused before the remap is durable",
+        );
+
+        b.flush().unwrap();
+        b.write_blob(third, &buf_with(4)).unwrap();
+        assert_eq!(
+            b.entry_of(third).unwrap().slot,
+            0,
+            "the old slot becomes reusable after manifest fsync",
+        );
+    }
+
+    #[test]
+    fn manifest_flush_drains_old_slot_readers_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let guid: BlobGuid = [0x3B; 16];
+        store.write_blob(guid, &buf_with(1)).unwrap();
+        store.flush().unwrap();
+
+        let (reader_entered_tx, reader_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_reader_tx, release_reader_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_store = std::sync::Arc::clone(&store);
+        let reader = std::thread::spawn(move || {
+            let _slot = reader_store.enter_slot_read();
+            assert_eq!(reader_store.entry_of(guid).unwrap().slot, 0);
+            reader_entered_tx.send(()).unwrap();
+            release_reader_rx.recv().unwrap();
+        });
+        reader_entered_rx.recv().unwrap();
+
+        // Publishing the complete shadow frame does not wait for an old-slot
+        // reader because the old slot is still protected from reuse.
+        store.write_blob(guid, &buf_with(2)).unwrap();
+        assert_eq!(store.entry_of(guid).unwrap().slot, 1);
+
+        let (flush_done_tx, flush_done_rx) = std::sync::mpsc::sync_channel(1);
+        let flush_store = std::sync::Arc::clone(&store);
+        let flush = std::thread::spawn(move || {
+            flush_store.flush().unwrap();
+            flush_done_tx.send(()).unwrap();
+        });
+        assert!(
+            flush_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "flush must not release an old slot while a reader still holds it",
+        );
+
+        release_reader_tx.send(()).unwrap();
+        reader.join().unwrap();
+        flush_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        flush.join().unwrap();
+        assert_eq!(store.store_stats().reusable_slots, 1);
     }
 
     #[test]
