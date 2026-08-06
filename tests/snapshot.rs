@@ -2,11 +2,11 @@
 //!
 //! Exercises only the public surface. Snapshot tests cover
 //! creation, the scoped read path (including across blob-frame
-//! boundaries), epoch advancement, and isolation from *root-local*
-//! live writes — which hold without fork-on-write because the live
-//! root frame is never shared (a snapshot takes a full copy of it).
-//! Multi-blob isolation under mutation (the fork-on-write gate) is
-//! added alongside that machinery.
+//! boundaries), epoch advancement, and isolation from both root-local
+//! and cross-frame live writes. Capture copies the root frame; descendants
+//! remain shared until a live mutation validates the parent edge and forks
+//! the affected shared frame. Escaped views, builders, and cursors keep the
+//! process-local epoch lease alive until the final handle is dropped.
 
 use std::sync::Arc;
 

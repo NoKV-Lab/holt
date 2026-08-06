@@ -420,6 +420,9 @@ impl DB {
     /// tree's exclusive mutation gate, releases the live DB, then
     /// invokes `read` with an immutable [`DBView`]. Writes committed
     /// after the capture are invisible to every captured tree view.
+    /// Cloned tree views and their range builders or owned cursors may escape
+    /// the callback and retain their process-local snapshot epoch leases until
+    /// the final derived handle is dropped.
     ///
     /// Scopes are explicit so callers choose exactly which catalog
     /// trees participate in the consistent read view.
@@ -1171,7 +1174,9 @@ impl DB {
 ///
 /// Created by [`DB::view`]. Each captured tree is exposed as a
 /// normal [`View`], so point lookup and range/list APIs stay the
-/// same as single-tree snapshots.
+/// same as single-tree snapshots. Each view owns a copied root, initially
+/// shares descendants with its live tree, and retains a process-local epoch
+/// lease through any cloned view, range builder, or owned cursor.
 pub struct DBView {
     trees: HashMap<String, Snapshot>,
 }

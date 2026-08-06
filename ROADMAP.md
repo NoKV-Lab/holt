@@ -382,8 +382,10 @@ single-node embedded library, no always-on MVCC version chains.
 
 - `Tree::view(prefix, |view| ...)` performs one root-frame copy, shares
   descendants, and serves stable point reads/scans while first writes fork
-  snapshot-visible frames. Cloned views and owned cursors extend the epoch
-  lease beyond the callback until their final handle drops.
+  snapshot-visible frames after validating their parent edges. Cloned views,
+  range builders, and owned cursors extend the process-local epoch lease beyond
+  the callback until their final handle drops; retirement then makes detached
+  frames eligible for checkpoint/GC reclamation.
 - Ordinary `range()` / `range_keys()` remain the hot restart-on-conflict
   iterators; `View` is the explicit stable-read path for list/readdir.
 

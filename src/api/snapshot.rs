@@ -10,9 +10,10 @@
 //! Creation is O(one frame copy); the per-write cost is zero while no
 //! snapshot is live, and bounded by the root→leaf frame path length on
 //! the first write to each region while one is. Dropping the handle (or
-//! calling [`Snapshot::retire`]) releases its lease; the global fork
-//! barrier lowers after every cloned view and owned cursor derived from
-//! that snapshot has also been dropped.
+//! calling [`Snapshot::retire`]) releases that handle's process-local lease
+//! reference; the global fork barrier can lower only after every cloned view,
+//! range builder, and owned cursor derived from that snapshot has also been
+//! dropped.
 
 use super::view::View;
 use std::ops::Deref;
@@ -24,8 +25,10 @@ use std::ops::Deref;
 /// writes. All [`View`] read operations are available through `Deref`
 /// (`snapshot.get(..)`, `snapshot.range()`, `snapshot.scan(..)`, …).
 ///
-/// The snapshot epoch is retired after this handle and all cloned views or
-/// owned cursors derived from it are dropped.
+/// The snapshot epoch is retired after this handle and all cloned views,
+/// range builders, or owned cursors derived from it are dropped. This lease is
+/// process-local lifetime bookkeeping, not a persistent or cross-process
+/// snapshot lease.
 /// Persisted copy-on-write frames are not reclaimed inline on handle drop.
 /// A later standalone or DB checkpoint reclaims a bounded exact batch, while
 /// [`crate::Tree::gc`] and [`crate::DB::gc`] provide complete reachability
@@ -59,8 +62,8 @@ impl Snapshot {
     }
 
     /// Release this snapshot handle now. The fork-barrier epoch retires
-    /// after the last cloned [`View`] or owned range cursor derived from
-    /// it is also dropped.
+    /// after the last cloned [`View`], range builder, or owned cursor derived
+    /// from it is also dropped.
     pub fn retire(mut self) {
         drop(self.view.take());
     }

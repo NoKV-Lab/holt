@@ -1899,8 +1899,9 @@ impl Tree {
     /// later live writes fork the frames this view references). Writes
     /// committed after the capture are invisible to all reads made through
     /// the view, and point lookup / range / list keep using the ART walker.
-    /// A cloned [`View`] or owned cursor returned through `R` may outlive the
-    /// callback and keeps the snapshot epoch leased until it is dropped.
+    /// A cloned [`View`], range builder, or owned cursor returned through `R`
+    /// may outlive the callback and keeps the process-local snapshot epoch
+    /// leased until it is dropped.
     ///
     /// A view is scoped: reads outside `prefix` return
     /// [`Error::OutsideViewScope`]. Use `prefix = b""` only when a
@@ -1925,9 +1926,9 @@ impl Tree {
     ///
     /// Reads outside `prefix` return [`Error::OutsideViewScope`]; use
     /// `prefix = b""` for a whole-tree snapshot. Dropping the main handle (or
-    /// calling [`Snapshot::retire`]) releases that handle; cloned views and
-    /// owned cursors remain valid and keep the epoch leased until they too are
-    /// dropped.
+    /// calling [`Snapshot::retire`]) releases that handle; cloned views,
+    /// range builders, and owned cursors remain valid and keep the
+    /// process-local epoch leased until they too are dropped.
     pub fn snapshot(&self, prefix: &[u8]) -> Result<Snapshot> {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;

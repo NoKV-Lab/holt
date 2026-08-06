@@ -1,9 +1,11 @@
 //! Copy-on-write snapshot benchmark.
 //!
-//! Quantifies the CoW [`Tree::snapshot`] against the full-copy
-//! [`Tree::view`], and the cost of holding a snapshot:
+//! Compares the owned [`Tree::snapshot`] and scoped [`Tree::view`] API paths,
+//! which use the same copy-on-write capture, and measures the cost of holding
+//! a snapshot:
 //!
-//! - `cow_create`   — snapshot creation (O(1 frame)) vs view (O(tree)).
+//! - `cow_create`   — owned snapshot vs scoped-view capture; each copies one
+//!                    root frame and initially shares descendants.
 //! - `cow_write`    — put throughput with no snapshot vs one held (the
 //!                    fork-on-write + route-cache-disabled overhead).
 //! - `cow_read`     — point read on the live tree vs on a snapshot.
@@ -22,8 +24,7 @@ const KEY_COUNT: usize = 20_000;
 const VALUE_LEN: usize = 200;
 
 /// Path-shaped keys + fixed-size bodies, sized so the tree spans many
-/// blob frames (so `view`'s O(tree) copy is visible against `snapshot`'s
-/// single-frame copy).
+/// blob frames and captured reads cross shared descendants.
 fn dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
     (0..KEY_COUNT)
         .map(|i| {
@@ -65,7 +66,7 @@ fn bench_create(c: &mut Criterion) {
             std::hint::black_box(&snap);
         });
     });
-    group.bench_function("view_full_copy", |b| {
+    group.bench_function("view_scoped", |b| {
         b.iter(|| {
             tree.view(b"", |v| {
                 std::hint::black_box(v);
