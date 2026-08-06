@@ -638,6 +638,13 @@ impl FileBlobStore {
             .collect()
     }
 
+    /// Roll back slots reserved by a write that failed before it could
+    /// publish them.
+    ///
+    /// A reserved slot was never in any manifest — durable or in-memory —
+    /// so no reader can resolve to it and returning it to the allocator
+    /// needs no fence. `pending_free_slots` is the opposite case and must
+    /// not be touched here: see [`Manifest::trim_trailing_reusable_slots`].
     fn release_reserved_slots(&self, slots: impl IntoIterator<Item = u64>) {
         let mut slots: Vec<_> = slots.into_iter().collect();
         if slots.is_empty() {
@@ -645,7 +652,7 @@ impl FileBlobStore {
         }
         let mut m = self.manifest.write().unwrap();
         m.reusable_slots.append_slots(&mut slots);
-        m.trim_trailing_free_slots();
+        m.trim_trailing_reusable_slots();
     }
 
     fn publish_blob_writes(&self, writes: &[PreparedBlobWrite<'_>]) {
@@ -1768,9 +1775,21 @@ impl Manifest {
             .append_slots(&mut self.pending_free_slots);
     }
 
+    /// Lower the high-water mark over slots that are *already* reusable.
+    ///
+    /// Unlike [`Self::trim_trailing_free_slots`] this does **not** drain
+    /// `pending_free_slots`. Those slots are still referenced by the last
+    /// durable manifest and may still be under an in-flight reader, so only
+    /// `flush_locked`'s durability + reader-drain fences may publish them.
+    /// Rollback paths, which run on I/O failure and pass neither fence, must
+    /// use this variant.
+    fn trim_trailing_reusable_slots(&mut self) -> u64 {
+        self.reusable_slots.trim_trailing(&mut self.next_slot)
+    }
+
     fn trim_trailing_free_slots(&mut self) -> u64 {
         self.publish_pending_free_slots();
-        self.reusable_slots.trim_trailing(&mut self.next_slot)
+        self.trim_trailing_reusable_slots()
     }
 
     fn relocation_plan(&self) -> Vec<SlotMove> {
@@ -2508,6 +2527,61 @@ mod tests {
             b.entry_of(third).unwrap().slot,
             0,
             "the old slot becomes reusable after manifest fsync",
+        );
+    }
+
+    /// The error-path sibling of
+    /// [`replaced_slot_is_reused_only_after_manifest_flush`].
+    ///
+    /// Rolling back a failed write returns only the slots that write
+    /// reserved. It must not also publish `pending_free_slots`: those are
+    /// still referenced by the last durable manifest, and the rollback path
+    /// passes neither the manifest-durability fence nor the reader drain.
+    /// Publishing them there would hand a durably-referenced slot to the next
+    /// write, so a crash before the next flush would resolve the old guid to
+    /// another blob's bytes.
+    ///
+    /// This drives `release_reserved_slots` directly — the same call the
+    /// `pwrite`/capacity error arms make — because the failure it rolls back
+    /// is a genuine device error inside the store, below any injectable
+    /// `BlobStore` boundary.
+    #[test]
+    fn rolling_back_reserved_slots_keeps_undurable_frees_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let live: BlobGuid = [0x3C; 16];
+        let next: BlobGuid = [0x3D; 16];
+
+        // Durable: live -> slot 0.
+        b.write_blob(live, &buf_with(1)).unwrap();
+        b.flush().unwrap();
+        assert_eq!(b.entry_of(live).unwrap().slot, 0);
+
+        // Shadow rewrite. Slot 0 is superseded in memory, but the durable
+        // manifest still maps live -> 0, so it may not be reused yet.
+        b.write_blob(live, &buf_with(2)).unwrap();
+        assert_eq!(b.entry_of(live).unwrap().slot, 1);
+        assert_eq!(b.store_stats().pending_free_slots, 1);
+
+        // A following write reserves a fresh slot and then fails before it
+        // can publish; only that reservation may go back to the allocator.
+        let reserved = b.reserve_write_entries([next]);
+        assert_eq!(reserved[0].slot, 2, "a rewrite must reserve a fresh slot");
+        b.release_reserved_slots(reserved.iter().map(|entry| entry.slot));
+
+        assert_eq!(
+            b.store_stats().pending_free_slots,
+            1,
+            "rollback must not publish slots the durable manifest still references",
+        );
+
+        b.write_blob(next, &buf_with(3)).unwrap();
+        assert_eq!(
+            b.entry_of(next).unwrap().slot,
+            2,
+            "the rolled-back reservation is reusable, the superseded slot is not",
         );
     }
 
