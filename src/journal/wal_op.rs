@@ -41,7 +41,14 @@ pub enum WalOp {
         src_key: Vec<u8>,
         /// Destination key.
         dst_key: Vec<u8>,
+        /// Source value captured by the committing operation.
+        ///
+        /// Recovery must never re-read `src_key` from a checkpoint image that
+        /// may already contain a later write.
+        value: Vec<u8>,
         /// Overwrite if dst exists.
+        #[allow(dead_code)]
+        // parsed for v4 wire fidelity; redo always installs the bound value
         force: bool,
     },
     /// Batch — one WAL record carrying multiple primitive ops so a
@@ -52,6 +59,7 @@ pub enum WalOp {
     /// nested `Batch`es are rejected at encode + decode. The outer
     /// record's header `SEQ` is the base, and replay derives each
     /// inner op's sequence as `outer_seq + index`.
+    #[cfg_attr(not(test), allow(dead_code))] // production streams batch primitives directly
     Batch {
         /// Inner ops, applied in order.
         ops: Vec<WalOp>,

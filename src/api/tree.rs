@@ -33,7 +33,7 @@ use crate::engine::{
 use crate::journal::codec::{
     encode_erase_record, encode_insert_record, encode_rename_object_record,
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
-    BatchEncoder, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE,
+    BatchEncoder, MAX_ATOMIC_WAL_OPS, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE,
 };
 use crate::journal::reader::replay_file;
 use crate::journal::wal_op::WalOp;
@@ -323,9 +323,58 @@ impl std::fmt::Debug for Tree {
     }
 }
 
+const BATCH_RECORD_ENVELOPE_LEN: usize = RECORD_HEADER_SIZE + 8 + 4 + RECORD_FOOTER_SIZE;
+
 fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
-    let body_prefix_len = 8 + 4; // tree_id + inner_count
-    let mut len = RECORD_HEADER_SIZE + body_prefix_len + RECORD_FOOTER_SIZE;
+    BATCH_RECORD_ENVELOPE_LEN.saturating_add(encoded_batch_inner_len(ops))
+}
+
+/// Incremental exact WAL admission shared by standalone and DB batches.
+/// Static framing and compressed put-run bytes are charged before preflight;
+/// each rename's captured value is charged before it is retained.
+pub(crate) struct BatchWalAdmission {
+    encoded_bytes: usize,
+    max_bytes: usize,
+}
+
+impl BatchWalAdmission {
+    pub(crate) fn new(encoded_bytes: usize, max_bytes: usize) -> Result<Self> {
+        if encoded_bytes > max_bytes {
+            return Err(Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes,
+            });
+        }
+        Ok(Self {
+            encoded_bytes,
+            max_bytes,
+        })
+    }
+
+    fn admit_rename_value(&mut self, value_len: usize) -> Result<()> {
+        let encoded_bytes =
+            self.encoded_bytes
+                .checked_add(value_len)
+                .ok_or(Error::AtomicRecordTooLarge {
+                    encoded_bytes: usize::MAX,
+                    max_bytes: self.max_bytes,
+                })?;
+        if encoded_bytes > self.max_bytes {
+            return Err(Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes: self.max_bytes,
+            });
+        }
+        self.encoded_bytes = encoded_bytes;
+        Ok(())
+    }
+}
+
+/// Exact number of bytes the shared batch plan will append inside one outer
+/// `Batch` envelope. DB admission reuses this planner per tree group so prefix
+/// and fixed-run compression cannot drift from the walker encoder.
+pub(crate) fn encoded_batch_inner_len(ops: &[BatchOp]) -> usize {
+    let mut len = 0usize;
     let mut i = 0usize;
     while i < ops.len() {
         if let Some(plan) = insert_run_plan(ops, i) {
@@ -337,10 +386,17 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
             BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
                 (1usize + 8 + 4).saturating_add(key.len())
             }
-            BatchOp::Rename { src, dst, .. } => (1usize + 8 + 4)
+            BatchOp::Rename {
+                src,
+                dst,
+                wal_value,
+                ..
+            } => (1usize + 8 + 4)
                 .saturating_add(src.len())
                 .saturating_add(4)
                 .saturating_add(dst.len())
+                .saturating_add(4)
+                .saturating_add(wal_value.as_ref().map_or(0, Vec::len))
                 .saturating_add(1),
             BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
             BatchOp::Put { .. } | BatchOp::PutIfAbsent { .. } | BatchOp::CompareAndPut { .. } => {
@@ -351,6 +407,32 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
         i += 1;
     }
     len
+}
+
+/// Reserve a consecutive sequence range without wrapping. The value stored in
+/// `next_seq` is always a representable next-unallocated sequence, so replay's
+/// `highest + 1` follows the same invariant.
+pub(crate) fn reserve_seq_range(next_seq: &AtomicU64, count: u64) -> Result<u64> {
+    let mut current = next_seq.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(count)
+            .ok_or(Error::WalSequenceExhausted { requested: count })?;
+        match next_seq.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+pub(crate) fn validate_atomic_op_count(count: usize) -> Result<u64> {
+    if count > MAX_ATOMIC_WAL_OPS {
+        return Err(Error::AtomicRecordTooManyOperations {
+            operations: count,
+            max_operations: MAX_ATOMIC_WAL_OPS,
+        });
+    }
+    Ok(count as u64)
 }
 
 const INSERT_PREFIX_RUN_MIN_PREFIX: usize = 12;
@@ -683,16 +765,8 @@ impl Tree {
                     let wal_len = wal.metadata()?.len();
                     let next_seq = if wal_len != 0 {
                         let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&wal, &bm, |tree_id| {
-                            if tree_id == 0 {
-                                Ok(root_guid)
-                            } else {
-                                Err(Error::ReplaySanityFailed {
-                                    context: "WAL record tree_id does not belong to this Tree",
-                                    record_offset: 0,
-                                })
-                            }
-                        })?;
+                        let (next_seq, replay_stats) =
+                            replay_wal(&wal, &bm, Some(0), |_| Ok(root_guid))?;
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -979,7 +1053,7 @@ impl Tree {
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let creates_key = self.get_version(key)?.is_none();
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let seq = reserve_seq_range(&self.next_seq, 1)?;
             let journal = self
                 .journal
                 .as_ref()
@@ -1020,7 +1094,7 @@ impl Tree {
             self.ensure_live()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let seq = reserve_seq_range(&self.next_seq, 1)?;
 
             if let Some(journal) = &self.journal {
                 let mut record =
@@ -1091,6 +1165,7 @@ impl Tree {
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        Self::validate_key_shape(key)?;
         if self.can_stage_deferred_write() {
             self.delete_deferred(key)
         } else {
@@ -1106,6 +1181,7 @@ impl Tree {
     /// tombstoned, or has been updated since the caller obtained
     /// the version.
     pub fn delete_if_version(&self, key: &[u8], expected_version: RecordVersion) -> Result<bool> {
+        Self::validate_key_shape(key)?;
         self.flush_write_delta_for_tree()?;
         self.delete_inner_conditional(
             key,
@@ -1123,7 +1199,7 @@ impl Tree {
             if self.get_version(key)?.is_none() {
                 return Ok(false);
             }
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let seq = reserve_seq_range(&self.next_seq, 1)?;
             let journal = self
                 .journal
                 .as_ref()
@@ -1169,7 +1245,7 @@ impl Tree {
             self.ensure_live()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let seq = reserve_seq_range(&self.next_seq, 1)?;
 
             if let Some(journal) = &self.journal {
                 let mut record = journal.prepare_record(encoded_erase_record_len(key.len()))?;
@@ -1241,7 +1317,10 @@ impl Tree {
     /// unrelated endpoints can proceed in parallel. The op emits a
     /// single `RenameObject` WAL record so its erase + insert phases
     /// recover atomically on replay.
+    #[allow(clippy::too_many_lines)] // keep the two-phase mutation and WAL protocol contiguous
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
+        Self::validate_key_shape(src)?;
+        Self::validate_key_shape(dst)?;
         self.flush_write_delta_for_tree()?;
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
@@ -1251,7 +1330,7 @@ impl Tree {
             self.ensure_live()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let seq = reserve_seq_range(&self.next_seq, 1)?;
 
             // Probe src across all blobs — zero-copy via BM pin.
             let Some(value) = engine::lookup_multi_with(
@@ -1290,9 +1369,20 @@ impl Tree {
             // `seq` across both erase + insert phases keeps the rename
             // atomic from the dirty-tracking perspective.
             if let Some(journal) = &self.journal {
-                let mut record = journal
-                    .prepare_record(encoded_rename_object_record_len(src.len(), dst.len()))?;
-                encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
+                let mut record = journal.prepare_record(encoded_rename_object_record_len(
+                    src.len(),
+                    dst.len(),
+                    value.len(),
+                ))?;
+                encode_rename_object_record(
+                    &mut record,
+                    seq,
+                    self.tree_id,
+                    src,
+                    dst,
+                    &value,
+                    force,
+                );
                 let _commit = self.commit_gate.enter_writer();
                 let erase_out = engine::erase_multi(
                     &self.store,
@@ -1405,12 +1495,12 @@ impl Tree {
         self.apply_batch(batch.pending)
     }
 
-    pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+    pub(crate) fn apply_batch(&self, mut pending: Vec<BatchOp>) -> Result<bool> {
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
-        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
+        let count = validate_atomic_op_count(pending.iter().filter(|op| op.emits_wal()).count())?;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
         // storing per-inner seqs in the body. Non-mutating prefix
@@ -1418,8 +1508,18 @@ impl Tree {
         // Failed guard preflights may burn the range without
         // emitting a WAL record; `next_seq` is monotonic, not
         // gap-free.
-        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
-        if !self.preflight_batch(&pending, base_seq)? {
+        let base_seq = reserve_seq_range(&self.next_seq, count)?;
+        let mut wal_admission = self
+            .journal
+            .as_ref()
+            .map(|journal| {
+                BatchWalAdmission::new(
+                    encoded_batch_record_len(&pending),
+                    journal.max_record_bytes(),
+                )
+            })
+            .transpose()?;
+        if !self.preflight_batch(&mut pending, base_seq, wal_admission.as_mut())? {
             return Ok(false);
         }
         if count != 0 {
@@ -1458,7 +1558,12 @@ impl Tree {
         Ok(())
     }
 
-    pub(crate) fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
+    pub(crate) fn preflight_batch(
+        &self,
+        pending: &mut [BatchOp],
+        base_seq: u64,
+        wal_admission: Option<&mut BatchWalAdmission>,
+    ) -> Result<bool> {
         if Self::batch_is_guard_free(pending) {
             Self::preflight_guard_free_batch(pending)?;
             return Ok(true);
@@ -1467,6 +1572,7 @@ impl Tree {
         let mut overlay = BatchOverlay::new();
         let mut seq_offset = 0u64;
 
+        let mut wal_admission = wal_admission;
         for op in pending {
             let seq = if op.emits_wal() {
                 let seq = base_seq + seq_offset;
@@ -1475,7 +1581,7 @@ impl Tree {
             } else {
                 base_seq + seq_offset
             };
-            if !self.preflight_batch_op(&mut overlay, op, seq)? {
+            if !self.preflight_batch_op(&mut overlay, op, seq, wal_admission.as_deref_mut())? {
                 return Ok(false);
             }
         }
@@ -1485,8 +1591,9 @@ impl Tree {
     fn preflight_batch_op(
         &self,
         overlay: &mut BatchOverlay,
-        op: &BatchOp,
+        op: &mut BatchOp,
         seq: u64,
+        wal_admission: Option<&mut BatchWalAdmission>,
     ) -> Result<bool> {
         match op {
             BatchOp::Put { key, value } => {
@@ -1514,9 +1621,11 @@ impl Tree {
                 }
             }
             BatchOp::Delete { key } => {
+                Self::validate_key_shape(key)?;
                 overlay.insert(key.clone(), None);
             }
             BatchOp::DeleteIfVersion { key, expected } => {
+                Self::validate_key_shape(key)?;
                 match self.projected_record(overlay, key)? {
                     Some(record) if record.version == *expected => {
                         overlay.insert(key.clone(), None);
@@ -1535,8 +1644,17 @@ impl Tree {
                     return Ok(false);
                 }
             }
-            BatchOp::Rename { src, dst, force } => {
-                self.preflight_rename_op(overlay, src, dst, *force, seq)?;
+            BatchOp::Rename {
+                src,
+                dst,
+                force,
+                wal_value,
+            } => {
+                let value = self.preflight_rename_op(overlay, src, dst, *force, seq)?;
+                if let Some(wal_admission) = wal_admission {
+                    wal_admission.admit_rename_value(value.len())?;
+                    *wal_value = Some(value);
+                }
             }
         }
         Ok(true)
@@ -1549,26 +1667,29 @@ impl Tree {
         dst: &[u8],
         force: bool,
         seq: u64,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
+        Self::validate_key_shape(src)?;
+        Self::validate_key_shape(dst)?;
         let Some(src_record) = self.projected_record(overlay, src)? else {
             return Err(Error::NotFound);
         };
+        let value = src_record.value;
         if src == dst {
-            return Ok(());
+            return Ok(value);
         }
         if !force && self.projected_record(overlay, dst)?.is_some() {
             return Err(Error::DstExists);
         }
-        Self::validate_insert_shape(dst, &src_record.value)?;
+        Self::validate_insert_shape(dst, &value)?;
         overlay.insert(src.to_vec(), None);
         overlay.insert(
             dst.to_vec(),
             Some(Record {
-                value: src_record.value,
+                value: value.clone(),
                 version: RecordVersion::new(seq),
             }),
         );
-        Ok(())
+        Ok(value)
     }
 
     fn overlay_put(overlay: &mut BatchOverlay, key: &[u8], value: &[u8], seq: u64) {
@@ -1589,8 +1710,10 @@ impl Tree {
 
     fn preflight_guard_free_batch(pending: &[BatchOp]) -> Result<()> {
         for op in pending {
-            if let BatchOp::Put { key, value } = op {
-                Self::validate_insert_shape(key, value)?;
+            match op {
+                BatchOp::Put { key, value } => Self::validate_insert_shape(key, value)?,
+                BatchOp::Delete { key } => Self::validate_key_shape(key)?,
+                _ => unreachable!("guard-free batches contain only put/delete"),
             }
         }
         Ok(())
@@ -1634,12 +1757,17 @@ impl Tree {
     }
 
     fn validate_insert_shape(key: &[u8], value: &[u8]) -> Result<()> {
+        Self::validate_key_shape(key)?;
+        if value.len() > u16::MAX as usize {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
+        Ok(())
+    }
+
+    fn validate_key_shape(key: &[u8]) -> Result<()> {
         let key_len = key.len().saturating_add(1);
         if key_len > u16::MAX as usize {
             return Err(Error::KeyTooLong { len: key_len });
-        }
-        if value.len() > u16::MAX as usize {
-            return Err(Error::ValueTooLong { len: value.len() });
         }
         Ok(())
     }
@@ -1757,10 +1885,29 @@ impl Tree {
                     }
                 }
                 BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
-                BatchOp::Rename { src, dst, force } => {
-                    self.apply_batch_rename_walker(src, dst, *force, seq)?;
+                BatchOp::Rename {
+                    src,
+                    dst,
+                    force,
+                    wal_value,
+                } => {
+                    let live_value;
+                    let value = if let Some(value) = wal_value.as_deref() {
+                        value
+                    } else {
+                        live_value = engine::lookup_multi_with(
+                            &self.store,
+                            &self.root_pin,
+                            Some(&self.route_cache),
+                            engine::SearchKey::user(src),
+                            |hit| hit.value.to_vec(),
+                        )?
+                        .ok_or(Error::Internal("rename source disappeared after preflight"))?;
+                        &live_value
+                    };
+                    self.apply_batch_rename_walker(src, dst, value, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_rename_object(self.tree_id, src, dst, *force);
+                        enc.push_rename_object(self.tree_id, src, dst, value, *force);
                     }
                 }
             }
@@ -1836,35 +1983,13 @@ impl Tree {
         &self,
         src: &[u8],
         dst: &[u8],
-        force: bool,
+        value: &[u8],
         seq: u64,
     ) -> Result<()> {
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
-        let Some(value) = engine::lookup_multi_with(
-            &self.store,
-            &self.root_pin,
-            Some(&self.route_cache),
-            src_search,
-            |hit| hit.value.to_vec(),
-        )?
-        else {
-            return Err(Error::NotFound);
-        };
         if src == dst {
             return Ok(());
-        }
-        if !force
-            && engine::lookup_multi_with(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                dst_search,
-                |_| (),
-            )?
-            .is_some()
-        {
-            return Err(Error::DstExists);
         }
 
         let erase_out = engine::erase_multi(
@@ -1879,7 +2004,7 @@ impl Tree {
             &self.root_pin,
             Some(&self.route_cache),
             dst_search,
-            &value,
+            value,
             seq,
         )?;
         if erase_out.root_dirty || insert_out.root_dirty {
@@ -3171,27 +3296,35 @@ pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobG
 pub(crate) fn replay_wal<F>(
     file: &File,
     bm: &Arc<BufferManager>,
+    expected_primitive_tree_id: Option<u64>,
     mut root_for_tree_id: F,
 ) -> Result<(u64, crate::journal::reader::ReplayStats)>
 where
     F: FnMut(u64) -> Result<BlobGuid>,
 {
-    let mut root_pins: HashMap<u64, (BlobGuid, Arc<CachedBlob>)> = HashMap::new();
-    let (_header, stats) = replay_file(file, |op, seq, _off| {
+    // Keep a fixed recent working set of durable root identities, never a
+    // replay-lifetime map or 512 KiB root pins. A miss may conservatively
+    // repeat the idempotent durability barrier, but recovery auxiliary memory
+    // is independent of WAL length and distinct-tree count.
+    const ENSURED_ROOT_WINDOW: usize = 64;
+    let mut ensured_roots = [None; ENSURED_ROOT_WINDOW];
+    let mut ensured_root_cursor = 0usize;
+    let (_header, stats) = replay_file(file, 0, expected_primitive_tree_id, |op, seq, _off| {
         let tree_id = op.tree_id().unwrap_or(0);
-        let (root_guid, root_pin) = match root_pins.entry(tree_id) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                let (guid, pin) = entry.get();
-                (*guid, Arc::clone(pin))
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let guid = root_for_tree_id(tree_id)?;
-                ensure_durable_root_blob(bm, guid)?;
-                let pin = bm.pin(guid)?;
-                let (guid, pin) = entry.insert((guid, pin));
-                (*guid, Arc::clone(pin))
-            }
-        };
+        // Hold only the current operation's root pin. The BufferManager owns
+        // dirty-frame liveness and its configured clean-cache budget; replay
+        // must not retain one 512 KiB pin per distinct tree in the WAL.
+        let root_guid = root_for_tree_id(tree_id)?;
+        if !ensured_roots.contains(&Some(root_guid)) {
+            ensure_durable_root_blob(bm, root_guid)?;
+            ensured_roots[ensured_root_cursor] = Some(root_guid);
+            ensured_root_cursor = (ensured_root_cursor + 1) % ENSURED_ROOT_WINDOW;
+        }
+        // Recovery is a streaming scan, not a hot point read. Scan admission
+        // prevents thousands of one-use clean roots from defeating TinyLFU
+        // point-frequency protection and growing past the configured cache
+        // budget while this operation still owns only one actual pin.
+        let root_pin = bm.pin_scan(root_guid)?;
         // `root_dirty` tracks whether this op actually mutated
         // the BM-cached root image. No-op replays (e.g. an erase
         // for a key already absent because a prior replay pass
@@ -3210,32 +3343,16 @@ where
             WalOp::RenameObject {
                 src_key,
                 dst_key,
-                force,
+                value,
                 ..
             } => {
                 let src_search = engine::SearchKey::user(src_key);
                 let dst_search = engine::SearchKey::user(dst_key);
-                // Existence probes pass a `|_| ()` closure so the
-                // walker doesn't even allocate / copy the value.
-                if engine::lookup_multi_with(bm, &root_pin, None, src_search, |_| ())?.is_none() {
-                    // Already reconciled in a prior replay pass —
-                    // skip. `highest` was bumped above so the
-                    // post-replay `next_seq` still advances past
-                    // this record's seq.
+                if src_key == dst_key {
                     return Ok(());
                 }
-                if !force
-                    && engine::lookup_multi_with(bm, &root_pin, None, dst_search, |_| ())?.is_some()
-                {
-                    return Ok(());
-                }
-                let value = engine::lookup_multi_with(bm, &root_pin, None, src_search, |hit| {
-                    hit.value.to_vec()
-                })?
-                .unwrap_or_default();
                 let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq)?;
-                let insert_out =
-                    engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq)?;
+                let insert_out = engine::insert_multi(bm, &root_pin, None, dst_search, value, seq)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
             // `Batch` is unpacked into per-inner callbacks inside
@@ -3271,7 +3388,12 @@ where
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything
     // ever seen in the log.
-    Ok((stats.highest_seq.unwrap_or(0) + 1, stats))
+    let next_seq = stats
+        .highest_seq
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(Error::WalSequenceExhausted { requested: 1 })?;
+    Ok((next_seq, stats))
 }
 
 #[cfg(test)]
@@ -3279,6 +3401,9 @@ mod tests {
     use crate::concurrency::CommitGate;
     use crate::engine::{RouteHit, SearchKey};
     use crate::journal::codec::encoded_insert_record_len;
+    use crate::journal::codec::BatchEncoder;
+    use crate::journal::wal_op::WalOp;
+    use crate::journal::writer::WalWriter;
     use crate::journal::Journal;
     use crate::layout::BlobGuid;
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
@@ -3325,6 +3450,234 @@ mod tests {
         assert!(tree.get(b"key").unwrap().is_none());
         assert_eq!(journal.stats().appends, appends_before);
         assert_eq!(tree.store.dirty_count(), 0);
+    }
+
+    #[test]
+    fn writer_operation_ceiling_and_sequence_exhaustion_reject_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        let tree = Tree::open(cfg).unwrap();
+        let journal = tree.journal.as_ref().unwrap();
+
+        assert_eq!(
+            super::validate_atomic_op_count(crate::journal::codec::MAX_ATOMIC_WAL_OPS).unwrap(),
+            crate::journal::codec::MAX_ATOMIC_WAL_OPS as u64,
+        );
+        let appends_before = journal.stats().appends;
+        let error = tree
+            .atomic(|batch| {
+                for i in 0..=crate::journal::codec::MAX_ATOMIC_WAL_OPS {
+                    batch.delete(&(i as u64).to_le_bytes());
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AtomicRecordTooManyOperations {
+                operations,
+                max_operations,
+            } if operations == crate::journal::codec::MAX_ATOMIC_WAL_OPS + 1
+                && max_operations == crate::journal::codec::MAX_ATOMIC_WAL_OPS
+        ));
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(tree.store.dirty_count(), 0);
+
+        tree.next_seq.store(u64::MAX, Ordering::Release);
+        let error = tree.put(b"must-not-mutate", b"value").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::WalSequenceExhausted { requested: 1 }
+        ));
+        assert!(tree.get(b"must-not-mutate").unwrap().is_none());
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(tree.store.dirty_count(), 0);
+    }
+
+    #[test]
+    fn oversized_delete_key_cannot_commit_a_wal_that_reader_would_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        let oversized_key = vec![0x5A; u16::MAX as usize];
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            let journal = tree.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+            let error = tree
+                .atomic(|batch| batch.delete(&oversized_key))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::KeyTooLong { len } if len == u16::MAX as usize + 1
+            ));
+            let error = tree.delete(&oversized_key).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::KeyTooLong { len } if len == u16::MAX as usize + 1
+            ));
+            assert_eq!(journal.stats().appends, appends_before);
+            assert_eq!(tree.store.dirty_count(), 0);
+        }
+
+        // The rejected request leaves only a valid header, so startup stays
+        // serviceable instead of failing on Holt's own durable output.
+        let reopened = Tree::open(cfg).unwrap();
+        assert!(reopened.get(b"ordinary-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn rename_value_admission_stops_before_retaining_an_oversized_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        let tree = Tree::open(cfg).unwrap();
+        let value = vec![0xA5; 512];
+        tree.put(b"a", &value).unwrap();
+        tree.checkpoint().unwrap();
+        let journal = tree.journal.as_ref().unwrap();
+        let appends_before = journal.stats().appends;
+
+        let mut pending = (0..32)
+            .map(|index| {
+                let (src, dst): (&[u8], &[u8]) = if index % 2 == 0 {
+                    (b"a", b"b")
+                } else {
+                    (b"b", b"a")
+                };
+                crate::api::atomic::BatchOp::Rename {
+                    src: src.to_vec(),
+                    dst: dst.to_vec(),
+                    force: true,
+                    wal_value: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let static_bytes = super::encoded_batch_record_len(&pending);
+        let max_bytes = static_bytes + value.len() * 3;
+        let mut admission = super::BatchWalAdmission::new(static_bytes, max_bytes).unwrap();
+        let error = tree
+            .preflight_batch(&mut pending, 100, Some(&mut admission))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes: observed_max,
+            } if encoded_bytes == static_bytes + value.len() * 4
+                && observed_max == max_bytes
+        ));
+        let retained = pending
+            .iter()
+            .map(|op| match op {
+                crate::api::atomic::BatchOp::Rename { wal_value, .. } => {
+                    wal_value.as_ref().map_or(0, Vec::len)
+                }
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(retained, value.len() * 3);
+        assert!(retained <= max_bytes - static_bytes);
+        assert_eq!(tree.get(b"a").unwrap().as_deref(), Some(value.as_slice()));
+        assert!(tree.get(b"b").unwrap().is_none());
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(tree.store.dirty_count(), 0);
+    }
+
+    #[test]
+    fn prefix_run_admission_uses_exact_compressed_wire_size() {
+        const OPERATIONS: usize = 256;
+        const PREFIX_BYTES: usize = 65_530;
+        const KEY_BYTES: usize = PREFIX_BYTES + 4;
+        const RING_BYTES: usize = 16 * 1024 * 1024;
+
+        let prefix = vec![0xA6; PREFIX_BYTES];
+        let pending = (0..OPERATIONS)
+            .map(|index| {
+                let mut key = prefix.clone();
+                key.extend_from_slice(&(index as u32).to_le_bytes());
+                crate::api::atomic::BatchOp::Put {
+                    key,
+                    value: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let naive = super::BATCH_RECORD_ENVELOPE_LEN + OPERATIONS * (1 + 8 + 4 + KEY_BYTES + 4);
+        let exact = super::encoded_batch_record_len(&pending);
+        assert_eq!(naive, 16_781_093);
+        assert_eq!(exact, 68_656);
+        assert!(naive > RING_BYTES);
+        assert!(exact < RING_BYTES);
+        super::BatchWalAdmission::new(exact, RING_BYTES).unwrap();
+
+        let mut encoded = Vec::with_capacity(exact);
+        let mut encoder = BatchEncoder::begin(&mut encoded, 1, 0);
+        encoder.push_insert_prefix_run(
+            0,
+            &prefix,
+            OPERATIONS,
+            pending.iter().map(|op| match op {
+                crate::api::atomic::BatchOp::Put { key, value } => {
+                    (key.as_slice(), value.as_slice())
+                }
+                _ => unreachable!("test batch contains only puts"),
+            }),
+        );
+        assert_eq!(encoder.finish() as usize, OPERATIONS);
+        assert_eq!(encoded.len(), exact);
+
+        // The same v4 framing formula at 4,096 operations crosses the native
+        // ceiling only in the obsolete uncompressed estimate. The exact
+        // prefix-run record remains small and therefore definitely admissible.
+        const FULL_OPERATIONS: usize = 4_096;
+        const FULL_NAIVE: usize =
+            super::BATCH_RECORD_ENVELOPE_LEN + FULL_OPERATIONS * (1 + 8 + 4 + KEY_BYTES + 4);
+        const FULL_EXACT: usize = super::BATCH_RECORD_ENVELOPE_LEN
+            + (1 + 8 + 4 + 4 + PREFIX_BYTES)
+            + FULL_OPERATIONS * (4 + 4 + 4);
+        assert_eq!(FULL_NAIVE, 268_496_933);
+        assert_eq!(FULL_EXACT, 114_736);
+        const {
+            assert!(FULL_NAIVE > crate::DB::MAX_ATOMIC_RECORD_BYTES);
+            assert!(FULL_EXACT < crate::DB::MAX_ATOMIC_RECORD_BYTES);
+        }
+    }
+
+    #[test]
+    fn replayed_rename_uses_bound_value_when_checkpoint_already_has_final_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            tree.put(b"src", b"old").unwrap();
+            tree.checkpoint().unwrap();
+            tree.atomic(|batch| {
+                batch.rename(b"src", b"dst", true);
+                batch.put(b"src", b"new");
+            })
+            .unwrap();
+
+            // Persist the final blob image without truncating the WAL. This
+            // recreates the crash window where replay sees a checkpoint whose
+            // src already contains a later write from the same atomic record.
+            tree.flush_inline().unwrap();
+            let wal_path = cfg.wal_path().unwrap();
+            assert!(
+                std::fs::metadata(wal_path).unwrap().len()
+                    > crate::journal::codec::FILE_HEADER_SIZE as u64
+            );
+        }
+
+        let reopened = Tree::open(cfg).unwrap();
+        assert_eq!(reopened.get(b"dst").unwrap().as_deref(), Some(&b"old"[..]));
+        assert_eq!(reopened.get(b"src").unwrap().as_deref(), Some(&b"new"[..]));
     }
 
     #[test]
@@ -3443,6 +3796,273 @@ mod tests {
         inner: MemoryBlobStore,
         flush_calls: AtomicUsize,
         fail_flush_at: AtomicUsize,
+    }
+
+    struct CountingFlushStore {
+        inner: MemoryBlobStore,
+        flush_calls: AtomicUsize,
+    }
+
+    impl CountingFlushStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                flush_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlobStore for CountingFlushStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> crate::Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> crate::Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> crate::Result<()> {
+            self.flush_calls.fetch_add(1, Ordering::AcqRel);
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> crate::Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    #[test]
+    fn replay_bounds_root_ensure_window_and_keeps_only_current_root_pinned() {
+        const TREES: u64 = 128;
+        const DELETES_PER_TREE: u64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("root-pins.wal");
+        let mut ops = Vec::new();
+        for tree_id in 1..=TREES {
+            for delete in 0..DELETES_PER_TREE {
+                ops.push(WalOp::Erase {
+                    tree_id,
+                    key: delete.to_le_bytes().to_vec(),
+                });
+            }
+        }
+        // Revisit the first root after more than ENSURED_ROOT_WINDOW distinct
+        // roots. A bounded cache may repeat the idempotent ensure instead of
+        // retaining replay-lifetime state for every tree in the WAL.
+        ops.push(WalOp::Erase {
+            tree_id: 1,
+            key: b"revisit-after-window-eviction".to_vec(),
+        });
+        {
+            let mut writer = WalWriter::create(&wal_path, 0).unwrap();
+            writer.append(&WalOp::Batch { ops }, 1).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let store = Arc::new(CountingFlushStore::new());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let bm = Arc::new(BufferManager::new(store_dyn, 2));
+        let wal = std::fs::File::open(wal_path).unwrap();
+        let (next_seq, stats) = super::replay_wal(&wal, &bm, None, |tree_id| {
+            let mut guid = [0u8; 16];
+            guid[..8].copy_from_slice(&tree_id.to_le_bytes());
+            guid[15] = 0xA5;
+            Ok(guid)
+        })
+        .unwrap();
+
+        assert_eq!(stats.records_seen, 1);
+        assert_eq!(
+            next_seq,
+            2 + TREES * DELETES_PER_TREE,
+            "each logical delete consumes one derived sequence",
+        );
+        assert_eq!(
+            store.flush_calls.load(Ordering::Acquire),
+            TREES as usize + 1,
+            "a root is ensured once while resident and safely re-ensured after bounded eviction",
+        );
+        let cached = bm.cached_count();
+        let dirty = bm.dirty_count();
+        let pinned = (1..=TREES)
+            .filter(|tree_id| {
+                let mut guid = [0u8; 16];
+                guid[..8].copy_from_slice(&tree_id.to_le_bytes());
+                guid[15] = 0xA5;
+                bm.blob_is_pinned(guid)
+            })
+            .count();
+        assert!(
+            cached <= 2,
+            "clean no-op roots must stay within the configured cache budget: cached={cached}, dirty={dirty}, pinned={pinned}",
+        );
+        assert_eq!(dirty, 0);
+        assert_eq!(pinned, 0, "replay must release every current-op root pin");
+    }
+
+    #[cfg(target_os = "linux")]
+    const BOUNDED_REPLAY_DIR_ENV: &str = "HOLT_BOUNDED_REPLAY_DIR";
+    #[cfg(target_os = "linux")]
+    const BOUNDED_REPLAY_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const BOUNDED_REPLAY_OPS_PER_RECORD: usize = 1_280;
+
+    #[cfg(target_os = "linux")]
+    fn append_bounded_replay_record(path: &std::path::Path, seq: u64, marker: u8) -> usize {
+        use std::io::Write as _;
+
+        let value = vec![marker; u16::MAX as usize];
+        let mut record = Vec::new();
+        let mut encoder = BatchEncoder::begin(&mut record, seq, 0);
+        for _ in 0..BOUNDED_REPLAY_OPS_PER_RECORD {
+            encoder.push_insert(0, b"bounded-replay-key", &value);
+        }
+        assert_eq!(encoder.finish() as usize, BOUNDED_REPLAY_OPS_PER_RECORD);
+        assert!(record.len() as u64 > BOUNDED_REPLAY_HEADROOM_BYTES);
+        assert!(record.len() < crate::DB::MAX_ATOMIC_RECORD_BYTES);
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&record).unwrap();
+        file.sync_data().unwrap();
+        record.len()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_virtual_memory_bytes() -> u64 {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages = statm
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        // SAFETY: sysconf is read-only and _SC_PAGESIZE has no preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+        pages.checked_mul(page_size as u64).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peak_virtual_memory_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmPeak:"))
+            .and_then(|value| value.split_whitespace().next())
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        kib.checked_mul(1024).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child-process body for bounded_replay_memory_is_independent_of_record_and_wal_bytes"]
+    fn bounded_replay_memory_child() {
+        let Some(dir) = std::env::var_os(BOUNDED_REPLAY_DIR_ENV) else {
+            return;
+        };
+        let current = current_virtual_memory_bytes();
+        let peak_before = peak_virtual_memory_bytes();
+        let target = current.checked_add(BOUNDED_REPLAY_HEADROOM_BYTES).unwrap();
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `old` points to writable storage for one rlimit value.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut old) }, 0);
+        let target = if old.rlim_max == libc::RLIM_INFINITY {
+            target
+        } else {
+            target.min(old.rlim_max)
+        };
+        assert!(
+            target >= current + BOUNDED_REPLAY_HEADROOM_BYTES / 2,
+            "test environment must provide at least 32 MiB of address-space headroom",
+        );
+        let limit = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: target,
+        };
+        // SAFETY: the child deliberately narrows only its own address-space
+        // limit; it exits after this one recovery attempt.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+
+        let mut cfg = TreeConfig::new(std::path::PathBuf::from(dir));
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        cfg.buffer_pool_size = 4;
+        let tree = Tree::open(cfg).unwrap();
+        let value = tree.get(b"bounded-replay-key").unwrap().unwrap();
+        assert_eq!(value.len(), u16::MAX as usize);
+        assert!(value.iter().all(|byte| *byte == 0xD2));
+        let peak_after = peak_virtual_memory_bytes();
+        assert!(
+            peak_before > target || peak_after <= target,
+            "recovery VmPeak must remain inside its active RLIMIT_AS",
+        );
+        println!(
+            "bounded-replay-metrics current_bytes={current} peak_before_bytes={peak_before} rlimit_bytes={target} headroom_bytes={} peak_after_bytes={peak_after} value_bytes={}",
+            target - current,
+            value.len(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_replay_memory_is_independent_of_record_and_wal_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        cfg.buffer_pool_size = 4;
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            tree.checkpoint().unwrap();
+        }
+
+        let wal_path = cfg.wal_path().unwrap();
+        let first = append_bounded_replay_record(&wal_path, 1, 0xC1);
+        let second =
+            append_bounded_replay_record(&wal_path, 1 + BOUNDED_REPLAY_OPS_PER_RECORD as u64, 0xD2);
+        assert!(first as u64 > BOUNDED_REPLAY_HEADROOM_BYTES);
+        assert!(second as u64 > BOUNDED_REPLAY_HEADROOM_BYTES);
+        let wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_bytes > BOUNDED_REPLAY_HEADROOM_BYTES * 2);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "api::tree::tests::bounded_replay_memory_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(BOUNDED_REPLAY_DIR_ENV, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bounded replay child failed: status={}\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        eprintln!(
+            "bounded-replay-wal first_record_bytes={first} second_record_bytes={second} total_wal_bytes={wal_bytes} configured_headroom_bytes={BOUNDED_REPLAY_HEADROOM_BYTES}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        );
     }
 
     impl FailTrailingDeleteFlushStore {

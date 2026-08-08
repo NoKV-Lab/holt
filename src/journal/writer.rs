@@ -63,6 +63,8 @@ pub struct WalWriter {
     #[cfg(test)]
     fail_next_append: bool,
     #[cfg(test)]
+    fail_next_drain: bool,
+    #[cfg(test)]
     fail_next_sync: bool,
 }
 
@@ -91,6 +93,8 @@ impl WalWriter {
             #[cfg(test)]
             fail_next_append: false,
             #[cfg(test)]
+            fail_next_drain: false,
+            #[cfg(test)]
             fail_next_sync: false,
         })
     }
@@ -117,6 +121,8 @@ impl WalWriter {
             header,
             #[cfg(test)]
             fail_next_append: false,
+            #[cfg(test)]
+            fail_next_drain: false,
             #[cfg(test)]
             fail_next_sync: false,
         })
@@ -160,6 +166,8 @@ impl WalWriter {
                 #[cfg(test)]
                 fail_next_append: false,
                 #[cfg(test)]
+                fail_next_drain: false,
+                #[cfg(test)]
                 fail_next_sync: false,
             });
         }
@@ -181,6 +189,8 @@ impl WalWriter {
             header,
             #[cfg(test)]
             fail_next_append: false,
+            #[cfg(test)]
+            fail_next_drain: false,
             #[cfg(test)]
             fail_next_sync: false,
         })
@@ -271,6 +281,10 @@ impl WalWriter {
         if self.pending.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_drain) {
+            return Err(std::io::Error::other("injected WAL drain failure").into());
+        }
         self.file.write_all(&self.pending)?;
         self.bytes_written += self.pending.len() as u64;
         self.pending.clear();
@@ -284,8 +298,16 @@ impl WalWriter {
     /// filesystems used in CI / tests), durability falls back to
     /// whatever the OS provides — the bytes still land in the
     /// page cache.
+    #[cfg(test)]
     pub fn flush(&mut self) -> Result<()> {
         self.drain_to_os()?;
+        self.sync_data()
+    }
+
+    /// Run only the power-loss durability boundary for bytes already handed
+    /// to the OS. The journal coordinator calls this separately from
+    /// [`Self::drain_to_os`] so append and sync failures retain their phase.
+    pub(crate) fn sync_data(&mut self) -> Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_sync) {
             return Err(std::io::Error::other("injected WAL sync failure").into());
@@ -297,6 +319,11 @@ impl WalWriter {
     #[cfg(test)]
     pub(crate) fn fail_next_append(&mut self) {
         self.fail_next_append = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_drain(&mut self) {
+        self.fail_next_drain = true;
     }
 
     #[cfg(test)]

@@ -91,6 +91,31 @@ pub(crate) struct ReserveTicket {
     pub(crate) end: u64,
 }
 
+/// One exact contiguous physical-WAL prefix snapshot.
+///
+/// Both fields are captured while holding [`WalRing::advance`], so `records`
+/// is the cumulative record count corresponding exactly to byte prefix
+/// `[0, addr)`, never an independently sampled approximation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommittedPrefix {
+    pub(crate) addr: u64,
+    pub(crate) records: u64,
+}
+
+/// Result of publishing one reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublishOutcome {
+    pub(crate) prefix: CommittedPrefix,
+    pub(crate) advanced: bool,
+}
+
+/// Exact prefix copied by one flusher pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyOutcome {
+    pub(crate) bytes: u64,
+    pub(crate) prefix: CommittedPrefix,
+}
+
 impl ReserveTicket {
     #[inline]
     fn len(self) -> usize {
@@ -227,7 +252,7 @@ impl WalRing {
     /// Record `ticket`'s published interval and greedily fold the contiguous
     /// published prefix into `committed_addr`. MUST be called after `fill`
     /// (the memcpy happens-before this lock acquisition).
-    pub(crate) fn publish(&self, ticket: &ReserveTicket) {
+    pub(crate) fn publish(&self, ticket: &ReserveTicket) -> PublishOutcome {
         let mut adv = self.advance.lock().unwrap();
         adv.pending.insert(ticket.start, ticket.end);
         // Fold every contiguous published interval starting at committed_addr.
@@ -255,18 +280,46 @@ impl WalRing {
         // `adv` unlock = Release: this writer's memcpy (done before the lock)
         // happens-before any later folder's Acquire of `advance`, hence
         // before the flusher's Acquire of committed_addr.
+        PublishOutcome {
+            prefix: CommittedPrefix {
+                addr,
+                records: adv.committed_count,
+            },
+            advanced: addr != start_addr,
+        }
+    }
+
+    /// Capture the committed byte address and its record count under the
+    /// single prefix-folding lock.
+    pub(crate) fn committed_prefix_snapshot(&self) -> CommittedPrefix {
+        let adv = self.advance.lock().unwrap();
+        CommittedPrefix {
+            addr: self.committed_addr.load(Ordering::Relaxed),
+            records: adv.committed_count,
+        }
     }
 
     /// Copy the committed contiguous prefix `[flush_cursor, committed_addr)`
     /// into `sink` (once per contiguous physical run — twice on wrap).
     /// Advances `flush_cursor`. Returns bytes copied. Single-flusher only.
-    pub(crate) fn copy_committed_prefix(&self, sink: &mut impl FnMut(&[u8])) -> u64 {
-        // Acquire: synchronizes-with the publishing fold's Release store,
-        // making every byte in [0, committed_addr) visible here.
-        let committed = self.committed_addr.load(Ordering::Acquire);
+    pub(crate) fn copy_committed_prefix(&self, sink: &mut impl FnMut(&[u8])) -> CopyOutcome {
+        let prefix = self.committed_prefix_snapshot();
+        self.copy_prefix(prefix, sink)
+    }
+
+    /// Copy exactly `prefix`, which must have been captured by
+    /// [`Self::committed_prefix_snapshot`]. Publishers may extend the
+    /// committed range concurrently, but this pass never includes records
+    /// beyond the supplied `(addr, records)` pair.
+    pub(crate) fn copy_prefix(
+        &self,
+        prefix: CommittedPrefix,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> CopyOutcome {
+        let committed = prefix.addr;
         let from = self.flush_cursor.load(Ordering::Acquire);
         if committed <= from {
-            return 0;
+            return CopyOutcome { bytes: 0, prefix };
         }
         let total = (committed - from) as usize;
         let cap = self.buf.len();
@@ -283,7 +336,10 @@ impl WalRing {
             }
         }
         self.flush_cursor.store(committed, Ordering::Release);
-        total as u64
+        CopyOutcome {
+            bytes: total as u64,
+            prefix,
+        }
     }
 
     /// Reset the byte cursors to 0 after the ring has been fully drained
@@ -374,11 +430,13 @@ mod tests {
 
         let mut flushed = Vec::new();
         let copied = ring.copy_committed_prefix(&mut |s| flushed.extend_from_slice(s));
-        assert_eq!(copied, expected.len() as u64);
+        assert_eq!(copied.bytes, expected.len() as u64);
+        assert_eq!(copied.prefix.records, records.len() as u64);
         assert_eq!(flushed, expected, "flushed stream must equal record concat");
         // Second pass copies nothing (prefix already drained).
         assert_eq!(
-            ring.copy_committed_prefix(&mut |_| panic!("nothing to copy")),
+            ring.copy_committed_prefix(&mut |_| panic!("nothing to copy"))
+                .bytes,
             0
         );
     }
@@ -467,7 +525,7 @@ mod tests {
                 let mut out: Vec<u8> = Vec::new();
                 loop {
                     let n = ring.copy_committed_prefix(&mut |s| out.extend_from_slice(s));
-                    if n == 0 {
+                    if n.bytes == 0 {
                         if done.load(O::Acquire) && ring.committed_addr() == ring.flush_cursor() {
                             break;
                         }
@@ -648,7 +706,7 @@ mod tests {
                 let n = ring.copy_committed_prefix(&mut |s| {
                     writer.lock().unwrap().append_encoded(s).unwrap();
                 });
-                if n == 0 {
+                if n.bytes == 0 {
                     if stop.load(O::Acquire) && ring.flush_cursor() == ring.committed_addr() {
                         break;
                     }

@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 
 use super::codec::{
-    crc32, encode_file_header, FileHeader, FILE_HEADER_SIZE, FORMAT_VERSION, RECORD_MAGIC,
+    crc32, encode_file_header, encode_record, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
+    FORMAT_VERSION, MAX_ATOMIC_WAL_OPS, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE, RECORD_MAGIC,
 };
-use super::reader::replay;
+use super::reader::{replay, replay_bytes, replay_file};
 use super::wal_op::WalOp;
 use super::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
 use crate::api::errors::Error;
@@ -29,6 +30,7 @@ fn append_raw_record(out: &mut Vec<u8>, seq: u64, ty: u8, body: &[u8]) {
     out.extend_from_slice(body);
     let crc = crc32(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
 }
 
 fn sample_ops() -> Vec<WalOp> {
@@ -51,6 +53,7 @@ fn sample_ops() -> Vec<WalOp> {
             tree_id: 0,
             src_key: b"img/02.jpg".to_vec(),
             dst_key: b"img/02-renamed.jpg".to_vec(),
+            value: vec![0xBB; 64],
             force: false,
         },
     ]
@@ -282,8 +285,9 @@ fn mid_file_corruption_propagates_with_offset() {
     let len_pos = FILE_HEADER_SIZE + 4;
     let first_body_len =
         u32::from_le_bytes(bytes[len_pos..len_pos + 4].try_into().unwrap()) as usize;
-    let first_record_end = FILE_HEADER_SIZE + 17 + first_body_len + 4; // header(17) + body + CRC(4)
-                                                                       // Flip a bit deep inside the second record's body.
+    let first_record_end =
+        FILE_HEADER_SIZE + RECORD_HEADER_SIZE + first_body_len + RECORD_FOOTER_SIZE;
+    // Flip a bit deep inside the second record's body.
     bytes[first_record_end + 20] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
 
@@ -303,6 +307,463 @@ fn mid_file_corruption_propagates_with_offset() {
         }
         other => panic!("expected mid-file sanity failure, got {other:?}"),
     }
+}
+
+#[test]
+fn whole_wal_validation_rejects_late_corruption_before_any_callback() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Insert {
+            tree_id: 0,
+            key: b"good-before".to_vec(),
+            value: b"value".to_vec(),
+        },
+        1,
+        &mut bytes,
+    );
+    // A validly framed/CRC'd Insert with no body fails semantic validation.
+    append_raw_record(&mut bytes, 2, 0, &[]);
+    encode_record(
+        &WalOp::Insert {
+            tree_id: 0,
+            key: b"good-after".to_vec(),
+            value: b"value".to_vec(),
+        },
+        3,
+        &mut bytes,
+    );
+    fs::write(&path, &bytes).unwrap();
+
+    let mut callbacks = 0usize;
+    assert!(matches!(
+        replay(&path, |_, _, _| {
+            callbacks += 1;
+            Ok(())
+        }),
+        Err(Error::ReplaySanityFailed { .. })
+    ));
+    assert_eq!(
+        callbacks, 0,
+        "validation must precede every replay callback"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "corruption must not truncate"
+    );
+}
+
+#[test]
+fn corrupt_declared_length_cannot_hide_a_valid_acknowledged_suffix() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"first".to_vec(),
+        },
+        1,
+        &mut bytes,
+    );
+    let corrupt_offset = bytes.len();
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"middle".to_vec(),
+        },
+        2,
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"acknowledged-suffix".to_vec(),
+        },
+        3,
+        &mut bytes,
+    );
+    // Stay under the native record ceiling but extend beyond EOF. The v4
+    // footer and the independently valid suffix prove this is corruption,
+    // not a safely truncatable torn tail.
+    bytes[corrupt_offset + 4..corrupt_offset + 8].copy_from_slice(&1_000_000u32.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+
+    let mut callbacks = 0usize;
+    match replay(&path, |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    }) {
+        Err(Error::ReplaySanityFailed {
+            context,
+            record_offset,
+        }) => {
+            assert!(context.contains("truncated record"));
+            assert_eq!(record_offset, corrupt_offset as u64);
+        }
+        other => panic!("expected mid-log length corruption, got {other:?}"),
+    }
+    assert_eq!(callbacks, 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn corrupt_length_cannot_disguise_a_complete_semantically_invalid_frame_as_torn() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    let record_offset = bytes.len();
+    encode_record(
+        &WalOp::RenameObject {
+            tree_id: 0,
+            src_key: b"src".to_vec(),
+            dst_key: b"dst".to_vec(),
+            value: b"bound-value".to_vec(),
+            force: false,
+        },
+        1,
+        &mut bytes,
+    );
+
+    // First create a complete CRC/LEN2-valid frame whose force byte is outside
+    // the canonical 0/1 domain. Then corrupt only LEN in the leading header.
+    // Reconstructing LEN from LEN2 proves a complete frame existed, so this is
+    // corruption even though its semantic validation must fail.
+    let body_end = bytes.len() - RECORD_FOOTER_SIZE;
+    bytes[body_end - 1] = 2;
+    let checksum = crc32(&bytes[record_offset..body_end]);
+    bytes[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+    bytes[record_offset + 4..record_offset + 8].copy_from_slice(&1_000_000u32.to_le_bytes());
+
+    let mut slice_callbacks = 0;
+    let slice_result = replay_bytes(&bytes, &mut |_, _, _| {
+        slice_callbacks += 1;
+        Ok(())
+    });
+    assert!(
+        matches!(
+            slice_result,
+            Err(Error::ReplaySanityFailed {
+                context: "truncated record precedes validated WAL data",
+                ..
+            })
+        ),
+        "unexpected slice result: {slice_result:?}"
+    );
+    assert_eq!(slice_callbacks, 0);
+
+    fs::write(&path, &bytes).unwrap();
+    let mut file_callbacks = 0;
+    let file_result = replay(&path, |_, _, _| {
+        file_callbacks += 1;
+        Ok(())
+    });
+    assert!(matches!(
+        file_result,
+        Err(Error::ReplaySanityFailed {
+            context: "truncated record precedes validated WAL data",
+            ..
+        })
+    ));
+    assert_eq!(file_callbacks, 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn declared_length_above_native_ceiling_is_corruption_not_torn_tail() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    let record_offset = bytes.len();
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"bad-length".to_vec(),
+        },
+        1,
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"later".to_vec(),
+        },
+        2,
+        &mut bytes,
+    );
+    bytes[record_offset + 4..record_offset + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+
+    let mut callbacks = 0usize;
+    let error = replay(&path, |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::ReplaySanityFailed {
+            context: "record exceeds native atomic WAL ceiling",
+            record_offset: off,
+        } if off == record_offset as u64
+    ));
+    assert_eq!(callbacks, 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+fn batch_insert_run_body(batch_count: u32, run_count: Option<u32>) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&batch_count.to_le_bytes());
+    if let Some(run_count) = run_count {
+        body.push(11); // BatchInsertRun
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&run_count.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // key_len
+        body.extend_from_slice(&0u32.to_le_bytes()); // value_len
+    }
+    body
+}
+
+#[test]
+fn logical_operation_ceiling_is_bounded_and_reader_accepts_its_boundary() {
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    let count = u32::try_from(MAX_ATOMIC_WAL_OPS).unwrap();
+    append_raw_record(
+        &mut bytes,
+        1,
+        10,
+        &batch_insert_run_body(count, Some(count)),
+    );
+
+    let mut callbacks = 0usize;
+    let (_, stats) = replay_bytes(&bytes, &mut |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(callbacks, MAX_ATOMIC_WAL_OPS);
+    assert_eq!(stats.records_seen, 1);
+    assert_eq!(stats.highest_seq, Some(MAX_ATOMIC_WAL_OPS as u64));
+
+    let mut over = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut over,
+    );
+    append_raw_record(&mut over, 1, 10, &batch_insert_run_body(count + 1, None));
+    let mut rejected_callbacks = 0usize;
+    let error = replay_bytes(&over, &mut |_, _, _| {
+        rejected_callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(error, Error::ReplaySanityFailed { .. }));
+    assert_eq!(rejected_callbacks, 0);
+}
+
+#[test]
+fn overflowing_batch_sequence_range_is_rejected_before_callbacks() {
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    // Sequence overflow is rejected from the outer count before the decoder
+    // attempts to visit either primitive.
+    append_raw_record(&mut bytes, u64::MAX, 10, &batch_insert_run_body(2, None));
+    let mut callbacks = 0usize;
+    let error = replay_bytes(&bytes, &mut |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(error, Error::ReplaySanityFailed { .. }));
+    assert_eq!(callbacks, 0);
+
+    let mut primitive = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut primitive,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"max-seq".to_vec(),
+        },
+        u64::MAX,
+        &mut primitive,
+    );
+    let mut primitive_callbacks = 0usize;
+    assert!(matches!(
+        replay_bytes(&primitive, &mut |_, _, _| {
+            primitive_callbacks += 1;
+            Ok(())
+        }),
+        Err(Error::ReplaySanityFailed { .. })
+    ));
+    assert_eq!(primitive_callbacks, 0);
+
+    let mut last_inner_is_max = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut last_inner_is_max,
+    );
+    append_raw_record(
+        &mut last_inner_is_max,
+        u64::MAX - 1,
+        10,
+        &batch_insert_run_body(2, Some(2)),
+    );
+    let mut batch_callbacks = 0usize;
+    assert!(matches!(
+        replay_bytes(&last_inner_is_max, &mut |_, _, _| {
+            batch_callbacks += 1;
+            Ok(())
+        }),
+        Err(Error::ReplaySanityFailed { .. })
+    ));
+    assert_eq!(batch_callbacks, 0);
+}
+
+#[test]
+fn replay_high_water_is_maximum_not_physical_record_order() {
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"high".to_vec(),
+        },
+        10,
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::Erase {
+            tree_id: 0,
+            key: b"low".to_vec(),
+        },
+        3,
+        &mut bytes,
+    );
+    let (_, stats) = replay_bytes(&bytes, &mut |_, _, _| Ok(())).unwrap();
+    assert_eq!(stats.records_seen, 2);
+    assert_eq!(stats.highest_seq, Some(10));
+}
+
+#[test]
+#[ignore = "165 MiB full provider-envelope qualification"]
+fn full_nokv_rename_envelope_streams_with_exact_v4_wire_size() {
+    const KEY_BYTES: usize = 8_205;
+    const VALUE_BYTES: usize = 61_493;
+    const OPERATIONS: usize = 2_128;
+    const EXPECTED_RECORD_BYTES: usize = 165_824_437;
+
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    let record_start = bytes.len();
+    let src = vec![0x51; KEY_BYTES];
+    let dst = vec![0x52; KEY_BYTES];
+    let value = vec![0x53; VALUE_BYTES];
+    let mut encoder = BatchEncoder::begin(&mut bytes, 1, 0);
+    for _ in 0..OPERATIONS {
+        encoder.push_rename_object(0, &src, &dst, &value, true);
+    }
+    assert_eq!(encoder.finish() as usize, OPERATIONS);
+    assert_eq!(bytes.len() - record_start, EXPECTED_RECORD_BYTES);
+    const {
+        assert!(EXPECTED_RECORD_BYTES < crate::DB::MAX_ATOMIC_RECORD_BYTES);
+    }
+    fs::write(&path, &bytes).unwrap();
+    drop(bytes);
+
+    let mut callbacks = 0usize;
+    let (_, stats) = replay(&path, |op, seq, _| {
+        let WalOp::RenameObject {
+            src_key,
+            dst_key,
+            value,
+            force,
+            ..
+        } = op
+        else {
+            panic!("expected RenameObject");
+        };
+        assert_eq!(src_key.len(), KEY_BYTES);
+        assert_eq!(dst_key.len(), KEY_BYTES);
+        assert_eq!(value.len(), VALUE_BYTES);
+        assert!(*force);
+        assert_eq!(seq, 1 + callbacks as u64);
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(callbacks, OPERATIONS);
+    assert_eq!(stats.records_seen, 1);
+    assert_eq!(stats.highest_seq, Some(OPERATIONS as u64));
 }
 
 #[test]
@@ -364,7 +825,9 @@ fn rejected_file_with_unsupported_version() {
 
     let mut bogus = vec![0u8; FILE_HEADER_SIZE];
     bogus[0..4].copy_from_slice(&super::codec::FILE_MAGIC.to_le_bytes());
-    bogus[4..8].copy_from_slice(&999u32.to_le_bytes());
+    // Format v4 deliberately has no dual-read path for v3: RenameObject's
+    // payload and the record footer both changed, so startup must fail closed.
+    bogus[4..8].copy_from_slice(&(FORMAT_VERSION - 1).to_le_bytes());
     fs::write(&path, &bogus).unwrap();
 
     match replay(&path, |_, _, _| Ok(())) {
@@ -373,6 +836,122 @@ fn rejected_file_with_unsupported_version() {
         }
         other => panic!("expected version mismatch, got {other:?}"),
     }
+}
+
+#[test]
+fn owner_mismatch_is_rejected_before_any_callback_or_file_change() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut writer = WalWriter::create(&path, 7).unwrap();
+    writer
+        .append(
+            &WalOp::Insert {
+                tree_id: 7,
+                key: b"wrong-owner".to_vec(),
+                value: b"value".to_vec(),
+            },
+            1,
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let before = fs::read(&path).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let mut callbacks = 0;
+    let result = replay_file(&file, 0, None, |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::ReplaySanityFailed {
+            context: "WAL file tree_id mismatch on open",
+            record_offset: 0,
+        })
+    ));
+    assert_eq!(callbacks, 0);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn late_standalone_record_owner_mismatch_is_rejected_before_any_callback() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut writer = WalWriter::create(&path, 0).unwrap();
+    for (seq, tree_id) in [(1, 0), (2, 9)] {
+        writer
+            .append(
+                &WalOp::Insert {
+                    tree_id,
+                    key: format!("owner-{tree_id}").into_bytes(),
+                    value: b"value".to_vec(),
+                },
+                seq,
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let before = fs::read(&path).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let mut callbacks = 0;
+    let result = replay_file(&file, 0, Some(0), |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::ReplaySanityFailed {
+            context: "WAL record tree_id does not belong to this Tree",
+            ..
+        })
+    ));
+    assert_eq!(callbacks, 0);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn noncanonical_rename_force_is_rejected_before_any_callback() {
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    encode_record(
+        &WalOp::RenameObject {
+            tree_id: 0,
+            src_key: b"src".to_vec(),
+            dst_key: b"dst".to_vec(),
+            value: b"value".to_vec(),
+            force: false,
+        },
+        1,
+        &mut bytes,
+    );
+    let record_start = FILE_HEADER_SIZE;
+    let body_end = bytes.len() - RECORD_FOOTER_SIZE;
+    bytes[body_end - 1] = 2;
+    let checksum = crc32(&bytes[record_start..body_end]);
+    bytes[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+
+    let mut callbacks = 0;
+    let result = replay_bytes(&bytes, &mut |_, _, _| {
+        callbacks += 1;
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::ReplaySanityFailed {
+            context: "RenameObject force flag is not canonical",
+            ..
+        })
+    ));
+    assert_eq!(callbacks, 0);
 }
 
 #[test]

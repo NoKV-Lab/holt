@@ -8,7 +8,7 @@
 //! WAL record.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use super::atomic::{BatchOp, RecordVersion};
@@ -17,11 +17,14 @@ use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::snapshot::Snapshot;
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
-use super::tree::{ensure_durable_root_blob, replay_wal, Tree, TreeRuntime};
+use super::tree::{
+    encoded_batch_inner_len, ensure_durable_root_blob, replay_wal, reserve_seq_range,
+    validate_atomic_op_count, BatchWalAdmission, Tree, TreeRuntime,
+};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
-use crate::journal::codec::{BatchEncoder, MAX_ATOMIC_WAL_RECORD_BYTES};
+use crate::journal::codec::{BatchEncoder, MAX_ATOMIC_WAL_OPS, MAX_ATOMIC_WAL_RECORD_BYTES};
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::{BlobStore, FileBlobStore, FileStoreObjectIdentity};
@@ -149,6 +152,15 @@ pub struct DB {
     catalog_cache: Arc<Mutex<HashMap<String, CatalogEntry>>>,
 }
 
+/// Native limits for one all-or-nothing Holt WAL record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicRecordCapability {
+    /// Maximum final encoded record bytes, including Holt framing.
+    pub max_encoded_bytes: usize,
+    /// Maximum logical primitive operations inside the record.
+    pub max_operations: usize,
+}
+
 impl std::fmt::Debug for DB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DB")
@@ -164,6 +176,8 @@ impl DB {
     /// above the ordinary journal ring use an on-demand, strictly ordered lane;
     /// Holt never splits one logical atomic batch across WAL records.
     pub const MAX_ATOMIC_RECORD_BYTES: usize = MAX_ATOMIC_WAL_RECORD_BYTES;
+    /// Maximum logical primitive operations in one native atomic record.
+    pub const MAX_ATOMIC_RECORD_OPERATIONS: usize = MAX_ATOMIC_WAL_OPS;
 
     /// Return Holt's native single-record atomic commit ceiling.
     ///
@@ -172,6 +186,16 @@ impl DB {
     #[must_use]
     pub const fn native_atomic_record_ceiling() -> usize {
         Self::MAX_ATOMIC_RECORD_BYTES
+    }
+
+    /// Return the complete native atomic-record offer for provider
+    /// negotiation. Both limits are enforced before tree mutation.
+    #[must_use]
+    pub const fn native_atomic_record_capability() -> AtomicRecordCapability {
+        AtomicRecordCapability {
+            max_encoded_bytes: Self::MAX_ATOMIC_RECORD_BYTES,
+            max_operations: Self::MAX_ATOMIC_RECORD_OPERATIONS,
+        }
     }
 
     /// Return the kernel-object identity of this DB's held file store.
@@ -229,8 +253,9 @@ impl DB {
                 let wal_len = wal.metadata()?.len();
                 let next_seq = if wal_len != 0 {
                     let start = std::time::Instant::now();
-                    let (next_seq, replay_stats) =
-                        replay_wal(&wal, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                    let (next_seq, replay_stats) = replay_wal(&wal, &bm, None, |tree_id| {
+                        Ok(root_guid_for_tree_id(tree_id))
+                    })?;
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -1062,7 +1087,7 @@ impl DB {
 
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let groups = self.group_batch_ops(pending)?;
+        let mut groups = self.group_batch_ops(pending)?;
         let mut gates = groups
             .iter()
             .map(|group| (group.tree_id, group.tree.mutation_gate()))
@@ -1079,9 +1104,22 @@ impl DB {
                 self.store.flush_write_deltas_for_tree(group.tree_id)?;
             }
         }
-        let count = count_wal_ops(&groups);
-        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
-        if !Self::preflight_batch_groups(&groups, base_seq)? {
+        let count = validate_atomic_op_count(
+            usize::try_from(count_wal_ops(&groups))
+                .map_err(|_| Error::Internal("DB atomic operation count overflow"))?,
+        )?;
+        let base_seq = reserve_seq_range(&self.next_seq, count)?;
+        let mut wal_admission = self
+            .journal
+            .as_ref()
+            .map(|journal| {
+                BatchWalAdmission::new(
+                    encoded_db_batch_record_len(&groups),
+                    journal.max_record_bytes(),
+                )
+            })
+            .transpose()?;
+        if !Self::preflight_batch_groups(&mut groups, base_seq, wal_admission.as_mut())? {
             return Ok(false);
         }
         if count == 0 {
@@ -1125,13 +1163,26 @@ impl DB {
         Ok(groups)
     }
 
-    fn preflight_batch_groups(groups: &[DBBatchGroup], base_seq: u64) -> Result<bool> {
+    fn preflight_batch_groups(
+        groups: &mut [DBBatchGroup],
+        base_seq: u64,
+        wal_admission: Option<&mut BatchWalAdmission>,
+    ) -> Result<bool> {
         let mut group_base = base_seq;
+        let mut wal_admission = wal_admission;
         for group in groups {
-            if !group.tree.preflight_batch(&group.ops, group_base)? {
+            if !group.tree.preflight_batch(
+                &mut group.ops,
+                group_base,
+                wal_admission.as_deref_mut(),
+            )? {
                 return Ok(false);
             }
-            group_base += count_group_wal_ops(group);
+            group_base = group_base.checked_add(count_group_wal_ops(group)).ok_or(
+                Error::WalSequenceExhausted {
+                    requested: count_group_wal_ops(group),
+                },
+            )?;
         }
         Ok(true)
     }
@@ -1151,7 +1202,11 @@ impl DB {
                 group
                     .tree
                     .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
-                group_base += count_group_wal_ops(group);
+                group_base = group_base.checked_add(count_group_wal_ops(group)).ok_or(
+                    Error::WalSequenceExhausted {
+                        requested: count_group_wal_ops(group),
+                    },
+                )?;
             }
             let _n = enc.finish();
             journal.submit(record, self.cfg.durability.wal_sync())?
@@ -1169,7 +1224,11 @@ impl DB {
             group
                 .tree
                 .apply_batch_walker_inline(&group.ops, group_base, None)?;
-            group_base += count_group_wal_ops(group);
+            group_base = group_base.checked_add(count_group_wal_ops(group)).ok_or(
+                Error::WalSequenceExhausted {
+                    requested: count_group_wal_ops(group),
+                },
+            )?;
         }
         drop(commit);
         if self.cfg.memory_flush_on_write {
@@ -1196,14 +1255,27 @@ impl DB {
                 open
             }
         };
-        let groups = vec![DBBatchGroup {
+        let mut groups = vec![DBBatchGroup {
             tree_id,
             tree: self.tree_from_state(tree_id, open)?,
             ops,
         }];
-        let count = count_wal_ops(&groups);
-        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
-        if !Self::preflight_batch_groups(&groups, base_seq)? {
+        let count = validate_atomic_op_count(
+            usize::try_from(count_wal_ops(&groups))
+                .map_err(|_| Error::Internal("DB atomic operation count overflow"))?,
+        )?;
+        let base_seq = reserve_seq_range(&self.next_seq, count)?;
+        let mut wal_admission = self
+            .journal
+            .as_ref()
+            .map(|journal| {
+                BatchWalAdmission::new(
+                    encoded_db_batch_record_len(&groups),
+                    journal.max_record_bytes(),
+                )
+            })
+            .transpose()?;
+        if !Self::preflight_batch_groups(&mut groups, base_seq, wal_admission.as_mut())? {
             return Err(Error::Internal("system DB batch preflight failed"));
         }
         if let Some(journal) = &self.journal {
@@ -1349,6 +1421,7 @@ impl DBAtomicBatch {
                 src: src.to_vec(),
                 dst: dst.to_vec(),
                 force,
+                wal_value: None,
             },
         );
     }
@@ -1374,29 +1447,7 @@ impl DBAtomicBatch {
 fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
     let mut len = crate::journal::codec::RECORD_HEADER_SIZE + 8 + 4;
     for group in groups {
-        for op in &group.ops {
-            let op_len = match op {
-                BatchOp::Put { key, value }
-                | BatchOp::PutIfAbsent { key, value }
-                | BatchOp::CompareAndPut { key, value, .. } => (1usize + 8 + 4)
-                    .saturating_add(key.len())
-                    .saturating_add(4)
-                    .saturating_add(value.len()),
-                BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
-                    (1usize + 8 + 4).saturating_add(key.len())
-                }
-                BatchOp::Rename { src, dst, .. } => (1usize + 8 + 4)
-                    .saturating_add(src.len())
-                    .saturating_add(4)
-                    .saturating_add(dst.len())
-                    .saturating_add(1),
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
-            };
-            // Insert run encodings only remove repeated framing/prefix bytes,
-            // so the per-op shape above is a proven upper bound for the final
-            // compact Batch record without running the walker twice.
-            len = len.saturating_add(op_len);
-        }
+        len = len.saturating_add(encoded_batch_inner_len(&group.ops));
     }
     len.saturating_add(crate::journal::codec::RECORD_FOOTER_SIZE)
 }
@@ -1517,17 +1568,33 @@ mod tests {
 
     #[test]
     fn native_atomic_record_ceiling_covers_nokv_legal_envelope() {
-        // Frozen integration envelope, intentionally copied as a number so
-        // Holt's provider capability test does not depend on the NoKV crate.
-        const NOKV_MAX_ENCODED_COMMAND_BYTES: usize = 148_317_344;
+        // Frozen provider envelope, expressed from the public command limits
+        // rather than importing the NoKV crate. Include Holt v4 framing and
+        // the largest WAL primitive: RenameObject carries two maximum keys
+        // plus the commit-time value captured for deterministic redo.
+        const MAX_KEY_BYTES: usize = 8_205;
+        const MAX_VALUE_BYTES: usize = 61_493;
+        const MAX_OPERATIONS: usize = 2_128;
+        const OUTER_BATCH_BYTES: usize = 17 + 8 + 4 + 8;
+        const PUT_BYTES: usize = 1 + 8 + 4 + MAX_KEY_BYTES + 4 + MAX_VALUE_BYTES;
+        const RENAME_BYTES: usize =
+            1 + 8 + 4 + MAX_KEY_BYTES + 4 + MAX_KEY_BYTES + 4 + MAX_VALUE_BYTES + 1;
+        const ALL_PUT_RECORD_BYTES: usize = OUTER_BATCH_BYTES + MAX_OPERATIONS * PUT_BYTES;
+        const ALL_RENAME_RECORD_BYTES: usize = OUTER_BATCH_BYTES + MAX_OPERATIONS * RENAME_BYTES;
 
         assert_eq!(DB::native_atomic_record_ceiling(), 256 * 1024 * 1024);
         assert_eq!(
             DB::MAX_ATOMIC_RECORD_BYTES,
             DB::native_atomic_record_ceiling()
         );
+        assert_eq!(ALL_PUT_RECORD_BYTES, 148_353_557);
+        assert_eq!(ALL_RENAME_RECORD_BYTES, 165_824_437);
+        let capability = DB::native_atomic_record_capability();
+        assert_eq!(capability.max_encoded_bytes, DB::MAX_ATOMIC_RECORD_BYTES);
+        assert_eq!(capability.max_operations, DB::MAX_ATOMIC_RECORD_OPERATIONS);
         const {
-            assert!(NOKV_MAX_ENCODED_COMMAND_BYTES < DB::MAX_ATOMIC_RECORD_BYTES);
+            assert!(ALL_RENAME_RECORD_BYTES < DB::MAX_ATOMIC_RECORD_BYTES);
+            assert!(MAX_OPERATIONS <= DB::MAX_ATOMIC_RECORD_OPERATIONS);
         }
     }
 
@@ -2089,7 +2156,7 @@ mod tests {
             .unwrap()
             .expect("created tree id");
         let root_guid = root_guid_for_tree_id(tree_id);
-        let seq = db.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = db.next_seq.fetch_add(1, AtomicOrdering::Relaxed);
         db.store
             .stage_write_delta_put(tree_id, root_guid, b"key", b"checkpoint-value", seq, false);
 

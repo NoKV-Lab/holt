@@ -72,6 +72,20 @@ pub enum Error {
         /// Maximum encoded bytes accepted as one native atomic WAL record.
         max_bytes: usize,
     },
+    /// One atomic WAL record contains more logical primitive operations than
+    /// Holt can replay with a bounded CPU contract.
+    AtomicRecordTooManyOperations {
+        /// Logical operations requested by the caller.
+        operations: usize,
+        /// Maximum logical operations accepted in one record.
+        max_operations: usize,
+    },
+    /// The monotonic WAL sequence space cannot reserve the requested range.
+    /// This is a definite pre-mutation rejection.
+    WalSequenceExhausted {
+        /// Number of consecutive sequence values requested.
+        requested: u64,
+    },
     /// A WAL append or sync failed after the operation crossed its commit
     /// boundary, so recovery may expose either the old or the new state.
     CommitOutcomeUnknown {
@@ -231,6 +245,17 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "atomic WAL record too large ({encoded_bytes} encoded bytes; max {max_bytes})"
+            ),
+            Self::AtomicRecordTooManyOperations {
+                operations,
+                max_operations,
+            } => write!(
+                f,
+                "atomic WAL record has too many operations ({operations}; max {max_operations})"
+            ),
+            Self::WalSequenceExhausted { requested } => write!(
+                f,
+                "WAL sequence space exhausted while reserving {requested} operations"
             ),
             Self::CommitOutcomeUnknown { phase, context } => {
                 let phase = match phase {

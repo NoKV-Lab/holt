@@ -96,6 +96,9 @@ pub(crate) enum BatchOp {
         src: Vec<u8>,
         dst: Vec<u8>,
         force: bool,
+        /// Source value frozen by batch preflight before mutation. This is
+        /// internal WAL planning state, never supplied by callers.
+        wal_value: Option<Vec<u8>>,
     },
 }
 
@@ -190,6 +193,7 @@ impl AtomicBatch {
             src: src.to_vec(),
             dst: dst.to_vec(),
             force,
+            wal_value: None,
         });
     }
 

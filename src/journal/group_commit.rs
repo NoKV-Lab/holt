@@ -37,13 +37,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::api::errors::{CommitPhase, Error, Result};
 use crate::store::blob_store::file::{FileBlobStore, FileStoreHealth, FileStoreHealthPermit};
 
 use super::codec::MAX_ATOMIC_WAL_RECORD_BYTES;
-use super::ring::{ReserveTicket, WalRing};
+use super::ring::{CommittedPrefix, ReserveTicket, WalRing};
 use super::writer::WalWriter;
 
 /// Production journal counters surfaced through `Tree::stats`.
@@ -66,13 +66,17 @@ const RING_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
 /// Flusher idle poll. Bounds the async RAM→page-cache window (process-crash
 /// durability) and the latency a sync waiter adds if a wake is ever missed.
 const FLUSH_POLL: Duration = Duration::from_micros(50);
+const ORDERED_CONTROL_CAPACITY: usize = 1;
+const WAKE_CAPACITY: usize = 1;
 const RECORD_BUFFER_POOL_LIMIT: usize = 1024;
 const RECORD_BUFFER_RETAIN_MAX: usize = 64 * 1024;
 
-/// Control messages to the flusher (rare — never per async append).
+/// Strictly ordered control messages to the flusher.
+///
+/// Prompt drain wakes use a separate coalesced one-token channel; dropping a
+/// redundant wake can never drop, reorder, or make one of these commands
+/// unreachable.
 enum Control {
-    /// Wake to drain + (if a sync target is outstanding) fsync.
-    Flush,
     /// Drain, then truncate the WAL to its header and reset the ring.
     Truncate(Sender<Result<()>>),
     /// Drain the preceding ring prefix, append one oversized record directly,
@@ -288,11 +292,25 @@ struct Shared {
     /// Condvar handshake for writers parked on ring backpressure.
     space_mx: Mutex<()>,
     space_cv: Condvar,
+    /// Condvar handshake for an out-of-order publisher waiting until its byte
+    /// ticket joins the contiguous physical prefix.
+    prefix_mx: Mutex<()>,
+    prefix_cv: Condvar,
+    prefix_waiters: AtomicUsize,
 
     control_tx: Sender<Control>,
+    wake_tx: Sender<()>,
     record_pool: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     shutdown_barrier: Mutex<Option<Arc<JournalShutdownBarrier>>>,
+    #[cfg(test)]
+    submit_pauses: Mutex<Vec<SubmitPause>>,
+    #[cfg(test)]
+    before_drain_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
+    #[cfg(test)]
+    after_snapshot_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
+    #[cfg(test)]
+    before_sync_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
 }
 
 /// Buffer admitted before a tree mutation begins.
@@ -414,6 +432,62 @@ impl JournalShutdownBarrier {
     }
 }
 
+/// One-shot deterministic barrier used by WAL interleaving tests.
+#[cfg(test)]
+#[derive(Debug)]
+struct JournalTestBarrier {
+    entered_tx: Sender<()>,
+    entered_rx: Receiver<()>,
+    release_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+#[cfg(test)]
+impl JournalTestBarrier {
+    fn new() -> Arc<Self> {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        Arc::new(Self {
+            entered_tx,
+            entered_rx,
+            release_tx,
+            release_rx,
+        })
+    }
+
+    fn pause(&self) {
+        let _ = self.entered_tx.send(());
+        let _ = self.release_rx.recv();
+    }
+
+    fn wait(&self) {
+        self.entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("journal test barrier was not reached");
+    }
+
+    fn release(&self) {
+        self.release_tx
+            .send(())
+            .expect("journal test barrier waiter disappeared");
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitPauseStage {
+    AfterReserve,
+    AfterPublish,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SubmitPause {
+    seq: u64,
+    stage: SubmitPauseStage,
+    barrier: Arc<JournalTestBarrier>,
+}
+
 impl Shared {
     fn enter_file_store_health(&self) -> Result<Option<FileStoreHealthPermit<'_>>> {
         self.file_store_health
@@ -433,8 +507,90 @@ impl Shared {
         }
         drop(slot);
         // Wake any sync waiters so they observe the error.
-        let _g = self.flushed_mx.lock().unwrap();
+        let flushed_guard = self.flushed_mx.lock().unwrap();
         self.flushed_cv.notify_all();
+        drop(flushed_guard);
+        let _prefix_guard = self.prefix_mx.lock().unwrap();
+        self.prefix_cv.notify_all();
+    }
+
+    #[cfg(test)]
+    fn pause_submit(&self, record: &[u8], stage: SubmitPauseStage) {
+        if record.len() < 16 {
+            return;
+        }
+        let seq = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let barrier = {
+            let mut pauses = self.submit_pauses.lock().unwrap();
+            pauses
+                .iter()
+                .position(|pause| pause.seq == seq && pause.stage == stage)
+                .map(|position| pauses.remove(position).barrier)
+        };
+        if let Some(barrier) = barrier {
+            barrier.pause();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_once(slot: &Mutex<Option<Arc<JournalTestBarrier>>>) {
+        let barrier = slot.lock().unwrap().take();
+        if let Some(barrier) = barrier {
+            barrier.pause();
+        }
+    }
+
+    fn physical_target(&self, prefix: CommittedPrefix) -> u64 {
+        self.record_base
+            .saturating_add(prefix.records)
+            .saturating_add(self.oversized_records.load(Ordering::Acquire))
+    }
+
+    fn notify_prefix_advanced(&self) {
+        if self.prefix_waiters.load(Ordering::Acquire) != 0 {
+            let _guard = self.prefix_mx.lock().unwrap();
+            self.prefix_cv.notify_all();
+        }
+    }
+
+    fn wait_for_ticket_prefix(
+        &self,
+        ticket: &ReserveTicket,
+        published: CommittedPrefix,
+    ) -> std::result::Result<CommittedPrefix, JournalFailure> {
+        if published.addr >= ticket.end {
+            return Ok(published);
+        }
+
+        self.prefix_waiters.fetch_add(1, Ordering::AcqRel);
+        let result = (|| {
+            let mut guard = self.prefix_mx.lock().unwrap();
+            loop {
+                let prefix = self.ring.committed_prefix_snapshot();
+                if prefix.addr >= ticket.end {
+                    return Ok(prefix);
+                }
+                if let Some(failure) = self.sticky_err() {
+                    return Err(failure);
+                }
+                guard = self.prefix_cv.wait(guard).unwrap();
+            }
+        })();
+        self.prefix_waiters.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn request_wake(
+        &self,
+        disconnected: JournalFailure,
+    ) -> std::result::Result<(), JournalFailure> {
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Err(TrySendError::Disconnected(())) => {
+                self.set_err(disconnected);
+                Err(disconnected)
+            }
+        }
     }
 
     /// Drain the committed prefix into the writer; if a sync target is
@@ -443,19 +599,15 @@ impl Shared {
         if self.sticky_err().is_some() {
             return;
         }
-        // Read the record count BEFORE copying: copy reads committed_addr,
-        // which (addr-before-records publish ordering) is >= end(rc), so the
-        // copy drains >= rc records and `base + rc` is a safe lower bound.
-        let rc = self.ring.committed_records();
-        let written_to = self
-            .record_base
-            .saturating_add(rc)
-            .saturating_add(self.oversized_records.load(Ordering::Acquire));
-
         let mut sink_err: Option<&'static str> = None;
         {
             let mut w = self.writer.lock().unwrap();
-            let copied = self.ring.copy_committed_prefix(&mut |bytes| {
+            let prefix = self.ring.committed_prefix_snapshot();
+            #[cfg(test)]
+            if prefix.addr > self.ring.flush_cursor() {
+                Self::pause_once(&self.after_snapshot_barrier);
+            }
+            let copied = self.ring.copy_prefix(prefix, &mut |bytes| {
                 if sink_err.is_none() && w.append_encoded(bytes).is_err() {
                     sink_err = Some("journal flusher append failed");
                 }
@@ -468,7 +620,19 @@ impl Shared {
                 });
                 return;
             }
-            if copied > 0 {
+            if copied.bytes > 0 {
+                // wal_sync=false still promises prompt process-crash
+                // durability: every poll batch reaches the OS page cache,
+                // without implying sync_data/power-loss durability.
+                if w.drain_to_os().is_err() {
+                    drop(w);
+                    self.set_err(JournalFailure {
+                        phase: CommitPhase::WalAppend,
+                        context: "journal flusher page-cache drain failed",
+                    });
+                    return;
+                }
+                let written_to = self.physical_target(copied.prefix);
                 self.written.fetch_max(written_to, Ordering::AcqRel);
                 self.batches.fetch_add(1, Ordering::Relaxed);
                 // Publish the freed ring space before a durability gate can
@@ -479,6 +643,7 @@ impl Shared {
             }
             let sync_target = self.sync_target.load(Ordering::Acquire);
             let flushed = self.flushed.load(Ordering::Acquire);
+            let written_to = self.written.load(Ordering::Acquire);
             let want_sync = sync_target > flushed && written_to >= sync_target;
             if want_sync {
                 // Appending already-accepted records may be needed to free
@@ -492,11 +657,13 @@ impl Shared {
                     });
                     return;
                 };
-                if w.flush().is_err() {
+                #[cfg(test)]
+                Self::pause_once(&self.before_sync_barrier);
+                if w.sync_data().is_err() {
                     drop(w);
                     self.set_err(JournalFailure {
                         phase: CommitPhase::WalSync,
-                        context: "journal flusher fsync failed",
+                        context: "journal flusher sync_data failed",
                     });
                     return;
                 }
@@ -518,27 +685,19 @@ impl Shared {
         &self,
         ticket: &ReserveTicket,
     ) -> std::result::Result<(), JournalFailure> {
-        if self.control_tx.send(Control::Flush).is_err() {
-            let failure = JournalFailure {
-                phase: CommitPhase::WalAppend,
-                context: "journal flusher stopped during WAL ring backpressure",
-            };
-            self.set_err(failure);
-            return Err(failure);
-        }
+        self.request_wake(JournalFailure {
+            phase: CommitPhase::WalAppend,
+            context: "journal flusher stopped during WAL ring backpressure",
+        })?;
         let mut guard = self.space_mx.lock().unwrap();
         while !self.ring.reserve_space_ready(ticket) {
             if let Some(failure) = self.sticky_err() {
                 return Err(failure);
             }
-            if self.control_tx.send(Control::Flush).is_err() {
-                let failure = JournalFailure {
-                    phase: CommitPhase::WalAppend,
-                    context: "journal flusher stopped during WAL ring backpressure",
-                };
-                self.set_err(failure);
-                return Err(failure);
-            }
+            self.request_wake(JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "journal flusher stopped during WAL ring backpressure",
+            })?;
             let (next, _timeout) = self
                 .space_cv
                 .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
@@ -567,11 +726,7 @@ impl Shared {
         // Wake the flusher. A disconnected receiver is an acknowledgement
         // failure, not an advisory miss: no worker remains to advance the
         // requested append/fsync boundary.
-        if self.control_tx.send(Control::Flush).is_err() {
-            let failure = self.stopped_before_target(target);
-            self.set_err(failure);
-            return Err(failure);
-        }
+        self.request_wake(self.stopped_before_target(target))?;
         let mut guard = self.flushed_mx.lock().unwrap();
         loop {
             if let Some(failure) = self.sticky_err() {
@@ -594,11 +749,10 @@ impl Shared {
                 .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
                 .unwrap();
             guard = next;
-            if timeout.timed_out() && self.control_tx.send(Control::Flush).is_err() {
+            if timeout.timed_out() {
                 drop(guard);
-                let failure = self.stopped_before_target(target);
-                self.set_err(failure);
-                return Err(failure);
+                self.request_wake(self.stopped_before_target(target))?;
+                guard = self.flushed_mx.lock().unwrap();
             }
         }
     }
@@ -813,7 +967,8 @@ impl Journal {
         // replayed effects durable.
         let initial_flushed = record_base.saturating_sub(1);
 
-        let (control_tx, control_rx) = unbounded::<Control>();
+        let (control_tx, control_rx) = bounded::<Control>(ORDERED_CONTROL_CAPACITY);
+        let (wake_tx, wake_rx) = bounded::<()>(WAKE_CAPACITY);
         let file_store_health = resource_guard
             .as_ref()
             .map(|file_store| file_store.journal_health());
@@ -838,17 +993,31 @@ impl Journal {
             flushed_cv: Condvar::new(),
             space_mx: Mutex::new(()),
             space_cv: Condvar::new(),
+            prefix_mx: Mutex::new(()),
+            prefix_cv: Condvar::new(),
+            prefix_waiters: AtomicUsize::new(0),
             control_tx,
+            wake_tx,
             record_pool: Mutex::new(Vec::new()),
             #[cfg(test)]
             shutdown_barrier: Mutex::new(None),
+            #[cfg(test)]
+            submit_pauses: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_drain_barrier: Mutex::new(None),
+            #[cfg(test)]
+            after_snapshot_barrier: Mutex::new(None),
+            #[cfg(test)]
+            before_sync_barrier: Mutex::new(None),
         });
 
         let worker_shared = Arc::clone(&shared);
         let worker_resource_guard = resource_guard.clone();
         let handle = thread::Builder::new()
             .name("holt-journal-ring".to_owned())
-            .spawn(move || run_flusher(worker_shared, control_rx, worker_resource_guard))
+            .spawn(move || {
+                run_flusher(worker_shared, control_rx, wake_rx, worker_resource_guard);
+            })
             .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal-ring"))?;
 
         Ok(Self {
@@ -953,16 +1122,31 @@ impl Journal {
                 // Reserve → backpressure wait → memcpy → publish.
                 // The flusher's cursor provides bounded ring backpressure.
                 let ticket = self.shared.ring.reserve(actual_len as u64);
+                #[cfg(test)]
+                self.shared
+                    .pause_submit(&record, SubmitPauseStage::AfterReserve);
                 if !self.shared.ring.reserve_space_ready(&ticket) {
                     self.shared
                         .wait_for_ring_space(&ticket)
                         .map_err(|failure| append_unknown(failure.context))?;
                 }
                 self.shared.ring.fill(&ticket, &record);
-                self.shared.ring.publish(&ticket);
+                let published = self.shared.ring.publish(&ticket);
+                if published.advanced {
+                    self.shared.notify_prefix_advanced();
+                }
+                #[cfg(test)]
+                self.shared
+                    .pause_submit(&record, SubmitPauseStage::AfterPublish);
                 let bytes = record.take_bytes();
                 self.shared.recycle(bytes);
-                self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1
+                let prefix = self
+                    .shared
+                    .wait_for_ticket_prefix(&ticket, published.prefix)
+                    .map_err(|failure| append_unknown(failure.context))?;
+                let target = self.shared.physical_target(prefix);
+                self.shared.queued.fetch_max(target, Ordering::AcqRel);
+                target
             }
             RecordLaneKind::Oversized => {
                 // Transfer the health boundary to the flusher before waiting
@@ -972,7 +1156,9 @@ impl Journal {
                 // until every success/error/channel-close path returns.
                 drop(record.file_store_health.take());
                 let bytes = record.take_bytes();
-                let target = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
+                let prefix = self.shared.ring.committed_prefix_snapshot();
+                let target = self.shared.physical_target(prefix).saturating_add(1);
+                self.shared.queued.fetch_max(target, Ordering::AcqRel);
                 let (ack, rx) = crossbeam_channel::bounded(1);
                 if self
                     .shared
@@ -1026,6 +1212,10 @@ impl Journal {
         self.shared.queued.load(Ordering::Acquire)
     }
 
+    pub(crate) fn max_record_bytes(&self) -> usize {
+        self.shared.max_record_bytes.load(Ordering::Acquire)
+    }
+
     pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
         self.shared
             .flush_to(observed)
@@ -1045,6 +1235,11 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_drain_for_test(&self) {
+        self.shared.writer.lock().unwrap().fail_next_drain();
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_sync_for_test(&self) {
         self.shared.writer.lock().unwrap().fail_next_sync();
     }
@@ -1060,6 +1255,64 @@ impl Journal {
     #[cfg(test)]
     fn oversized_waiting_for_test(&self) -> bool {
         self.shared.record_lane.oversized_waiting()
+    }
+
+    #[cfg(test)]
+    fn install_submit_pause(
+        &self,
+        seq: u64,
+        stage: SubmitPauseStage,
+        barrier: Arc<JournalTestBarrier>,
+    ) {
+        self.shared.submit_pauses.lock().unwrap().push(SubmitPause {
+            seq,
+            stage,
+            barrier,
+        });
+    }
+
+    #[cfg(test)]
+    fn install_before_drain_barrier(&self, barrier: Arc<JournalTestBarrier>) {
+        assert!(self
+            .shared
+            .before_drain_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier)
+            .is_none());
+        let _ = self.shared.wake_tx.try_send(());
+    }
+
+    #[cfg(test)]
+    fn install_after_snapshot_barrier(&self, barrier: Arc<JournalTestBarrier>) {
+        assert!(self
+            .shared
+            .after_snapshot_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier)
+            .is_none());
+    }
+
+    #[cfg(test)]
+    fn install_before_sync_barrier(&self, barrier: Arc<JournalTestBarrier>) {
+        assert!(self
+            .shared
+            .before_sync_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier)
+            .is_none());
+    }
+
+    #[cfg(test)]
+    fn wake_depth_for_test(&self) -> usize {
+        self.shared.wake_tx.len()
+    }
+
+    #[cfg(test)]
+    fn ordered_control_depth_for_test(&self) -> usize {
+        self.shared.control_tx.len()
     }
 
     pub(crate) fn truncate(&self) -> Result<()> {
@@ -1115,7 +1368,7 @@ impl Journal {
         drop(slot);
         // Wake the worker so it observes the newly-installed barrier without
         // relying on the idle poll deadline.
-        let _ = self.shared.control_tx.send(Control::Flush);
+        let _ = self.shared.wake_tx.try_send(());
     }
 
     #[cfg(test)]
@@ -1139,6 +1392,7 @@ impl Drop for Journal {
 fn run_flusher(
     shared: Arc<Shared>,
     control_rx: Receiver<Control>,
+    wake_rx: Receiver<()>,
     _resource_guard: Option<Arc<FileBlobStore>>,
 ) {
     #[cfg(test)]
@@ -1151,11 +1405,11 @@ fn run_flusher(
                 barrier.pause_before_drain();
             }
         }
+        #[cfg(test)]
+        Shared::pause_once(&shared.before_drain_barrier);
         shared.drain_and_maybe_sync();
-        match control_rx.recv_timeout(FLUSH_POLL) {
-            // Flush wake and idle-poll timeout both just re-loop to drain +
-            // (re)check the sync target at the top.
-            Ok(Control::Flush) | Err(RecvTimeoutError::Timeout) => {}
+        crossbeam_channel::select_biased! {
+            recv(control_rx) -> control => match control {
             Ok(Control::Truncate(ack)) => {
                 // Drain anything outstanding, then reset. The caller holds
                 // the commit gate exclusively at the checkpoint truncate
@@ -1182,7 +1436,12 @@ fn run_flusher(
                 shared.drain_writer_to_os();
                 break;
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
+            },
+            // Wake tokens are coalesced and advisory. The ordered channel
+            // above is biased so critical commands never depend on a wake.
+            recv(wake_rx) -> _ => {},
+            default(FLUSH_POLL) => {},
         }
     }
     #[cfg(test)]
@@ -1589,5 +1848,270 @@ mod tests {
         assert_eq!(after.flushed_work, 4);
         assert_eq!(after.checkpointed_work, 3);
         assert!(journal.needs_checkpoint());
+    }
+
+    fn encoded_insert(seq: u64, key: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        encode_insert_record(&mut bytes, seq, 0, key, b"value");
+        bytes
+    }
+
+    fn replay_seqs(path: &std::path::Path) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        reader::replay(path, |_, seq, _| {
+            seqs.push(seq);
+            Ok(())
+        })
+        .unwrap();
+        seqs
+    }
+
+    fn assert_unknown_phase(result: Result<()>, phase: CommitPhase) {
+        assert!(matches!(
+            result,
+            Err(Error::CommitOutcomeUnknown { phase: actual, .. }) if actual == phase
+        ));
+    }
+
+    #[test]
+    fn sync_ack_uses_contiguous_physical_record_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let crash_image = dir.path().join("crash-image.wal");
+        let journal = Arc::new(Journal::open_or_create(&path, 0).unwrap());
+
+        let a_after_reserve = JournalTestBarrier::new();
+        let a_after_publish = JournalTestBarrier::new();
+        let b_after_reserve = JournalTestBarrier::new();
+        let c_after_publish = JournalTestBarrier::new();
+        journal.install_submit_pause(
+            1,
+            SubmitPauseStage::AfterReserve,
+            Arc::clone(&a_after_reserve),
+        );
+        journal.install_submit_pause(
+            1,
+            SubmitPauseStage::AfterPublish,
+            Arc::clone(&a_after_publish),
+        );
+        journal.install_submit_pause(
+            2,
+            SubmitPauseStage::AfterReserve,
+            Arc::clone(&b_after_reserve),
+        );
+        journal.install_submit_pause(
+            3,
+            SubmitPauseStage::AfterPublish,
+            Arc::clone(&c_after_publish),
+        );
+
+        let (a_done_tx, a_done_rx) = mpsc::channel();
+        let a_journal = Arc::clone(&journal);
+        let a = thread::spawn(move || {
+            let bytes = encoded_insert(1, b"A");
+            a_done_tx
+                .send(a_journal.submit(prepared(&a_journal, &bytes), false))
+                .unwrap();
+        });
+        a_after_reserve.wait();
+
+        let (b_done_tx, b_done_rx) = mpsc::channel();
+        let b_journal = Arc::clone(&journal);
+        let b = thread::spawn(move || {
+            let bytes = encoded_insert(2, b"B");
+            b_done_tx
+                .send(b_journal.submit(prepared(&b_journal, &bytes), false))
+                .unwrap();
+        });
+        b_after_reserve.wait();
+
+        let (c_done_tx, c_done_rx) = mpsc::channel();
+        let c_journal = Arc::clone(&journal);
+        let c = thread::spawn(move || {
+            let bytes = encoded_insert(3, b"C");
+            let result = c_journal
+                .submit(prepared(&c_journal, &bytes), true)
+                .and_then(|ack| ack.expect("sync append acknowledgement").wait());
+            c_done_tx.send(result).unwrap();
+        });
+        c_after_publish.wait();
+        c_after_publish.release();
+
+        // C is published first but cannot obtain an ACK target while the
+        // earlier A/B byte reservations leave a physical gap.
+        assert!(c_done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        a_after_reserve.release();
+        a_after_publish.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while journal.stats().written_work < 1 {
+            assert!(Instant::now() < deadline, "A never reached the page cache");
+            thread::yield_now();
+        }
+        assert!(c_done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        // A crash image taken while B is still unpublished contains A only;
+        // C has neither ACKed nor become replay-visible.
+        std::fs::copy(&path, &crash_image).unwrap();
+        assert_eq!(replay_seqs(&crash_image), vec![1]);
+
+        b_after_reserve.release();
+        b_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        c_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        a_after_publish.release();
+        a_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+
+        a.join().unwrap();
+        b.join().unwrap();
+        c.join().unwrap();
+        assert_eq!(replay_seqs(&path), vec![1, 2, 3]);
+        let stats = journal.stats();
+        assert_eq!(stats.queued_work, 3);
+        assert_eq!(stats.written_work, 3);
+        assert_eq!(stats.flushed_work, 3);
+    }
+
+    #[test]
+    fn async_small_append_is_promptly_drained_without_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = Journal::open_or_create(&path, 0).unwrap();
+        let bytes = encoded_insert(1, b"async");
+        journal.submit(prepared(&journal, &bytes), false).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while journal.stats().written_work != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "async record was not promptly drained"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(journal.stats().syncs, 0);
+        assert_eq!(journal.stats().flushed_work, 0);
+        assert_eq!(replay_seqs(&path), vec![1]);
+    }
+
+    #[test]
+    fn sync_waiter_wakes_are_coalesced_while_fsync_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            Arc::new(Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap());
+        let before_sync = JournalTestBarrier::new();
+        journal.install_before_sync_barrier(Arc::clone(&before_sync));
+        let bytes = encoded_insert(1, b"coalesced");
+        let ack = journal
+            .submit(prepared(&journal, &bytes), true)
+            .unwrap()
+            .unwrap();
+
+        let ack_waiter = thread::spawn(move || ack.wait());
+        before_sync.wait();
+
+        let target = journal.queued_work();
+        let mut waiters = Vec::new();
+        for _ in 0..32 {
+            let journal = Arc::clone(&journal);
+            waiters.push(thread::spawn(move || journal.flush_up_to(target)));
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert!(journal.wake_depth_for_test() <= WAKE_CAPACITY);
+        assert_eq!(journal.ordered_control_depth_for_test(), 0);
+
+        before_sync.release();
+        ack_waiter.join().unwrap().unwrap();
+        for waiter in waiters {
+            waiter.join().unwrap().unwrap();
+        }
+        assert_eq!(journal.wake_depth_for_test(), 0);
+    }
+
+    #[test]
+    fn pending_page_cache_drain_failure_is_wal_append_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = Journal::open_or_create(&path, 0).unwrap();
+        journal.fail_next_drain_for_test();
+        let bytes = encoded_insert(1, b"drain-fail");
+        let ack = journal
+            .submit(prepared(&journal, &bytes), true)
+            .unwrap()
+            .unwrap();
+        assert_unknown_phase(ack.wait(), CommitPhase::WalAppend);
+        assert_eq!(journal.stats().written_work, 0);
+        assert!(replay_seqs(&path).is_empty());
+    }
+
+    #[test]
+    fn copied_records_report_sync_failure_but_later_prefix_reports_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = Arc::new(Journal::open_or_create(&path, 0).unwrap());
+        let after_snapshot = JournalTestBarrier::new();
+        journal.install_after_snapshot_barrier(Arc::clone(&after_snapshot));
+        journal.fail_next_sync_for_test();
+
+        let first = encoded_insert(1, b"first");
+        let first_ack = journal
+            .submit(prepared(&journal, &first), true)
+            .unwrap()
+            .unwrap();
+        let first_waiter = thread::spawn(move || first_ack.wait());
+        after_snapshot.wait();
+
+        let second = encoded_insert(2, b"second");
+        let second_ack = journal
+            .submit(prepared(&journal, &second), true)
+            .unwrap()
+            .unwrap();
+        after_snapshot.release();
+
+        assert_unknown_phase(first_waiter.join().unwrap(), CommitPhase::WalSync);
+        assert_unknown_phase(second_ack.wait(), CommitPhase::WalAppend);
+        assert_eq!(journal.stats().written_work, 1);
+        assert_eq!(replay_seqs(&path), vec![1]);
+    }
+
+    #[test]
+    fn exact_copied_snapshot_marks_every_included_record_wal_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = Arc::new(Journal::open_or_create(&path, 0).unwrap());
+        let before_drain = JournalTestBarrier::new();
+        journal.install_before_drain_barrier(Arc::clone(&before_drain));
+        before_drain.wait();
+        journal.fail_next_sync_for_test();
+
+        let first = encoded_insert(1, b"first");
+        let second = encoded_insert(2, b"second");
+        let first_ack = journal
+            .submit(prepared(&journal, &first), true)
+            .unwrap()
+            .unwrap();
+        let second_ack = journal
+            .submit(prepared(&journal, &second), true)
+            .unwrap()
+            .unwrap();
+        let first_waiter = thread::spawn(move || first_ack.wait());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while journal.shared.sync_target.load(Ordering::Acquire) < 1 {
+            assert!(Instant::now() < deadline, "sync target was not published");
+            thread::yield_now();
+        }
+        before_drain.release();
+
+        assert_unknown_phase(first_waiter.join().unwrap(), CommitPhase::WalSync);
+        assert_unknown_phase(second_ack.wait(), CommitPhase::WalSync);
+        assert_eq!(journal.stats().written_work, 2);
+        assert_eq!(replay_seqs(&path), vec![1, 2]);
     }
 }
