@@ -92,6 +92,12 @@
 //! [`FileBlobStore::validate_object_set`] dynamically verifies name-to-fd
 //! identity. Those checks deliberately cover cooperative processes and
 //! operational mistakes involving hardlinks or renamed entries.
+//! Existing authority files are never chmod-repaired while serving: an
+//! existing mode other than exactly 0600 is a hard open failure. Operators
+//! upgrading an older store must stop every opener, confirm no process keeps
+//! an old descriptor, and correct the modes offline before restarting Holt.
+//! Only an inode created by this open through `O_CREAT | O_EXCL` may have its
+//! umask-filtered mode normalized to 0600.
 //!
 //! Holt does not walk and independently pin every ancestor component. POSIX
 //! also has no portable macOS/Linux operation that atomically validates a
@@ -153,6 +159,16 @@ const MANIFEST_LOG_FILENAME: &str = "manifest.log";
 const READ_INDEX_FILENAME: &str = "read.idx";
 /// Packed rebuildable read-value segment file.
 const VALUE_SEGMENT_FILENAME: &str = "value.seg";
+/// Existing entries checked before first-open creation is allowed. `store.lock`
+/// has its own stricter zero-length validation in [`acquire_store_lock`].
+const PREEXISTING_AUTHORITY_FILENAMES: [&str; 6] = [
+    DATA_FILENAME,
+    READ_INDEX_FILENAME,
+    VALUE_SEGMENT_FILENAME,
+    MANIFEST_FILENAME,
+    MANIFEST_LOG_FILENAME,
+    WAL_FILENAME,
+];
 /// Prefix used for unique, exclusively-created manifest staging files.
 /// The historical fixed name is deliberately never truncated or reused.
 const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
@@ -327,7 +343,7 @@ enum ManifestDelta {
     Delete { guid: BlobGuid },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManifestEntry {
     slot: u64,
 }
@@ -528,7 +544,11 @@ impl StoreDirectory {
     fn secure_authority_file(&self, name: &str, file: &File, created: bool) -> Result<()> {
         let metadata = AuthorityFileMetadata::from_file(file)?;
         let expected_uid = unsafe { libc::geteuid() };
-        if !metadata.has_safe_shape(expected_uid) {
+        if if created {
+            !metadata.has_safe_shape(expected_uid)
+        } else {
+            !metadata.is_exact(expected_uid)
+        } {
             return Err(unsafe_authority_file_error(name));
         }
 
@@ -543,20 +563,26 @@ impl StoreDirectory {
         )?;
         self.validate_authority_file_shape(name, file)?;
 
-        let mut changed = created;
-        if metadata.mode & 0o7777 != 0o600 {
+        if created && metadata.mode & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.sync_all()?;
-            changed = true;
         }
         if created {
             file.sync_all()?;
-        }
-        if changed {
             self.sync()?;
         }
 
         self.validate_authority_file(name, file)?;
+        Ok(())
+    }
+
+    /// Reject every malformed existing authority entry before this open is
+    /// allowed to create a missing lock, data file, or accelerator. The held
+    /// directory flock excludes another compliant opener while the formal
+    /// opens below repeat these checks against their lifetime descriptors.
+    fn validate_preexisting_authority_files(&self) -> Result<()> {
+        for name in PREEXISTING_AUTHORITY_FILENAMES {
+            drop(self.open_existing_at(name, libc::O_RDONLY)?);
+        }
         Ok(())
     }
 
@@ -800,7 +826,7 @@ fn unsafe_lock_file_error() -> Error {
     ))
 }
 
-fn lock_metadata_can_be_hardened(metadata: LockFileMetadata, expected_uid: u32) -> bool {
+fn lock_metadata_has_safe_shape(metadata: LockFileMetadata, expected_uid: u32) -> bool {
     metadata.mode & FILE_TYPE_MASK == REGULAR_FILE_TYPE
         && metadata.uid == expected_uid
         && metadata.links == 1
@@ -834,8 +860,10 @@ fn acquire_existing_store_lock_unmodified(directory: &StoreDirectory, path: &Pat
         libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         0,
     )?;
+    validate_lock_file(&lock)?;
     acquire_flock(&lock, path, DIR_LOCK_ACQUIRE_TIMEOUT, LOCK_FILENAME)?;
     verify_named_lock(directory, &lock)?;
+    validate_lock_file(&lock)?;
     Ok(lock)
 }
 
@@ -847,26 +875,29 @@ fn finish_store_lock_open(
 ) -> Result<()> {
     let expected_uid = unsafe { libc::geteuid() };
     let metadata = LockFileMetadata::from_file(lock)?;
-    if !lock_metadata_can_be_hardened(metadata, expected_uid) {
-        return Err(unsafe_lock_file_error());
+    if created {
+        if !lock_metadata_has_safe_shape(metadata, expected_uid) {
+            return Err(unsafe_lock_file_error());
+        }
+    } else {
+        validate_lock_metadata(metadata, expected_uid)?;
     }
     acquire_flock(lock, path, DIR_LOCK_ACQUIRE_TIMEOUT, LOCK_FILENAME)?;
     verify_named_lock(directory, lock)?;
     let metadata = LockFileMetadata::from_file(lock)?;
-    if !lock_metadata_can_be_hardened(metadata, expected_uid) {
-        return Err(unsafe_lock_file_error());
-    }
-
-    let changed = created || metadata.mode & 0o7777 != 0o600;
-    if metadata.mode & 0o7777 != 0o600 {
-        // `openat`'s mode is filtered through umask, and older Holt versions
-        // commonly left mode 0644. Tighten only after the safe-shape checks,
-        // name/fd comparison, and inode flock all succeed.
-        lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    if changed {
+    if created {
+        if !lock_metadata_has_safe_shape(metadata, expected_uid) {
+            return Err(unsafe_lock_file_error());
+        }
+        if metadata.mode & 0o7777 != 0o600 {
+            // `openat`'s requested mode is filtered through umask. Only this
+            // newly and exclusively created inode may be normalized.
+            lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         lock.sync_all()?;
         directory.sync()?;
+    } else {
+        validate_lock_metadata(metadata, expected_uid)?;
     }
     validate_lock_file(lock)?;
     acquire_flock(lock, path, Duration::ZERO, LOCK_FILENAME)?;
@@ -921,6 +952,7 @@ fn open_store_root(
         Ok((directory, store_lock, actual))
     } else {
         let directory = Arc::new(StoreDirectory::open(data_dir)?);
+        directory.validate_preexisting_authority_files()?;
         let store_lock = acquire_store_lock(&directory, data_dir)?;
         let actual = object_identity(&directory, &store_lock)?;
         Ok((directory, store_lock, actual))
@@ -992,6 +1024,61 @@ fn pause_after_directory_open() {
 
 #[cfg(not(test))]
 fn pause_after_directory_open() {}
+
+#[cfg(test)]
+struct AuthorityRaceBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl AuthorityRaceBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn pause(&self) {
+        self.entered.wait();
+        self.release.wait();
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OBJECT_SET_BETWEEN_PASSES_BARRIER: std::cell::RefCell<Option<Arc<AuthorityRaceBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+    static MANIFEST_BEFORE_RENAME_BARRIER: std::cell::RefCell<Option<Arc<AuthorityRaceBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_object_set_between_passes_barrier(barrier: Arc<AuthorityRaceBarrier>) {
+    OBJECT_SET_BETWEEN_PASSES_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_object_set_between_passes() {
+    let barrier = OBJECT_SET_BETWEEN_PASSES_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.pause();
+    }
+}
+
+#[cfg(test)]
+fn set_manifest_before_rename_barrier(barrier: Arc<AuthorityRaceBarrier>) {
+    MANIFEST_BEFORE_RENAME_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_manifest_before_rename() {
+    let barrier = MANIFEST_BEFORE_RENAME_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.pause();
+    }
+}
 
 fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -1184,6 +1271,8 @@ impl FileBlobStore {
     }
 
     pub(crate) fn open_wal_file(&self) -> Result<File> {
+        let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         let mut guard = self.wal_guard.lock().unwrap();
         if let Some(file) = guard.as_ref() {
             self.directory.validate_authority_file(WAL_FILENAME, file)?;
@@ -1205,6 +1294,8 @@ impl FileBlobStore {
     /// for the caller's fencing record only after this method succeeds.
     pub fn validate_object_set(&self) -> Result<FileStoreObjectIdentity> {
         let first = self.validate_object_set_once()?;
+        #[cfg(test)]
+        pause_object_set_between_passes();
         let second = self.validate_object_set_once()?;
         if first != second {
             return Err(Error::BlobStoreIo(io::Error::other(
@@ -1249,7 +1340,7 @@ impl FileBlobStore {
             .validate_authority_file(VALUE_SEGMENT_FILENAME, &self.value_segment_file)?;
         let manifest = self
             .manifest
-            .read()
+            .write()
             .unwrap()
             .validate_files(&self.directory)?;
         let wal_guard = self.wal_guard.lock().unwrap();
@@ -1306,6 +1397,13 @@ impl FileBlobStore {
 
     fn enter_slot_write(&self) -> RwLockWriteGuard<'_, ()> {
         self.slot_io_lock.write().unwrap()
+    }
+
+    /// Sticky fail-stop gate for every file-store mutation. Callers hold
+    /// `data_io_lock` before checking, which orders later mutation attempts
+    /// after the compaction attempt that first poisoned snapshot authority.
+    fn ensure_mutations_healthy(&self) -> Result<()> {
+        self.manifest.read().unwrap().ensure_snapshot_healthy()
     }
 
     fn clear_read_accelerator_slots(&self, guid: BlobGuid) -> Result<()> {
@@ -1603,6 +1701,7 @@ impl FileBlobStore {
     }
 
     fn flush_locked(&self) -> Result<()> {
+        self.ensure_mutations_healthy()?;
         // Order matters: data must be on disk before the manifest
         // promotes any new slot. Otherwise a crash could leave the
         // manifest pointing at a slot whose data is still in NVMe's
@@ -2163,6 +2262,7 @@ impl BlobStore for FileBlobStore {
 
     fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         let Some(base_offset) = self.read_index_offset_of(guid) else {
             return Ok(());
         };
@@ -2201,11 +2301,14 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+        let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         self.clear_read_accelerator_slots(guid)
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         let writes = [(guid, src)];
         let prepared = self.prepare_blob_writes(&writes)?;
         self.clear_reserved_read_accelerators(&prepared);
@@ -2220,6 +2323,7 @@ impl BlobStore for FileBlobStore {
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         let prepared = self.prepare_blob_writes(writes)?;
         if prepared.is_empty() {
             return Ok(());
@@ -2239,6 +2343,7 @@ impl BlobStore for FileBlobStore {
             return Ok(());
         }
         let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
@@ -2270,6 +2375,7 @@ impl BlobStore for FileBlobStore {
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
+        self.ensure_mutations_healthy()?;
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
             m.pending_free_slots.push(entry.slot);
@@ -2652,11 +2758,7 @@ impl Manifest {
 
     fn persist_snapshot(&mut self, directory: &StoreDirectory) -> Result<()> {
         self.ensure_snapshot_healthy()?;
-        if let Some(snapshot) = self.snapshot_file.as_ref() {
-            directory.validate_authority_file(MANIFEST_FILENAME, snapshot)?;
-        } else {
-            ensure_authority_entry_absent(directory, MANIFEST_FILENAME)?;
-        }
+        self.validate_snapshot_authority(directory)?;
 
         let temp_name = format!(
             "{MANIFEST_TMP_FILENAME}.{}.{}",
@@ -2695,6 +2797,8 @@ impl Manifest {
                 return Err(error);
             }
         }
+        #[cfg(test)]
+        pause_manifest_before_rename();
         if let Err(error) = directory.rename_at(&temp_name, MANIFEST_FILENAME) {
             self.snapshot_file = old_snapshot;
             self.poison_snapshot(Some(f));
@@ -2857,13 +2961,39 @@ impl Manifest {
         }
     }
 
-    fn validate_files(&self, directory: &StoreDirectory) -> Result<ManifestFileIdentities> {
-        self.ensure_snapshot_healthy()?;
-        let snapshot = if let Some(file) = self.snapshot_file.as_ref() {
-            Some(directory.validate_authority_file(MANIFEST_FILENAME, file)?)
+    fn validate_snapshot_authority(&mut self, directory: &StoreDirectory) -> Result<()> {
+        let result = if let Some(snapshot) = self.snapshot_file.as_ref() {
+            directory
+                .validate_authority_file(MANIFEST_FILENAME, snapshot)
+                .map(|_| ())
         } else {
-            ensure_authority_entry_absent(directory, MANIFEST_FILENAME)?;
-            None
+            ensure_authority_entry_absent(directory, MANIFEST_FILENAME)
+        };
+        if let Err(error) = result {
+            // `snapshot_file` itself retains the old inode when present. The
+            // poison bit prevents every later mutation before it can append
+            // another delta or allocate another staging descriptor.
+            self.poison_snapshot(None);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate_files(&mut self, directory: &StoreDirectory) -> Result<ManifestFileIdentities> {
+        self.ensure_snapshot_healthy()?;
+        let snapshot_result = if let Some(file) = self.snapshot_file.as_ref() {
+            directory
+                .validate_authority_file(MANIFEST_FILENAME, file)
+                .map(Some)
+        } else {
+            ensure_authority_entry_absent(directory, MANIFEST_FILENAME).map(|()| None)
+        };
+        let snapshot = match snapshot_result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.poison_snapshot(None);
+                return Err(error);
+            }
         };
         let log = if let Some(file) = self.log_file.as_ref() {
             Some(directory.validate_authority_file(MANIFEST_LOG_FILENAME, file)?)
@@ -3143,6 +3273,49 @@ mod tests {
         }
     }
 
+    fn try_open_complete_authority_set(dir: &Path) -> Option<FileBlobStore> {
+        let store = try_open(dir)?;
+        store.write_blob([0xD0; 16], &buf_with(0x40)).unwrap();
+        store.flush().unwrap();
+        store
+            .manifest
+            .write()
+            .unwrap()
+            .persist_snapshot(&store.directory)
+            .unwrap();
+        drop(store.open_wal_file().unwrap());
+        Some(store)
+    }
+
+    fn create_exact_authority_replacement(path: &Path) {
+        OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+    }
+
+    fn held_manifest_file_count(manifest: &Manifest) -> usize {
+        usize::from(manifest.snapshot_file.is_some())
+            + usize::from(manifest.log_file.is_some())
+            + usize::from(manifest.poisoned_snapshot_guard.is_some())
+    }
+
+    fn manifest_temp_entry_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(MANIFEST_TMP_FILENAME)
+            })
+            .count()
+    }
+
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     #[test]
     fn registered_buffer_allocator_returns_fixed_buffers_when_available() {
@@ -3282,6 +3455,45 @@ mod tests {
     }
 
     #[test]
+    fn every_existing_authority_mode_is_rejected_without_changing_bytes_or_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open_complete_authority_set(dir.path()) else {
+            return;
+        };
+        drop(store);
+
+        for name in [
+            DATA_FILENAME,
+            READ_INDEX_FILENAME,
+            VALUE_SEGMENT_FILENAME,
+            MANIFEST_FILENAME,
+            MANIFEST_LOG_FILENAME,
+            WAL_FILENAME,
+            LOCK_FILENAME,
+        ] {
+            let path = dir.path().join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let before = file_state(&path);
+
+            let error = FileBlobStore::open(dir.path()).unwrap_err();
+            assert!(
+                matches!(error, Error::BlobStoreIo(ref source) if source.kind() == io::ErrorKind::PermissionDenied),
+                "wrong-mode {name} returned unexpected error: {error}"
+            );
+            assert_eq!(
+                file_state(&path),
+                before,
+                "opening wrong-mode {name} changed its mode, content, or inode"
+            );
+
+            // Test setup only: the production open above must never perform
+            // this repair. Restore offline so the next authority entry can be
+            // exercised against the same complete object set.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
     fn hardlinked_data_is_rejected_without_mutating_source() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
@@ -3297,9 +3509,10 @@ mod tests {
 
         assert!(FileBlobStore::open(target_dir.path()).is_err());
         assert_eq!(file_state(&source_path), before);
-        let source_lock = std::fs::metadata(source_dir.path().join(LOCK_FILENAME)).unwrap();
-        let target_lock = std::fs::metadata(target_dir.path().join(LOCK_FILENAME)).unwrap();
-        assert_ne!(source_lock.ino(), target_lock.ino());
+        assert!(
+            !target_dir.path().join(LOCK_FILENAME).exists(),
+            "preflight rejection must not create a target lock"
+        );
     }
 
     #[test]
@@ -3396,6 +3609,162 @@ mod tests {
     }
 
     #[test]
+    fn two_pass_validation_deterministically_catches_every_dynamic_authority_replacement() {
+        for (ordinal, name) in [
+            READ_INDEX_FILENAME,
+            VALUE_SEGMENT_FILENAME,
+            MANIFEST_FILENAME,
+            MANIFEST_LOG_FILENAME,
+            WAL_FILENAME,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let Some(store) = try_open_complete_authority_set(dir.path()) else {
+                return;
+            };
+            let store = Arc::new(store);
+            assert_eq!(
+                store.validate_object_set().unwrap(),
+                store.object_identity()
+            );
+
+            let barrier = Arc::new(AuthorityRaceBarrier::new());
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_store = Arc::clone(&store);
+            let worker = std::thread::spawn(move || {
+                set_object_set_between_passes_barrier(worker_barrier);
+                worker_store.validate_object_set()
+            });
+
+            barrier.entered.wait();
+            let named = dir.path().join(name);
+            let held = dir.path().join(format!("authority-held-{ordinal}"));
+            std::fs::rename(&named, &held).unwrap();
+            create_exact_authority_replacement(&named);
+            barrier.release.wait();
+
+            assert!(
+                worker.join().unwrap().is_err(),
+                "two-pass validation accepted a raced {name} replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_validate_to_rename_race_is_sticky_and_retains_one_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open_complete_authority_set(dir.path()) else {
+            return;
+        };
+        let store = Arc::new(store);
+        let barrier = Arc::new(AuthorityRaceBarrier::new());
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_store = Arc::clone(&store);
+        let worker = std::thread::spawn(move || {
+            set_manifest_before_rename_barrier(worker_barrier);
+            worker_store
+                .manifest
+                .write()
+                .unwrap()
+                .persist_snapshot(&worker_store.directory)
+        });
+
+        barrier.entered.wait();
+        let alias = dir.path().join("manifest-raced-alias");
+        std::fs::hard_link(dir.path().join(MANIFEST_FILENAME), &alias).unwrap();
+        barrier.release.wait();
+
+        assert!(worker.join().unwrap().is_err());
+        let (held_files, temp_entries) = {
+            let manifest = store.manifest.read().unwrap();
+            assert!(manifest.snapshot_poisoned);
+            assert!(manifest.poisoned_snapshot_guard.is_some());
+            (
+                held_manifest_file_count(&manifest),
+                manifest_temp_entry_count(dir.path()),
+            )
+        };
+        for _ in 0..3 {
+            assert!(store
+                .manifest
+                .write()
+                .unwrap()
+                .persist_snapshot(&store.directory)
+                .is_err());
+            let manifest = store.manifest.read().unwrap();
+            assert_eq!(held_manifest_file_count(&manifest), held_files);
+            assert_eq!(manifest_temp_entry_count(dir.path()), temp_entries);
+        }
+    }
+
+    #[test]
+    fn failed_compaction_appends_delta_once_then_poison_blocks_all_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        let first_record_bytes = (MANIFEST_LOG_HEADER_SIZE
+            + MANIFEST_LOG_SET_BODY_SIZE
+            + MANIFEST_LOG_FOOTER_SIZE) as u64;
+        assert_eq!(first_record_bytes, 37);
+
+        store.write_blob([0xE1; 16], &buf_with(0x51)).unwrap();
+        store.flush().unwrap();
+        store
+            .manifest
+            .write()
+            .unwrap()
+            .persist_snapshot(&store.directory)
+            .unwrap();
+        let log_path = dir.path().join(MANIFEST_LOG_FILENAME);
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 37);
+
+        store.write_blob([0xE2; 16], &buf_with(0x52)).unwrap();
+        store.manifest.write().unwrap().log_bytes = MANIFEST_LOG_MIN_COMPACT_BYTES;
+        let held_snapshot = dir.path().join("manifest-held-before-compaction");
+        std::fs::rename(dir.path().join(MANIFEST_FILENAME), &held_snapshot).unwrap();
+        create_exact_authority_replacement(&dir.path().join(MANIFEST_FILENAME));
+
+        assert!(store.flush().is_err());
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 74);
+        let (held_files, temp_entries, entries, write_epoch) = {
+            let manifest = store.manifest.read().unwrap();
+            assert!(manifest.snapshot_poisoned);
+            assert_eq!(manifest.pending_log.len(), 1);
+            (
+                held_manifest_file_count(&manifest),
+                manifest_temp_entry_count(dir.path()),
+                manifest.entries.clone(),
+                store.data_write_epoch.load(Ordering::Acquire),
+            )
+        };
+
+        for _ in 0..3 {
+            assert!(store.flush().is_err());
+            assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 74);
+            let manifest = store.manifest.read().unwrap();
+            assert_eq!(held_manifest_file_count(&manifest), held_files);
+            assert_eq!(manifest_temp_entry_count(dir.path()), temp_entries);
+            assert_eq!(manifest.entries, entries);
+        }
+
+        assert!(store.write_blob([0xE3; 16], &buf_with(0x53)).is_err());
+        assert!(store.delete_blob([0xE1; 16]).is_err());
+        assert!(store
+            .publish_read_index([0xE1; 16], b"index", b"value")
+            .is_err());
+        assert!(store.delete_read_index([0xE1; 16]).is_err());
+        assert!(store.vacuum().is_err());
+        assert!(store.open_wal_file().is_err());
+        assert!(!dir.path().join(WAL_FILENAME).exists());
+        assert_eq!(store.data_write_epoch.load(Ordering::Acquire), write_epoch);
+        assert_eq!(store.manifest.read().unwrap().entries, entries);
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 74);
+    }
+
+    #[test]
     fn expected_identity_rejects_other_store_before_touching_it_then_reopens_original() {
         let a_dir = tempfile::tempdir().unwrap();
         let b_dir = tempfile::tempdir().unwrap();
@@ -3421,7 +3790,6 @@ mod tests {
         }
 
         let authority_names = [
-            LOCK_FILENAME,
             DATA_FILENAME,
             READ_INDEX_FILENAME,
             VALUE_SEGMENT_FILENAME,
@@ -3429,6 +3797,8 @@ mod tests {
             MANIFEST_LOG_FILENAME,
             WAL_FILENAME,
         ];
+        let lock_path = b_dir.path().join(LOCK_FILENAME);
+        let lock_before = file_state(&lock_path);
         let mut before = Vec::new();
         for name in authority_names {
             let path = b_dir.path().join(name);
@@ -3453,6 +3823,7 @@ mod tests {
                 "expected mismatch touched {path:?}"
             );
         }
+        assert_eq!(file_state(&lock_path), lock_before);
 
         let mut original =
             crate::TreeConfig::new(a_dir.path()).with_expected_file_store_identity(a_identity);
@@ -3509,7 +3880,6 @@ mod tests {
             .open(source_dir.path().join(DATA_FILENAME))
             .unwrap();
         let migrated = target_dir.path().join(DATA_FILENAME);
-        std::fs::set_permissions(&migrated, std::fs::Permissions::from_mode(0o640)).unwrap();
         let before = file_state(&migrated);
 
         // The migrated inode has nlink==1 in the other directory, but the
@@ -3560,7 +3930,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_symlink_is_rejected_and_safe_legacy_mode_is_hardened() {
+    fn authority_symlink_and_existing_legacy_mode_are_rejected_without_repair() {
         use std::os::unix::fs::symlink;
 
         let linked_dir = tempfile::tempdir().unwrap();
@@ -3577,10 +3947,10 @@ mod tests {
             .mode(0o640)
             .open(&data)
             .unwrap();
-        let Some(_store) = try_open(legacy_dir.path()) else {
-            return;
-        };
-        assert_eq!(std::fs::metadata(data).unwrap().mode() & 0o7777, 0o600);
+        let before = file_state(&data);
+        assert!(FileBlobStore::open(legacy_dir.path()).is_err());
+        assert_eq!(file_state(&data), before);
+        assert!(!legacy_dir.path().join(LOCK_FILENAME).exists());
     }
 
     #[test]
@@ -3609,7 +3979,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owned_lock_mode_is_hardened_before_flock() {
+    fn existing_legacy_lock_mode_is_rejected_without_repair() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(LOCK_FILENAME);
         OpenOptions::new()
@@ -3619,10 +3989,10 @@ mod tests {
             .open(&lock_path)
             .unwrap();
 
-        let Some(_store) = try_open(dir.path()) else {
-            return;
-        };
-        assert_eq!(std::fs::metadata(lock_path).unwrap().mode() & 0o7777, 0o600);
+        let before = file_state(&lock_path);
+        assert!(FileBlobStore::open(dir.path()).is_err());
+        assert_eq!(file_state(&lock_path), before);
+        assert!(!dir.path().join(DATA_FILENAME).exists());
     }
 
     #[test]

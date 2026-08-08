@@ -39,7 +39,9 @@ use crate::journal::reader::replay_file;
 use crate::journal::wal_op::WalOp;
 use crate::journal::Journal;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
-use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
+use crate::store::blob_store::{
+    AlignedBlobBuf, BlobStore, FileBlobStore, FileStoreObjectIdentity, MemoryBlobStore,
+};
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
     WriteDeltaEntry, WriteThroughEntry,
@@ -513,6 +515,25 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 }
 
 impl Tree {
+    /// Return the kernel-object identity of this Tree's held file store.
+    ///
+    /// File-backed trees return the `(device, inode)` pairs for the directory
+    /// and `store.lock` descriptors actually held by the live store. This
+    /// getter is stable open-time identity; call
+    /// [`Self::validate_file_store_object_set`] for a fresh full-set check.
+    /// Memory and custom stores return `None`.
+    #[must_use]
+    pub fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        self.store.file_store_object_identity()
+    }
+
+    /// Revalidate every held file-store object against its current directory
+    /// entry and return the root fencing identity only on a stable two-pass
+    /// result. Memory and custom stores return `Ok(None)`.
+    pub fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
+        self.store.validate_file_store_object_set()
+    }
+
     /// Open a tree using the supplied configuration.
     ///
     /// `TreeConfig::new("/path")` opens a file-backed tree at
@@ -3631,6 +3652,32 @@ mod tests {
         fn needs_flush(&self) -> bool {
             self.pending.load(Ordering::Acquire)
         }
+    }
+
+    #[test]
+    fn standalone_file_store_identity_and_validator_cover_all_store_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file_cfg = TreeConfig::new(dir.path());
+        file_cfg.checkpoint.enabled = false;
+        let file_tree = Tree::open(file_cfg).unwrap();
+        let identity = file_tree
+            .file_store_object_identity()
+            .expect("file-backed Tree must expose its held root identity");
+        assert_eq!(
+            file_tree.validate_file_store_object_set().unwrap(),
+            Some(identity)
+        );
+
+        let mut memory_cfg = TreeConfig::memory();
+        memory_cfg.checkpoint.enabled = false;
+        let memory_tree = Tree::open(memory_cfg.clone()).unwrap();
+        assert_eq!(memory_tree.file_store_object_identity(), None);
+        assert_eq!(memory_tree.validate_file_store_object_set().unwrap(), None);
+
+        let custom: Arc<dyn BlobStore> = Arc::new(FailTrailingDeleteFlushStore::new());
+        let custom_tree = Tree::open_with_blob_store(memory_cfg, custom).unwrap();
+        assert_eq!(custom_tree.file_store_object_identity(), None);
+        assert_eq!(custom_tree.validate_file_store_object_set().unwrap(), None);
     }
 
     #[test]

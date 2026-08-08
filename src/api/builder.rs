@@ -69,7 +69,13 @@ impl TreeBuilder {
     }
 
     /// Require the existing file store to match `expected` before any
-    /// authoritative data, manifest, or WAL file is opened or repaired.
+    /// authoritative data, manifest, or WAL file is opened.
+    ///
+    /// Existing authority files must already be exact mode 0600. Holt does
+    /// not repair them while serving; stop all openers, confirm no old file
+    /// descriptors remain, and correct legacy modes offline. After open, use
+    /// [`Tree::validate_file_store_object_set`] before publishing or renewing
+    /// a live fence.
     pub fn expected_file_store_identity(mut self, expected: FileStoreObjectIdentity) -> Self {
         self.cfg.expected_file_store_identity = Some(expected);
         self
