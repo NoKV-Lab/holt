@@ -220,7 +220,7 @@ records or by loading checkpointed blob images; they are not
 standalone WAL records. Each record is
 
 ```text
-MAGIC | LEN | SEQ | TY | BODY | CRC32
+MAGIC | LEN | SEQ | TY | BODY | CRC32 | LEN2
 ```
 
 with hardware-accelerated CRC32 (`crc32fast`, dispatching to
@@ -228,11 +228,21 @@ PCLMULQDQ on x86_64 + ARM-CRC32 on AArch64). The writer's pending
 buffer auto-drains to the OS page cache at 64 KB. `Journal::flush`
 and durable group-commit batches are the `sync_data` boundaries.
 
-Replay walks the journal forward, validating CRC + magic +
-variant tag on each record. Torn tails (mid-write power loss)
-are recovered gracefully — the scanner reports the offset where
-it stopped; real mid-file corruption surfaces as
-`Error::ReplaySanityFailed` with the bad record's offset.
+WAL format v4 repeats the body length in `LEN2`. The redundant footer lets
+recovery distinguish a genuinely torn final write from a corrupted header
+length that would otherwise swallow later acknowledged records. The v4 rename
+body also stores the value observed by the committing operation, so redo never
+looks up a potentially newer source value from the checkpoint image. Format v3
+WALs fail closed on startup; Holt deliberately does not dual-read an ambiguous
+redo shape.
+
+Replay first validates the whole visible journal, including framing, CRC,
+variant semantics, owner, operation count, and sequence range, without invoking
+mutation callbacks. A second chunked pass applies only the validated prefix.
+Both passes use bounded scratch space independent of total WAL or record size.
+Torn tails (mid-write power loss) are recovered gracefully — the scanner
+reports the offset where it stopped; real mid-file corruption surfaces as
+`Error::ReplaySanityFailed` with the bad record's offset and is never truncated.
 
 ### `BufferManager` — cache + dirty/pending tracking
 
@@ -499,7 +509,7 @@ only when `CheckpointConfig::enabled = true`.
 | What | Behaviour |
 |---|---|
 | Crash mid-write | WAL replay restores the tree to the last durable record. Uncommitted partial writes drop. |
-| WAL torn tail | Replay yields every complete record before the chop, reports the byte offset where it stopped. Real mid-file corruption surfaces as `Error::ReplaySanityFailed`. |
+| WAL torn tail | Whole-log validation identifies a genuinely torn final frame before replay applies the validated prefix; truncation occurs only after successful apply. A valid later frame proves mid-log corruption, which surfaces as `Error::ReplaySanityFailed` without callback or truncation. |
 | Partial `store.flush` | Manifest deltas are appended and fsync'd before becoming the recovery contract; full manifest snapshots use tmp+rename. Data file writes are O_DIRECT aligned (atomic at 4 KB on NVMe). |
 | Out of disk space | BlobStore write errors propagate as `Error::BlobStoreIo`; the dirty entry stays in BM for retry, no state corruption. |
 | OOM in buffer pool | Clock-tick eviction reclaims cold blobs; pinned blobs are skipped until released. |
