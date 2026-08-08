@@ -43,7 +43,10 @@ use crate::layout::BlobGuid;
 /// These numbers come from `fstat(2)` on the directory and lock-file
 /// descriptors that the store actually holds. They therefore describe the
 /// kernel objects backing this live instance, not a pathname that may later be
-/// renamed or replaced. Raw file descriptors are intentionally not exposed.
+/// renamed or replaced. It identifies the store root, not a cached claim that
+/// every data/manifest/WAL name is still intact; use
+/// [`BlobStore::validate_file_store_object_set`] at serving/fencing cut
+/// points. Raw file descriptors are intentionally not exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileStoreObjectIdentity {
     /// Device containing the held store directory.
@@ -91,11 +94,22 @@ pub enum IndexedBlobLookup {
 pub trait BlobStore: Send + Sync {
     /// Return the actual held filesystem objects for a file-backed store.
     ///
-    /// Custom and memory stores return `None`. The identity is diagnostic and
-    /// fencing material; it does not grant access to the underlying file
-    /// descriptors.
+    /// Custom and memory stores return `None`. This is the open-time root
+    /// identity and does not freshly validate all authoritative entries; use
+    /// [`Self::validate_file_store_object_set`] before publishing or renewing
+    /// a fence. It does not grant access to the underlying descriptors.
     fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
         None
+    }
+
+    /// Revalidate the live file-store object set and return its root fencing
+    /// identity. Memory and custom stores have no filesystem object set.
+    ///
+    /// Unlike [`Self::file_store_object_identity`], a file-backed override
+    /// must perform fresh name-to-descriptor, metadata, and lock checks before
+    /// returning.
+    fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
+        Ok(None)
     }
 
     /// Allocate a zero-filled blob buffer suitable for this store.

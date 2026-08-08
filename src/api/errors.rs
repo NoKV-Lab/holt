@@ -1,6 +1,7 @@
 //! Top-level error type.
 
 use crate::layout::BlobGuid;
+use crate::store::blob_store::FileStoreObjectIdentity;
 use crate::store::{AllocError, FreeError};
 
 /// Result alias used throughout the crate.
@@ -23,6 +24,15 @@ pub(crate) fn is_blob_store_not_found(error: &Error) -> bool {
 pub enum Error {
     /// BlobStore I/O failure.
     BlobStoreIo(std::io::Error),
+    /// A file store was opened through a directory/lock object other than the
+    /// caller's expected live identity. No authoritative store entry is
+    /// opened or repaired before this error is returned.
+    FileStoreIdentityMismatch {
+        /// Identity required by the caller.
+        expected: FileStoreObjectIdentity,
+        /// Identity obtained from the held directory and lock descriptors.
+        actual: FileStoreObjectIdentity,
+    },
     /// Bump allocator / slot table exhaustion / invalid alloc.
     Alloc(AllocError),
     /// Free-list misuse.
@@ -172,6 +182,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BlobStoreIo(e) => write!(f, "store I/O: {e}"),
+            Self::FileStoreIdentityMismatch { expected, actual } => write!(
+                f,
+                "file-store identity mismatch (expected {expected:?}, actual {actual:?})"
+            ),
             Self::Alloc(e) => write!(f, "alloc: {e}"),
             Self::Free(e) => write!(f, "free: {e}"),
             Self::KeyTooLong { len } => write!(f, "key too long ({len} bytes; max {})", u16::MAX),
@@ -282,7 +296,27 @@ mod tests {
 
     #[test]
     fn display_covers_public_error_variants() {
+        let expected_identity = FileStoreObjectIdentity {
+            directory_device: 1,
+            directory_inode: 2,
+            lock_device: 3,
+            lock_inode: 4,
+        };
+        let actual_identity = FileStoreObjectIdentity {
+            directory_device: 5,
+            directory_inode: 6,
+            lock_device: 7,
+            lock_inode: 8,
+        };
         let cases = [
+            (
+                Error::FileStoreIdentityMismatch {
+                    expected: expected_identity,
+                    actual: actual_identity,
+                }
+                .to_string(),
+                "file-store identity mismatch (expected FileStoreObjectIdentity { directory_device: 1, directory_inode: 2, lock_device: 3, lock_inode: 4 }, actual FileStoreObjectIdentity { directory_device: 5, directory_inode: 6, lock_device: 7, lock_inode: 8 })",
+            ),
             (
                 Error::KeyTooLong { len: 70_000 }.to_string(),
                 "key too long (70000 bytes; max 65535)",
@@ -363,6 +397,22 @@ mod tests {
         assert!(Error::InvalidTreeName { reason: "empty" }
             .source()
             .is_none());
+        assert!(Error::FileStoreIdentityMismatch {
+            expected: FileStoreObjectIdentity {
+                directory_device: 1,
+                directory_inode: 2,
+                lock_device: 3,
+                lock_inode: 4,
+            },
+            actual: FileStoreObjectIdentity {
+                directory_device: 5,
+                directory_inode: 6,
+                lock_device: 7,
+                lock_inode: 8,
+            },
+        }
+        .source()
+        .is_none());
         assert!(Error::TreeDropped.source().is_none());
         assert!(Error::SnapshotEpochExhausted.source().is_none());
     }

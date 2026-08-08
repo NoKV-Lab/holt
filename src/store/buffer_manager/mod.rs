@@ -1223,6 +1223,10 @@ impl BufferManager {
     pub(crate) fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
         self.store.file_store_object_identity()
     }
+
+    pub(crate) fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
+        self.store.validate_file_store_object_set()
+    }
 }
 
 impl BufferManager {
@@ -3296,6 +3300,10 @@ impl BufferManager {
 impl BlobStore for BufferManager {
     fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
         self.store.file_store_object_identity()
+    }
+
+    fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
+        self.store.validate_file_store_object_set()
     }
 
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {

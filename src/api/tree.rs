@@ -534,11 +534,25 @@ impl Tree {
     /// an empty one and writes it through, flushing before
     /// returning.
     pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
+        if cfg.expected_file_store_identity.is_some() {
+            return Err(Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expected_file_store_identity requires Storage::File",
+            )));
+        }
         let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
         Self::open_inner(cfg, bm, /*attach_journal=*/ false, None)
     }
 
     pub(crate) fn open_buffer_manager(cfg: &TreeConfig) -> Result<OpenedBufferManager> {
+        if cfg.expected_file_store_identity.is_some()
+            && !matches!(&cfg.storage, Storage::File { .. })
+        {
+            return Err(Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expected_file_store_identity requires Storage::File",
+            )));
+        }
         let opened = match &cfg.storage {
             Storage::Memory => {
                 let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
@@ -553,6 +567,7 @@ impl Tree {
                     let store = Arc::new(FileBlobStore::open_with_buffer_pool_hint(
                         dir,
                         cfg.buffer_pool_size,
+                        cfg.expected_file_store_identity,
                     )?);
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     let alloc_store = Arc::clone(&store);
@@ -571,7 +586,10 @@ impl Tree {
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    let store = Arc::new(FileBlobStore::open(dir)?);
+                    let store = Arc::new(FileBlobStore::open_with_expected_object_identity(
+                        dir,
+                        cfg.expected_file_store_identity,
+                    )?);
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     OpenedBufferManager {
                         manager: Arc::new(BufferManager::new_file(
@@ -598,6 +616,7 @@ impl Tree {
         file_store: Option<Arc<FileBlobStore>>,
     ) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
+        bm.validate_file_store_object_set()?;
         ensure_durable_root_blob(&bm, root_guid)?;
 
         let mut open_stats = OpenStats::default();
@@ -620,6 +639,7 @@ impl Tree {
                 None => (None, 1u64),
                 Some(file_store) => {
                     let wal = file_store.open_wal_file()?;
+                    file_store.validate_object_set()?;
                     let wal_len = wal.metadata()?.len();
                     let next_seq = if wal_len != 0 {
                         let start = std::time::Instant::now();
@@ -641,6 +661,7 @@ impl Tree {
                     } else {
                         1
                     };
+                    file_store.validate_object_set()?;
                     let journal =
                         Journal::open_or_create_file(wal, /*tree_id=*/ 0, file_store)?;
                     (Some(Arc::new(journal)), next_seq)

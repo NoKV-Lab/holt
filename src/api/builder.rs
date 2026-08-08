@@ -8,6 +8,7 @@ use super::tree::Tree;
 use crate::api::errors::Result;
 use crate::checkpoint::CheckpointConfig;
 use crate::store::blob_store::BlobStore;
+use crate::FileStoreObjectIdentity;
 
 /// Fluent constructor for [`Tree`].
 ///
@@ -64,6 +65,13 @@ impl TreeBuilder {
     /// [`Tree::checkpoint`] synchronously instead.
     pub fn checkpoint(mut self, cfg: CheckpointConfig) -> Self {
         self.cfg.checkpoint = cfg;
+        self
+    }
+
+    /// Require the existing file store to match `expected` before any
+    /// authoritative data, manifest, or WAL file is opened or repaired.
+    pub fn expected_file_store_identity(mut self, expected: FileStoreObjectIdentity) -> Self {
+        self.cfg.expected_file_store_identity = Some(expected);
         self
     }
 

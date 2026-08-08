@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::checkpoint::CheckpointConfig;
+use crate::store::blob_store::FileStoreObjectIdentity;
 
 const DEFAULT_FILE_BUFFER_POOL_SIZE: usize = 256;
 const DEFAULT_MEMORY_BUFFER_POOL_SIZE: usize = 64;
@@ -94,6 +95,13 @@ pub struct TreeConfig {
     /// file-backed service use; set `enabled = false` when callers
     /// want to drive [`crate::Tree::checkpoint`] manually.
     pub checkpoint: CheckpointConfig,
+    /// Required identity of the held file-store directory and `store.lock`.
+    ///
+    /// When set for file storage, open acquires the existing directory and
+    /// lock without creating or repairing anything, compares their `fstat`
+    /// identity exactly, and fails before touching authoritative store files
+    /// on mismatch. `None` permits first-time store creation.
+    pub expected_file_store_identity: Option<FileStoreObjectIdentity>,
 }
 
 impl TreeConfig {
@@ -108,6 +116,7 @@ impl TreeConfig {
             durability: Durability::Wal { sync: false },
             memory_flush_on_write: false,
             checkpoint: CheckpointConfig::default(),
+            expected_file_store_identity: None,
         }
     }
 
@@ -123,7 +132,15 @@ impl TreeConfig {
                 enabled: false,
                 ..CheckpointConfig::default()
             },
+            expected_file_store_identity: None,
         }
+    }
+
+    /// Require a specific held directory/lock identity when opening.
+    #[must_use]
+    pub fn with_expected_file_store_identity(mut self, expected: FileStoreObjectIdentity) -> Self {
+        self.expected_file_store_identity = Some(expected);
+        self
     }
 
     /// `true` iff [`Storage::Memory`].
@@ -138,7 +155,7 @@ impl TreeConfig {
     /// trees have no WAL. This is not the identity of a live store: after
     /// open, the configured directory may be renamed or replaced while Holt
     /// continues using its held directory and WAL descriptors. Use
-    /// [`crate::DB::file_store_object_identity`] when fencing a live DB.
+    /// [`crate::DB::validate_file_store_object_set`] when fencing a live DB.
     #[must_use]
     pub fn wal_path(&self) -> Option<PathBuf> {
         match &self.storage {

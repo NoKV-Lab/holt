@@ -162,10 +162,19 @@ impl DB {
     ///
     /// File-backed databases return the `(device, inode)` pairs for the
     /// directory and `store.lock` descriptors actually held by the live
-    /// store. Memory and custom stores return `None`.
+    /// store. This getter is stable open-time identity; call
+    /// [`Self::validate_file_store_object_set`] for a fresh full-set check.
+    /// Memory and custom stores return `None`.
     #[must_use]
     pub fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
         self.store.file_store_object_identity()
+    }
+
+    /// Revalidate every held file-store object against its current directory
+    /// entry and return the root fencing identity only on a stable two-pass
+    /// result. Memory and custom stores return `Ok(None)`.
+    pub fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
+        self.store.validate_file_store_object_set()
     }
 
     /// Open a multi-tree database using the supplied configuration.
@@ -195,10 +204,12 @@ impl DB {
         file_store: Option<Arc<FileBlobStore>>,
     ) -> Result<Self> {
         let mut open_stats = OpenStats::default();
+        bm.validate_file_store_object_set()?;
 
         let (journal, next_seq) = match file_store {
             Some(file_store) => {
                 let wal = file_store.open_wal_file()?;
+                file_store.validate_object_set()?;
                 let wal_len = wal.metadata()?.len();
                 let next_seq = if wal_len != 0 {
                     let start = std::time::Instant::now();
@@ -212,6 +223,7 @@ impl DB {
                 } else {
                     1
                 };
+                file_store.validate_object_set()?;
                 let journal = Journal::open_or_create_file(wal, 0, file_store)?;
                 (Some(Arc::new(journal)), next_seq)
             }
