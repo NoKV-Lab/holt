@@ -259,6 +259,10 @@ pub struct FileBlobStore {
     /// it here preserves the per-entry flock and supports dynamic name/fd
     /// validation without exposing the descriptor.
     wal_guard: Mutex<Option<File>>,
+    /// Fail-stop state shared with every descriptor-backed Journal opened
+    /// from this store. A manifest publication failure poisons this one gate;
+    /// already-open WAL handles must not outlive the mutation fence.
+    health: Arc<FileStoreHealth>,
     manifest: RwLock<Manifest>,
     /// Tracks GUID-to-slot updates that still need durable publication.
     /// Every blob rewrite uses a fresh shadow slot, so both inserts and
@@ -299,6 +303,40 @@ pub struct FileBlobStore {
     registered_buffers: Option<BlobBufPool>,
 }
 
+/// Dynamic fail-stop gate shared by the file store and its open Journal.
+///
+/// Readers are held only across Journal submission or durability cut points.
+/// Manifest poisoning takes the exclusive side, so a mutation either
+/// linearizes before poison or observes the sticky state before touching its
+/// authoritative boundary.
+#[derive(Debug, Default)]
+pub(crate) struct FileStoreHealth {
+    poisoned: RwLock<bool>,
+}
+
+pub(crate) struct FileStoreHealthPermit<'a> {
+    _guard: RwLockReadGuard<'a, bool>,
+}
+
+impl FileStoreHealth {
+    pub(crate) fn enter(&self) -> Result<FileStoreHealthPermit<'_>> {
+        let guard = self.poisoned.read().unwrap();
+        if *guard {
+            return Err(poisoned_manifest_error());
+        }
+        Ok(FileStoreHealthPermit { _guard: guard })
+    }
+
+    fn poison(&self) {
+        *self.poisoned.write().unwrap() = true;
+    }
+
+    #[cfg(test)]
+    fn is_poisoned(&self) -> bool {
+        *self.poisoned.read().unwrap()
+    }
+}
+
 #[derive(Debug)]
 struct Manifest {
     /// guid → packed-file slot.
@@ -328,10 +366,9 @@ struct Manifest {
     snapshot_file: Option<File>,
     /// Held descriptor for the append-only manifest log, if one exists.
     log_file: Option<File>,
-    /// Sticky fail-stop state after a publication race or externally linked
-    /// retired snapshot is observed. No later compaction is allowed to
-    /// accumulate additional retired descriptors.
-    snapshot_poisoned: bool,
+    /// Sticky fail-stop state shared with the owning store and every Journal
+    /// that already holds its WAL descriptor.
+    health: Arc<FileStoreHealth>,
     /// At most one externally linked retired snapshot is retained until drop
     /// so a compliant opener remains excluded by its inode flock.
     poisoned_snapshot_guard: Option<File>,
@@ -436,7 +473,11 @@ impl StoreDirectory {
     }
 
     fn open_existing_at(&self, name: &str, flags: libc::c_int) -> Result<Option<File>> {
-        match self.open_at(name, flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) {
+        match self.open_at(
+            name,
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        ) {
             Ok(file) => {
                 self.secure_authority_file(name, &file, false)?;
                 Ok(Some(file))
@@ -581,9 +622,37 @@ impl StoreDirectory {
     /// opens below repeat these checks against their lifetime descriptors.
     fn validate_preexisting_authority_files(&self) -> Result<()> {
         for name in PREEXISTING_AUTHORITY_FILENAMES {
-            drop(self.open_existing_at(name, libc::O_RDONLY)?);
+            let Some(metadata) = self.entry_metadata(name)? else {
+                continue;
+            };
+            let metadata = AuthorityFileMetadata::from_stat(metadata)?;
+            let expected_uid = unsafe { libc::geteuid() };
+            if !metadata.is_exact(expected_uid) {
+                return Err(unsafe_authority_file_error(name));
+            }
+            let file = self
+                .open_existing_at(name, libc::O_RDONLY)?
+                .ok_or_else(|| {
+                    Error::BlobStoreIo(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("file-store entry {name} disappeared during preflight"),
+                    ))
+                })?;
+            drop(file);
         }
         Ok(())
+    }
+
+    /// Validate the lock name without opening it. This rejects FIFOs and
+    /// other non-regular entries before an `open` could block; the later
+    /// descriptor open uses `O_NONBLOCK` and repeats every check.
+    fn validate_preexisting_lock_file(&self) -> Result<bool> {
+        let Some(metadata) = self.entry_metadata(LOCK_FILENAME)? else {
+            return Ok(false);
+        };
+        let metadata = LockFileMetadata::from_stat(metadata)?;
+        validate_lock_metadata(metadata, unsafe { libc::geteuid() })?;
+        Ok(true)
     }
 
     fn validate_authority_file_shape(
@@ -781,6 +850,12 @@ fn unsafe_authority_file_error(name: &str) -> Error {
     ))
 }
 
+fn poisoned_manifest_error() -> Error {
+    Error::BlobStoreIo(io::Error::other(
+        "manifest snapshot publication is poisoned",
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LockFileMetadata {
     mode: u32,
@@ -797,6 +872,16 @@ impl LockFileMetadata {
             uid: metadata.uid(),
             links: metadata.nlink(),
             size: metadata.len(),
+        })
+    }
+
+    fn from_stat(metadata: libc::stat) -> Result<Self> {
+        Ok(Self {
+            mode: stat_mode(&metadata),
+            uid: metadata.st_uid,
+            links: stat_links(&metadata),
+            size: u64::try_from(metadata.st_size)
+                .map_err(|_| Error::BlobStoreIo(io::Error::other("negative store.lock size")))?,
         })
     }
 }
@@ -834,30 +919,45 @@ fn lock_metadata_has_safe_shape(metadata: LockFileMetadata, expected_uid: u32) -
 }
 
 fn acquire_store_lock(directory: &StoreDirectory, path: &Path) -> Result<File> {
-    let (lock, created) = match directory.open_at(
-        LOCK_FILENAME,
-        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    ) {
-        Ok(lock) => (lock, true),
-        Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let lock = directory.open_at(
-                LOCK_FILENAME,
-                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )?;
-            (lock, false)
+    let preexisting = directory.validate_preexisting_lock_file()?;
+    let existing_flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let (lock, created) = if preexisting {
+        (directory.open_at(LOCK_FILENAME, existing_flags, 0)?, false)
+    } else {
+        match directory.open_at(
+            LOCK_FILENAME,
+            existing_flags | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(lock) => (lock, true),
+            Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // The name appeared after the non-opening preflight. Validate
+                // it before opening, then repeat every check on the fd.
+                if !directory.validate_preexisting_lock_file()? {
+                    return Err(Error::BlobStoreIo(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "store.lock disappeared during preflight",
+                    )));
+                }
+                (directory.open_at(LOCK_FILENAME, existing_flags, 0)?, false)
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
     finish_store_lock_open(directory, path, &lock, created)?;
     Ok(lock)
 }
 
 fn acquire_existing_store_lock_unmodified(directory: &StoreDirectory, path: &Path) -> Result<File> {
+    if !directory.validate_preexisting_lock_file()? {
+        return Err(Error::BlobStoreIo(io::Error::new(
+            io::ErrorKind::NotFound,
+            "expected store.lock is missing",
+        )));
+    }
     let lock = directory.open_at(
         LOCK_FILENAME,
-        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         0,
     )?;
     validate_lock_file(&lock)?;
@@ -1052,6 +1152,85 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     static MANIFEST_BEFORE_RENAME_BARRIER: std::cell::RefCell<Option<Arc<AuthorityRaceBarrier>>> =
         const { std::cell::RefCell::new(None) };
+    static MANIFEST_PERSIST_FAILPOINT: std::cell::Cell<Option<ManifestPersistFailpoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One-shot, thread-local persistence failures. Every call site is itself
+/// `cfg(test)`, leaving the production persistence path with no branch or
+/// environment lookup.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestPersistFailpoint {
+    PostDeltaSyncValidate,
+    SnapshotAuthorityValidate,
+    SnapshotTempCreate,
+    SnapshotCountEncode,
+    SnapshotHeaderWrite,
+    SnapshotNextSlotWrite,
+    SnapshotGuidWrite,
+    SnapshotSlotWrite,
+    SnapshotTempSync,
+    SnapshotTempValidate,
+    SnapshotOldValidate,
+    SnapshotRename,
+    SnapshotDirectorySync,
+    SnapshotNewValidate,
+    SnapshotRetiredMetadata,
+    LogPreValidate,
+    LogTruncate,
+    LogSync,
+    LogPostValidate,
+}
+
+#[cfg(test)]
+impl ManifestPersistFailpoint {
+    const ALL: [Self; 19] = [
+        Self::PostDeltaSyncValidate,
+        Self::SnapshotAuthorityValidate,
+        Self::SnapshotTempCreate,
+        Self::SnapshotCountEncode,
+        Self::SnapshotHeaderWrite,
+        Self::SnapshotNextSlotWrite,
+        Self::SnapshotGuidWrite,
+        Self::SnapshotSlotWrite,
+        Self::SnapshotTempSync,
+        Self::SnapshotTempValidate,
+        Self::SnapshotOldValidate,
+        Self::SnapshotRename,
+        Self::SnapshotDirectorySync,
+        Self::SnapshotNewValidate,
+        Self::SnapshotRetiredMetadata,
+        Self::LogPreValidate,
+        Self::LogTruncate,
+        Self::LogSync,
+        Self::LogPostValidate,
+    ];
+}
+
+#[cfg(test)]
+fn set_manifest_persist_failpoint(point: ManifestPersistFailpoint) {
+    MANIFEST_PERSIST_FAILPOINT.with(|slot| {
+        assert!(slot.replace(Some(point)).is_none());
+    });
+}
+
+#[cfg(test)]
+fn manifest_persist_failpoint(point: ManifestPersistFailpoint) -> Result<()> {
+    let fired = MANIFEST_PERSIST_FAILPOINT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if fired {
+        return Err(Error::BlobStoreIo(io::Error::other(format!(
+            "manifest persistence failpoint: {point:?}"
+        ))));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1158,7 +1337,8 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&directory)?;
+        let health = Arc::new(FileStoreHealth::default());
+        let manifest = Manifest::load_or_create(&directory, Arc::clone(&health))?;
         let wal_guard = directory.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
@@ -1184,6 +1364,7 @@ impl FileBlobStore {
             read_index_file,
             value_segment_file,
             wal_guard: Mutex::new(wal_guard),
+            health,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -1230,7 +1411,8 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&directory)?;
+        let health = Arc::new(FileStoreHealth::default());
+        let manifest = Manifest::load_or_create(&directory, Arc::clone(&health))?;
         let wal_guard = directory.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
@@ -1244,6 +1426,7 @@ impl FileBlobStore {
             read_index_file,
             value_segment_file,
             wal_guard: Mutex::new(wal_guard),
+            health,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -1283,6 +1466,10 @@ impl FileBlobStore {
             .validate_authority_file(WAL_FILENAME, &file)?;
         *guard = Some(file.try_clone()?);
         Ok(file)
+    }
+
+    pub(crate) fn journal_health(&self) -> Arc<FileStoreHealth> {
+        Arc::clone(&self.health)
     }
 
     /// Dynamically validate the entire authoritative file-store object set.
@@ -1403,7 +1590,8 @@ impl FileBlobStore {
     /// `data_io_lock` before checking, which orders later mutation attempts
     /// after the compaction attempt that first poisoned snapshot authority.
     fn ensure_mutations_healthy(&self) -> Result<()> {
-        self.manifest.read().unwrap().ensure_snapshot_healthy()
+        drop(self.health.enter()?);
+        Ok(())
     }
 
     fn clear_read_accelerator_slots(&self, guid: BlobGuid) -> Result<()> {
@@ -2527,7 +2715,7 @@ struct SlotMove {
 }
 
 impl Manifest {
-    fn load_or_create(directory: &StoreDirectory) -> Result<Self> {
+    fn load_or_create(directory: &StoreDirectory, health: Arc<FileStoreHealth>) -> Result<Self> {
         let mut snapshot_file = directory.open_existing_at(MANIFEST_FILENAME, libc::O_RDWR)?;
         let (mut entries, mut next_slot) = match snapshot_file.as_mut() {
             Some(file) => {
@@ -2572,7 +2760,7 @@ impl Manifest {
             pending_log: Vec::new(),
             snapshot_file,
             log_file,
-            snapshot_poisoned: false,
+            health,
             poisoned_snapshot_guard: None,
         })
     }
@@ -2740,12 +2928,26 @@ impl Manifest {
         directory.validate_authority_file(MANIFEST_LOG_FILENAME, f)?;
         f.write_all(&buf)?;
         f.sync_data()?;
-        directory.validate_authority_file(MANIFEST_LOG_FILENAME, f)?;
+        // `sync_data` is the irreversible boundary: retrying `pending_log`
+        // after this point would append the same logical delta again. Every
+        // later validation/publication/truncation error therefore poisons the
+        // shared store+Journal health state before it escapes.
+        let post_append = (|| {
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::PostDeltaSyncValidate)?;
+            let f = self.log_file.as_ref().expect("manifest log initialized");
+            directory.validate_authority_file(MANIFEST_LOG_FILENAME, f)?;
 
-        self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
-        if self.should_compact_log() {
-            self.persist_snapshot(directory)?;
-            self.truncate_log(directory)?;
+            self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
+            if self.should_compact_log() {
+                self.persist_snapshot(directory)?;
+                self.truncate_log(directory)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = post_append {
+            self.poison_snapshot(None);
+            return Err(error);
         }
         Ok(())
     }
@@ -2756,8 +2958,57 @@ impl Manifest {
             && self.log_bytes >= snapshot_bytes.saturating_mul(MANIFEST_LOG_COMPACT_RATIO)
     }
 
+    fn create_snapshot_temp(
+        &mut self,
+        directory: &StoreDirectory,
+        temp_name: &str,
+    ) -> Result<File> {
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotTempCreate)?;
+        let mut file = directory.create_new_at(temp_name, libc::O_RDWR)?;
+
+        let mut header = [0u8; 16];
+        header[..8].copy_from_slice(&MANIFEST_MAGIC);
+        header[8..10].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotCountEncode)?;
+        let count = u32::try_from(self.entries.len()).map_err(|_| {
+            Error::BlobStoreIo(io::Error::other("manifest slot count exceeds u32::MAX"))
+        })?;
+        header[10..14].copy_from_slice(&count.to_le_bytes());
+        // Bytes 14..16 reserved (zero).
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotHeaderWrite)?;
+        file.write_all(&header)?;
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotNextSlotWrite)?;
+        file.write_all(&self.next_slot.to_le_bytes())?;
+
+        for (guid, entry) in &self.entries {
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotGuidWrite)?;
+            file.write_all(guid)?;
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotSlotWrite)?;
+            file.write_all(&entry.slot.to_le_bytes())?;
+        }
+
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotTempSync)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotTempValidate)?;
+        if let Err(error) = directory.validate_authority_file(temp_name, &file) {
+            self.poison_snapshot(Some(file));
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     fn persist_snapshot(&mut self, directory: &StoreDirectory) -> Result<()> {
         self.ensure_snapshot_healthy()?;
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotAuthorityValidate)?;
         self.validate_snapshot_authority(directory)?;
 
         let temp_name = format!(
@@ -2765,32 +3016,12 @@ impl Manifest {
             std::process::id(),
             MANIFEST_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
-        let mut f = directory.create_new_at(&temp_name, libc::O_RDWR)?;
-
-        let mut hdr = [0u8; 16];
-        hdr[..8].copy_from_slice(&MANIFEST_MAGIC);
-        hdr[8..10].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
-        let count = u32::try_from(self.entries.len()).map_err(|_| {
-            Error::BlobStoreIo(io::Error::other("manifest slot count exceeds u32::MAX"))
-        })?;
-        hdr[10..14].copy_from_slice(&count.to_le_bytes());
-        // Bytes 14..16 reserved (zero).
-        f.write_all(&hdr)?;
-        f.write_all(&self.next_slot.to_le_bytes())?;
-
-        for (g, entry) in &self.entries {
-            f.write_all(g)?;
-            f.write_all(&entry.slot.to_le_bytes())?;
-        }
-
-        f.sync_all()?;
-        if let Err(error) = directory.validate_authority_file(&temp_name, &f) {
-            self.poison_snapshot(Some(f));
-            return Err(error);
-        }
+        let f = self.create_snapshot_temp(directory, &temp_name)?;
 
         let old_snapshot = self.snapshot_file.take();
         if let Some(old) = old_snapshot.as_ref() {
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotOldValidate)?;
             if let Err(error) = directory.validate_authority_file(MANIFEST_FILENAME, old) {
                 self.snapshot_file = old_snapshot;
                 self.poison_snapshot(None);
@@ -2799,6 +3030,8 @@ impl Manifest {
         }
         #[cfg(test)]
         pause_manifest_before_rename();
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotRename)?;
         if let Err(error) = directory.rename_at(&temp_name, MANIFEST_FILENAME) {
             self.snapshot_file = old_snapshot;
             self.poison_snapshot(Some(f));
@@ -2811,6 +3044,8 @@ impl Manifest {
         // (required by POSIX; ext4/xfs honour it). After rename, every error
         // is sticky: the new held fd remains installed and at most one old fd
         // with a surviving link is retained until drop.
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotDirectorySync)?;
         if let Err(error) = directory.sync() {
             let guard = old_snapshot
                 .take()
@@ -2826,6 +3061,8 @@ impl Manifest {
             .snapshot_file
             .as_ref()
             .expect("renamed manifest snapshot remains held");
+        #[cfg(test)]
+        manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotNewValidate)?;
         if let Err(error) = directory.validate_authority_file(MANIFEST_FILENAME, new_snapshot) {
             let guard = old_snapshot
                 .take()
@@ -2837,6 +3074,8 @@ impl Manifest {
             return Err(error);
         }
         if let Some(old) = old_snapshot {
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotRetiredMetadata)?;
             match AuthorityFileMetadata::from_file(&old) {
                 Ok(metadata) if metadata.links == 0 => {}
                 Ok(_) => {
@@ -2857,9 +3096,17 @@ impl Manifest {
     fn truncate_log(&mut self, directory: &StoreDirectory) -> Result<()> {
         self.ensure_snapshot_healthy()?;
         if let Some(f) = self.log_file.as_ref() {
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::LogPreValidate)?;
             directory.validate_authority_file(MANIFEST_LOG_FILENAME, f)?;
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::LogTruncate)?;
             f.set_len(0)?;
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::LogSync)?;
             f.sync_data()?;
+            #[cfg(test)]
+            manifest_persist_failpoint(ManifestPersistFailpoint::LogPostValidate)?;
             directory.validate_authority_file(MANIFEST_LOG_FILENAME, f)?;
         } else {
             ensure_authority_entry_absent(directory, MANIFEST_LOG_FILENAME)?;
@@ -2946,16 +3193,12 @@ impl Manifest {
     }
 
     fn ensure_snapshot_healthy(&self) -> Result<()> {
-        if self.snapshot_poisoned {
-            return Err(Error::BlobStoreIo(io::Error::other(
-                "manifest snapshot publication is poisoned",
-            )));
-        }
+        drop(self.health.enter()?);
         Ok(())
     }
 
     fn poison_snapshot(&mut self, guard: Option<File>) {
-        self.snapshot_poisoned = true;
+        self.health.poison();
         if self.poisoned_snapshot_guard.is_none() {
             self.poisoned_snapshot_guard = guard;
         }
@@ -3224,6 +3467,14 @@ mod tests {
         inode: u64,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestEntryState {
+        mode: u32,
+        device: u64,
+        inode: u64,
+        links: u64,
+    }
+
     fn file_state(path: &Path) -> TestFileState {
         let metadata = std::fs::metadata(path).unwrap();
         TestFileState {
@@ -3233,6 +3484,26 @@ mod tests {
             device: metadata.dev(),
             inode: metadata.ino(),
         }
+    }
+
+    fn entry_state(path: &Path) -> TestEntryState {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        TestEntryState {
+            mode: metadata.mode(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            links: metadata.nlink(),
+        }
+    }
+
+    fn create_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated pathname and `mkfifo` does
+        // not retain it after returning.
+        let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
     }
 
     fn buf_with(byte_at_100: u8) -> AlignedBlobBuf {
@@ -3494,6 +3765,42 @@ mod tests {
     }
 
     #[test]
+    fn fifo_data_and_lock_are_rejected_without_blocking_or_mutation() {
+        for name in [DATA_FILENAME, LOCK_FILENAME] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            create_fifo(&path);
+            let before = entry_state(&path);
+            let open_path = dir.path().to_path_buf();
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let worker = std::thread::spawn(move || {
+                let result = FileBlobStore::open(open_path);
+                let _ = done_tx.send(result.map(|_| ()));
+            });
+
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("opening FIFO authority {name} blocked"));
+            assert!(result.is_err(), "opening FIFO authority {name} succeeded");
+            worker.join().unwrap();
+            assert_eq!(
+                entry_state(&path),
+                before,
+                "FIFO authority {name} was modified"
+            );
+            let other = if name == DATA_FILENAME {
+                LOCK_FILENAME
+            } else {
+                DATA_FILENAME
+            };
+            assert!(
+                !dir.path().join(other).exists(),
+                "FIFO preflight created {other} before rejecting {name}"
+            );
+        }
+    }
+
+    #[test]
     fn hardlinked_data_is_rejected_without_mutating_source() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
@@ -3611,11 +3918,13 @@ mod tests {
     #[test]
     fn two_pass_validation_deterministically_catches_every_dynamic_authority_replacement() {
         for (ordinal, name) in [
+            DATA_FILENAME,
             READ_INDEX_FILENAME,
             VALUE_SEGMENT_FILENAME,
             MANIFEST_FILENAME,
             MANIFEST_LOG_FILENAME,
             WAL_FILENAME,
+            LOCK_FILENAME,
         ]
         .into_iter()
         .enumerate()
@@ -3679,7 +3988,7 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
         let (held_files, temp_entries) = {
             let manifest = store.manifest.read().unwrap();
-            assert!(manifest.snapshot_poisoned);
+            assert!(manifest.health.is_poisoned());
             assert!(manifest.poisoned_snapshot_guard.is_some());
             (
                 held_manifest_file_count(&manifest),
@@ -3731,7 +4040,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 74);
         let (held_files, temp_entries, entries, write_epoch) = {
             let manifest = store.manifest.read().unwrap();
-            assert!(manifest.snapshot_poisoned);
+            assert!(manifest.health.is_poisoned());
             assert_eq!(manifest.pending_log.len(), 1);
             (
                 held_manifest_file_count(&manifest),
@@ -3762,6 +4071,156 @@ mod tests {
         assert_eq!(store.data_write_epoch.load(Ordering::Acquire), write_epoch);
         assert_eq!(store.manifest.read().unwrap().entries, entries);
         assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 74);
+    }
+
+    #[test]
+    fn every_post_append_compaction_failure_is_sticky_and_bounded() {
+        for point in ManifestPersistFailpoint::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+
+            store.write_blob([0xE4; 16], &buf_with(0x54)).unwrap();
+            store.flush().unwrap();
+            store
+                .manifest
+                .write()
+                .unwrap()
+                .persist_snapshot(&store.directory)
+                .unwrap();
+            let log_path = dir.path().join(MANIFEST_LOG_FILENAME);
+            assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 37);
+
+            store.write_blob([0xE5; 16], &buf_with(0x55)).unwrap();
+            store.manifest.write().unwrap().log_bytes = MANIFEST_LOG_MIN_COMPACT_BYTES;
+            set_manifest_persist_failpoint(point);
+            let error = store.flush().unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("{point:?}")),
+                "{point:?} returned the wrong injected error: {error}"
+            );
+
+            let stable_log_len = std::fs::metadata(&log_path).unwrap().len();
+            let (stable_held_files, stable_temp_entries) = {
+                let manifest = store.manifest.read().unwrap();
+                assert!(
+                    manifest.health.is_poisoned(),
+                    "{point:?} did not poison the shared store health"
+                );
+                assert_eq!(manifest.pending_log.len(), 1);
+                (
+                    held_manifest_file_count(&manifest),
+                    manifest_temp_entry_count(dir.path()),
+                )
+            };
+
+            for _ in 0..3 {
+                assert!(
+                    store.flush().is_err(),
+                    "{point:?} retry unexpectedly succeeded"
+                );
+                assert_eq!(
+                    std::fs::metadata(&log_path).unwrap().len(),
+                    stable_log_len,
+                    "{point:?} retry appended or truncated the log again"
+                );
+                let manifest = store.manifest.read().unwrap();
+                assert_eq!(
+                    held_manifest_file_count(&manifest),
+                    stable_held_files,
+                    "{point:?} retry retained another descriptor"
+                );
+                assert_eq!(
+                    manifest_temp_entry_count(dir.path()),
+                    stable_temp_entries,
+                    "{point:?} retry allocated another staging file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_poison_fences_an_already_open_journal_submit_and_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        store.write_blob([0xE6; 16], &buf_with(0x56)).unwrap();
+        store.flush().unwrap();
+        store
+            .manifest
+            .write()
+            .unwrap()
+            .persist_snapshot(&store.directory)
+            .unwrap();
+
+        let store = Arc::new(store);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let wal = store.open_wal_file().unwrap();
+        let journal =
+            crate::journal::Journal::open_or_create_file(wal, 0, Arc::clone(&store)).unwrap();
+        let barrier = Arc::new(crate::journal::group_commit::JournalShutdownBarrier::new());
+        journal.install_shutdown_barrier(Arc::clone(&barrier));
+        assert!(
+            barrier.wait_before_drain(Duration::from_secs(1)),
+            "journal worker did not reach the deterministic pre-drain gate"
+        );
+
+        let mut record = journal.prepare_record(32).unwrap();
+        record.resize(32, 0xA5);
+        let ack = journal
+            .submit(record, true)
+            .unwrap()
+            .expect("sync submit returns an acknowledgement");
+        let target = journal.queued_work();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let waiter = std::thread::spawn(move || {
+            let _ = ack_tx.send(ack.wait());
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while journal.sync_target_for_test() < target {
+            assert!(
+                Instant::now() < deadline,
+                "ack waiter did not publish its sync target"
+            );
+            std::thread::yield_now();
+        }
+
+        store.write_blob([0xE7; 16], &buf_with(0x57)).unwrap();
+        store.manifest.write().unwrap().log_bytes = MANIFEST_LOG_MIN_COMPACT_BYTES;
+        set_manifest_persist_failpoint(ManifestPersistFailpoint::PostDeltaSyncValidate);
+        assert!(store.flush().is_err());
+        assert!(store.health.is_poisoned());
+
+        barrier.release_before_drain();
+        assert!(
+            ack_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("health-gated flusher did not wake the ack waiter")
+                .is_err(),
+            "an acknowledgement crossed the manifest poison boundary"
+        );
+        waiter.join().unwrap();
+
+        let queued = journal.queued_work();
+        assert!(journal.prepare_record(32).is_err());
+        assert_eq!(
+            journal.queued_work(),
+            queued,
+            "post-poison submit advanced the WAL order"
+        );
+        assert!(journal.flush_up_to(queued).is_err());
+
+        // Pre-send the final release so Drop can join without a timing
+        // dependency after the worker observes Stop.
+        barrier.release_before_exit();
+        drop(journal);
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            crate::journal::codec::FILE_HEADER_SIZE as u64,
+            "poisoned Journal wrote or acknowledged the queued record"
+        );
     }
 
     #[test]

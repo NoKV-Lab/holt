@@ -40,6 +40,7 @@ use std::time::Duration;
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 
 use crate::api::errors::{CommitPhase, Error, Result};
+use crate::store::blob_store::file::{FileBlobStore, FileStoreHealth, FileStoreHealthPermit};
 
 use super::codec::MAX_ATOMIC_WAL_RECORD_BYTES;
 use super::ring::{ReserveTicket, WalRing};
@@ -273,6 +274,10 @@ struct Shared {
     batches: AtomicU64,
     syncs: AtomicU64,
 
+    /// Shared fail-stop state for descriptor-backed file stores. Path-backed
+    /// Journal unit tests have no owning FileBlobStore and therefore no gate.
+    file_store_health: Option<Arc<FileStoreHealth>>,
+
     /// Sticky flusher phase/error; fanned out to commit waiters and future
     /// checkpoint barriers. Static context keeps the failure copyable without
     /// erasing whether append or sync became uncertain.
@@ -300,6 +305,11 @@ pub(crate) struct PreparedRecord<'a> {
     bytes: Option<Vec<u8>>,
     admitted_upper_bound: usize,
     permit: RecordLanePermit<'a>,
+    /// Descriptor-backed journals keep the shared health side from admission
+    /// through small-record publication. Oversized submit transfers the health
+    /// boundary to the flusher. This field follows the lane permit so drop
+    /// releases ordering before allowing poison to proceed.
+    file_store_health: Option<FileStoreHealthPermit<'a>>,
 }
 
 impl PreparedRecord<'_> {
@@ -405,6 +415,13 @@ impl JournalShutdownBarrier {
 }
 
 impl Shared {
+    fn enter_file_store_health(&self) -> Result<Option<FileStoreHealthPermit<'_>>> {
+        self.file_store_health
+            .as_ref()
+            .map(|health| health.enter())
+            .transpose()
+    }
+
     fn sticky_err(&self) -> Option<JournalFailure> {
         *self.err.lock().unwrap()
     }
@@ -436,7 +453,6 @@ impl Shared {
             .saturating_add(self.oversized_records.load(Ordering::Acquire));
 
         let mut sink_err: Option<&'static str> = None;
-        let mut freed_space = false;
         {
             let mut w = self.writer.lock().unwrap();
             let copied = self.ring.copy_committed_prefix(&mut |bytes| {
@@ -455,12 +471,27 @@ impl Shared {
             if copied > 0 {
                 self.written.fetch_max(written_to, Ordering::AcqRel);
                 self.batches.fetch_add(1, Ordering::Relaxed);
-                freed_space = true;
+                // Publish the freed ring space before a durability gate can
+                // wait behind manifest poison. A pre-poison submit holding a
+                // shared health permit may itself be parked on this cursor.
+                let _g = self.space_mx.lock().unwrap();
+                self.space_cv.notify_all();
             }
             let sync_target = self.sync_target.load(Ordering::Acquire);
             let flushed = self.flushed.load(Ordering::Acquire);
             let want_sync = sync_target > flushed && written_to >= sync_target;
             if want_sync {
+                // Appending already-accepted records may be needed to free
+                // ring space for a submit that linearized before poison. The
+                // durability/ACK boundary itself is fenced here.
+                let Ok(_health) = self.enter_file_store_health() else {
+                    drop(w);
+                    self.set_err(JournalFailure {
+                        phase: CommitPhase::WalSync,
+                        context: "file-store health gate rejected journal fsync",
+                    });
+                    return;
+                };
                 if w.flush().is_err() {
                     drop(w);
                     self.set_err(JournalFailure {
@@ -476,12 +507,6 @@ impl Shared {
         if self.flushed.load(Ordering::Acquire) >= self.sync_target.load(Ordering::Acquire) {
             let _g = self.flushed_mx.lock().unwrap();
             self.flushed_cv.notify_all();
-        }
-        if freed_space {
-            // The flusher advanced flush_cursor: wake any writer parked on
-            // ring backpressure.
-            let _g = self.space_mx.lock().unwrap();
-            self.space_cv.notify_all();
         }
     }
 
@@ -526,6 +551,12 @@ impl Shared {
     /// Block until `flushed >= target` (or a flusher error). Used by sync
     /// appends (`JournalAck::wait`) and `flush_up_to`.
     fn flush_to(&self, target: u64) -> std::result::Result<(), JournalFailure> {
+        // Reject even an already-satisfied ACK after the owning store has
+        // entered fail-stop. The final recheck below closes the wait race.
+        drop(self.enter_file_store_health().map_err(|_| JournalFailure {
+            phase: CommitPhase::WalSync,
+            context: "file-store health gate rejected journal acknowledgement",
+        })?);
         if target <= self.flushed.load(Ordering::Acquire) {
             return match self.sticky_err() {
                 Some(failure) => Err(failure),
@@ -547,7 +578,16 @@ impl Shared {
                 return Err(failure);
             }
             if self.flushed.load(Ordering::Acquire) >= target {
-                return Ok(());
+                let _health = self.enter_file_store_health().map_err(|_| JournalFailure {
+                    phase: CommitPhase::WalSync,
+                    context: "file-store health gate rejected journal acknowledgement",
+                })?;
+                if let Some(failure) = self.sticky_err() {
+                    return Err(failure);
+                }
+                if self.flushed.load(Ordering::Acquire) >= target {
+                    return Ok(());
+                }
             }
             let (next, timeout) = self
                 .flushed_cv
@@ -614,6 +654,13 @@ impl Shared {
         if self.sticky_err().is_some() {
             return;
         }
+        let Ok(_health) = self.enter_file_store_health() else {
+            self.set_err(JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "file-store health gate rejected journal final drain",
+            });
+            return;
+        };
         if self.writer.lock().unwrap().drain_to_os().is_err() {
             self.set_err(JournalFailure {
                 phase: CommitPhase::WalAppend,
@@ -633,6 +680,19 @@ impl Shared {
         if let Some(failure) = self.sticky_err() {
             return Err(failure);
         }
+
+        // Oversized submit releases its preparatory health permit before
+        // handing work to this thread. Re-enter here so the direct append is
+        // itself ordered against poison without recursively acquiring a read
+        // lock while a poison writer may be queued.
+        let Ok(_health) = self.enter_file_store_health() else {
+            let failure = JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "file-store health gate rejected journal oversized append",
+            };
+            self.set_err(failure);
+            return Err(failure);
+        };
 
         // A prior ring drain can leave a sub-threshold prefix in WalWriter's
         // private buffer. Hand it to the OS before attempting the large
@@ -691,11 +751,11 @@ impl JournalAck {
 pub(crate) struct Journal {
     shared: Arc<Shared>,
     handle: Mutex<Option<JoinHandle<()>>>,
-    /// Opaque owner of any resources whose exclusion lifetime must cover the
-    /// worker's final drain and join. `Drop` releases this explicitly after
-    /// join; the worker receives its own clone so neither side depends on
-    /// struct-field destruction order.
-    resource_guard: Option<Arc<dyn Send + Sync>>,
+    /// Owner of the descriptor set and health gate whose exclusion lifetime
+    /// must cover the worker's final drain and join. `Drop` releases this
+    /// explicitly after join; the worker receives its own clone so neither
+    /// side depends on struct-field destruction order.
+    resource_guard: Option<Arc<FileBlobStore>>,
 }
 
 impl Journal {
@@ -716,24 +776,18 @@ impl Journal {
         Self::from_writer_with_limits(writer, None, ring_capacity, max_record_bytes)
     }
 
-    /// Open a descriptor-backed WAL whose worker keeps `resource_guard` live.
-    ///
-    /// The guard is deliberately type-erased: the journal may retain the
-    /// file-store object set for the worker lifetime without depending on the
-    /// storage layer's concrete type or exposing any descriptor.
+    /// Open a descriptor-backed WAL whose worker keeps `resource_guard` and
+    /// its dynamic fail-stop state live.
     pub(crate) fn open_or_create_file(
         file: File,
         tree_id: u64,
-        resource_guard: Arc<dyn Send + Sync>,
+        resource_guard: Arc<FileBlobStore>,
     ) -> Result<Self> {
         let writer = WalWriter::open_or_create_file(file, tree_id)?;
         Self::from_writer(writer, Some(resource_guard))
     }
 
-    fn from_writer(
-        writer: WalWriter,
-        resource_guard: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<Self> {
+    fn from_writer(writer: WalWriter, resource_guard: Option<Arc<FileBlobStore>>) -> Result<Self> {
         Self::from_writer_with_limits(
             writer,
             resource_guard,
@@ -744,7 +798,7 @@ impl Journal {
 
     fn from_writer_with_limits(
         writer: WalWriter,
-        resource_guard: Option<Arc<dyn Send + Sync>>,
+        resource_guard: Option<Arc<FileBlobStore>>,
         ring_capacity: usize,
         max_record_bytes: usize,
     ) -> Result<Self> {
@@ -760,6 +814,9 @@ impl Journal {
         let initial_flushed = record_base.saturating_sub(1);
 
         let (control_tx, control_rx) = unbounded::<Control>();
+        let file_store_health = resource_guard
+            .as_ref()
+            .map(|file_store| file_store.journal_health());
         let shared = Arc::new(Shared {
             ring: WalRing::with_capacity(ring_capacity),
             record_lane: RecordLane::default(),
@@ -775,6 +832,7 @@ impl Journal {
             appends: AtomicU64::new(0),
             batches: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
+            file_store_health,
             err: Mutex::new(None),
             flushed_mx: Mutex::new(()),
             flushed_cv: Condvar::new(),
@@ -818,26 +876,45 @@ impl Journal {
         if let Some(failure) = self.shared.sticky_err() {
             return Err(Error::Internal(failure.context));
         }
-
+        // Lane admission precedes health admission. An oversized owner hands
+        // direct append to the flusher, which must acquire health itself;
+        // holding health while waiting behind that owner could deadlock with a
+        // queued poison writer. No mutation begins until both admissions pass.
         let permit = if admitted_upper_bound as u64 <= self.shared.ring.capacity() {
             self.shared.record_lane.enter_small()
         } else {
             self.shared.record_lane.enter_oversized()
+        };
+        let file_store_health = match self.shared.enter_file_store_health() {
+            Ok(health) => health,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
         };
         // A failure may race admission while this caller waits behind an
         // oversized writer. It is still a definite rejection: no caller is
         // allowed to mutate until this method returns a PreparedRecord.
         if let Some(failure) = self.shared.sticky_err() {
             drop(permit);
+            drop(file_store_health);
             return Err(Error::Internal(failure.context));
         }
 
-        let bytes = self.shared.record_buffer(admitted_upper_bound)?;
+        let bytes = match self.shared.record_buffer(admitted_upper_bound) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(permit);
+                drop(file_store_health);
+                return Err(error);
+            }
+        };
         Ok(PreparedRecord {
             shared: &self.shared,
             bytes: Some(bytes),
             admitted_upper_bound,
             permit,
+            file_store_health,
         })
     }
 
@@ -888,6 +965,12 @@ impl Journal {
                 self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1
             }
             RecordLaneKind::Oversized => {
+                // Transfer the health boundary to the flusher before waiting
+                // for its direct-append acknowledgement. Keeping this read
+                // permit while the worker re-entered health could deadlock
+                // behind a queued poison writer; the lane permit remains held
+                // until every success/error/channel-close path returns.
+                drop(record.file_store_health.take());
                 let bytes = record.take_bytes();
                 let target = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
                 let (ack, rx) = crossbeam_channel::bounded(1);
@@ -1034,6 +1117,11 @@ impl Journal {
         // relying on the idle poll deadline.
         let _ = self.shared.control_tx.send(Control::Flush);
     }
+
+    #[cfg(test)]
+    pub(crate) fn sync_target_for_test(&self) -> u64 {
+        self.shared.sync_target.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for Journal {
@@ -1051,7 +1139,7 @@ impl Drop for Journal {
 fn run_flusher(
     shared: Arc<Shared>,
     control_rx: Receiver<Control>,
-    _resource_guard: Option<Arc<dyn Send + Sync>>,
+    _resource_guard: Option<Arc<FileBlobStore>>,
 ) {
     #[cfg(test)]
     let mut shutdown_barrier = None;
@@ -1107,6 +1195,7 @@ fn do_truncate(shared: &Shared) -> Result<()> {
     if let Some(failure) = shared.sticky_err() {
         return Err(Error::Internal(failure.context));
     }
+    let _health = shared.enter_file_store_health()?;
     let mut w = shared.writer.lock().unwrap();
     w.truncate()?;
     drop(w);
