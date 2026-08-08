@@ -3986,6 +3986,80 @@ mod tests {
     }
 
     #[test]
+    fn put_many_if_absent_public_prefix_run_uses_exact_borrowed_admission() {
+        const OPERATIONS: usize = 64;
+        const PREFIX: &[u8] = b"public-prefix-run/";
+        const VALUE_BYTES: usize = 16;
+
+        assert!(PREFIX.len() >= super::INSERT_PREFIX_RUN_MIN_PREFIX);
+        let owned = (0..OPERATIONS)
+            .map(|index| {
+                let suffix = u8::try_from(index).unwrap();
+                let mut key = PREFIX.to_vec();
+                key.push(suffix);
+                (key, vec![suffix; VALUE_BYTES])
+            })
+            .collect::<Vec<_>>();
+        let entries = owned
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .collect::<Vec<_>>();
+
+        let exact = super::encoded_insert_only_batch_record_len(&entries);
+        let expected_prefix = super::BATCH_RECORD_ENVELOPE_LEN
+            + (1 + 8 + 4 + 4)
+            + PREFIX.len()
+            + OPERATIONS * (4 + 1 + 4 + VALUE_BYTES);
+        let naive_fixed = super::BATCH_RECORD_ENVELOPE_LEN
+            + (1 + 8 + 4 + 4 + 4)
+            + OPERATIONS * (PREFIX.len() + 1 + VALUE_BYTES);
+        assert_eq!(exact, expected_prefix);
+        assert!(exact < naive_fixed);
+        let ceiling = exact + (naive_fixed - exact) / 2;
+        assert!(exact < ceiling);
+        assert!(ceiling < naive_fixed);
+        super::BatchWalAdmission::new(exact, ceiling).unwrap();
+        assert!(matches!(
+            super::BatchWalAdmission::new(naive_fixed, ceiling),
+            Err(Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes,
+            }) if encoded_bytes == naive_fixed && max_bytes == ceiling
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            let journal = tree.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+            journal.set_max_record_bytes_for_test(ceiling);
+
+            let outcomes = tree.put_many_if_absent(&entries).unwrap();
+            assert_eq!(outcomes.len(), OPERATIONS);
+            assert!(outcomes
+                .iter()
+                .all(|outcome| *outcome == crate::PutOutcome::Created));
+            assert_eq!(journal.stats().appends, appends_before + 1);
+            for (index, (key, value)) in owned.iter().enumerate() {
+                let record = tree.get_record(key).unwrap().unwrap();
+                assert_eq!(record.value, *value);
+                assert_eq!(record.version.as_u64(), 1 + index as u64);
+            }
+        }
+
+        let reopened = Tree::open(cfg).unwrap();
+        for (index, (key, value)) in owned.iter().enumerate() {
+            let record = reopened.get_record(key).unwrap().unwrap();
+            assert_eq!(record.value, *value);
+            assert_eq!(record.version.as_u64(), 1 + index as u64);
+        }
+    }
+
+    #[test]
     fn replayed_rename_uses_bound_value_when_checkpoint_already_has_final_image() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = TreeConfig::new(dir.path());
