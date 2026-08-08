@@ -40,7 +40,8 @@ use crate::journal::wal_op::WalOp;
 use crate::journal::Journal;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{
-    AlignedBlobBuf, BlobStore, FileBlobStore, FileStoreObjectIdentity, MemoryBlobStore,
+    AlignedBlobBuf, BlobStore, FileBlobStore, FileStoreKind, FileStoreObjectIdentity,
+    FileStoreReservation, MemoryBlobStore,
 };
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
@@ -684,6 +685,33 @@ impl Tree {
         )
     }
 
+    /// Open a file-backed tree by adopting an exclusive pre-open reservation.
+    ///
+    /// The configured file locator must exactly match the reservation. Holt
+    /// uses the reservation's original directory and `store.lock`
+    /// open-file-descriptions instead of reopening either name, and preserves
+    /// its create-versus-existing intent through manifest and WAL recovery.
+    /// On any error or unwind the token remains ready and keeps the exclusion
+    /// lock; only a completely opened `Tree` consumes it.
+    pub fn open_with_file_store_reservation(
+        cfg: TreeConfig,
+        reservation: &mut FileStoreReservation,
+    ) -> Result<Self> {
+        let opened = Self::open_buffer_manager_with_file_store_reservation(
+            &cfg,
+            reservation,
+            FileStoreKind::StandaloneTree,
+        )?;
+        let tree = Self::open_inner(
+            cfg,
+            opened.manager,
+            /*attach_journal=*/ true,
+            opened.file_store,
+        )?;
+        reservation.mark_adopted();
+        Ok(tree)
+    }
+
     /// Open a tree with a caller-supplied [`BlobStore`].
     ///
     /// **No WAL is attached.** The caller's store has its own
@@ -779,6 +807,56 @@ impl Tree {
         Ok(opened)
     }
 
+    pub(crate) fn open_buffer_manager_with_file_store_reservation(
+        cfg: &TreeConfig,
+        reservation: &mut FileStoreReservation,
+        kind: FileStoreKind,
+    ) -> Result<OpenedBufferManager> {
+        let Storage::File { dir } = &cfg.storage else {
+            return Err(Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file-store reservation requires Storage::File",
+            )));
+        };
+        let store = Arc::new(FileBlobStore::open_with_reservation(
+            dir,
+            cfg.buffer_pool_size,
+            cfg.expected_file_store_identity,
+            reservation,
+            kind,
+        )?);
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let manager = {
+            let alloc_store = Arc::clone(&store);
+            Arc::new(BufferManager::new_file(
+                store_dyn,
+                cfg.buffer_pool_size,
+                move || {
+                    // SAFETY: BufferManager initializes every returned buffer
+                    // before reading it.
+                    unsafe { alloc_store.alloc_blob_buf_uninit() }
+                },
+            ))
+        };
+        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+        let manager = Arc::new(BufferManager::new_file(
+            store_dyn,
+            cfg.buffer_pool_size,
+            || {
+                // SAFETY: BufferManager initializes every returned buffer
+                // before reading it.
+                unsafe { AlignedBlobBuf::uninit() }
+            },
+        ));
+
+        Ok(OpenedBufferManager {
+            manager,
+            file_store: Some(store),
+        })
+    }
+
     fn open_inner(
         cfg: TreeConfig,
         bm: Arc<BufferManager>,
@@ -787,6 +865,15 @@ impl Tree {
     ) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
         bm.validate_file_store_object_set()?;
+        if file_store
+            .as_ref()
+            .is_some_and(|store| store.requires_existing_recovery_truth())
+            && !bm.has_blob(root_guid)?
+        {
+            return Err(Error::node_corrupt(
+                "standalone tree root missing from an existing store",
+            ));
+        }
         ensure_durable_root_blob(&bm, root_guid)?;
 
         let mut open_stats = OpenStats::default();
@@ -810,11 +897,14 @@ impl Tree {
                 Some(file_store) => {
                     let wal = file_store.open_wal_file()?;
                     file_store.validate_object_set()?;
+                    file_store.validate_wal_recovery_content(&wal)?;
                     let wal_len = wal.metadata()?.len();
                     let next_seq = if wal_len != 0 {
                         let start = std::time::Instant::now();
                         let (next_seq, replay_stats) =
-                            replay_wal(&wal, &bm, Some(0), |_| Ok(root_guid))?;
+                            replay_wal(&wal, &bm, Some(0), Some(file_store.as_ref()), |_| {
+                                Ok(root_guid)
+                            })?;
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -3414,6 +3504,7 @@ pub(crate) fn replay_wal<F>(
     file: &File,
     bm: &Arc<BufferManager>,
     expected_primitive_tree_id: Option<u64>,
+    recovery_store: Option<&FileBlobStore>,
     mut root_for_tree_id: F,
 ) -> Result<(u64, crate::journal::reader::ReplayStats)>
 where
@@ -3500,7 +3591,11 @@ where
     // crash hit mid-write, before its fdatasync), so truncating it to the
     // last complete record loses nothing durable — standard WAL recovery.
     if let Some(off) = stats.torn_tail_at {
-        file.set_len(off)?;
+        if let Some(store) = recovery_store {
+            store.truncate_wal_recovery_tail(file, off)?;
+        } else {
+            file.set_len(off)?;
+        }
     }
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything
@@ -4287,7 +4382,7 @@ mod tests {
         let store_dyn: Arc<dyn BlobStore> = store.clone();
         let bm = Arc::new(BufferManager::new(store_dyn, 2));
         let wal = std::fs::File::open(wal_path).unwrap();
-        let (next_seq, stats) = super::replay_wal(&wal, &bm, None, |tree_id| {
+        let (next_seq, stats) = super::replay_wal(&wal, &bm, None, None, |tree_id| {
             let mut guid = [0u8; 16];
             guid[..8].copy_from_slice(&tree_id.to_le_bytes());
             guid[15] = 0xA5;

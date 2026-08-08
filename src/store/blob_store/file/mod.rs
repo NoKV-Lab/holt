@@ -99,6 +99,15 @@
 //! Only an inode created by this open through `O_CREAT | O_EXCL` may have its
 //! umask-filtered mode normalized to 0600.
 //!
+//! Every name-based authority operation (open/create, manifest rename, and
+//! directory sync) validates the current configured locator, its leaf inside
+//! the held parent directory, and the held `store.lock` name/OFD before and
+//! after the operation. Once an authority descriptor is obtained through that
+//! boundary, positional data I/O stays on that same descriptor; Holt does not
+//! add path-stat syscalls to each page read/write or WAL append. Dynamic
+//! full-object validation and the shared store/Journal health gate remain the
+//! serving and durability cut points for those already-held descriptors.
+//!
 //! Holt does not walk and independently pin every ancestor component. POSIX
 //! also has no portable macOS/Linux operation that atomically validates a
 //! name and renames an already-open fd, so an actively hostile same-UID
@@ -114,7 +123,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -127,11 +136,15 @@ use std::time::{Duration, Instant};
 
 use crate::api::errors::{Error, Result};
 use crate::api::stats::{StoreStats, VacuumStats};
-use crate::layout::{BlobGuid, PAGE_SIZE};
+use crate::journal::reader::replay_file;
+use crate::layout::{BlobGuid, PAGE_SIZE, ROOT_BLOB_GUID};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
-use super::{AlignedBlobBuf, BlobStore, FileStoreObjectIdentity};
+use super::{
+    db_root_guid_for_tree_id, AlignedBlobBuf, BlobStore, FileStoreObjectIdentity,
+    DB_CATALOG_TREE_ID,
+};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use self::uring::UringContext;
@@ -228,7 +241,6 @@ const VALUE_SEGMENT_IO_ALIGN: usize = 512;
 const VALUE_SEGMENT_SLOT_BYTES: usize = PAGE_SIZE as usize;
 const FILE_TYPE_MASK: u32 = 0o170_000;
 const REGULAR_FILE_TYPE: u32 = 0o100_000;
-#[cfg(test)]
 const DIRECTORY_FILE_TYPE: u32 = 0o040_000;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
@@ -238,20 +250,11 @@ const DIRECTORY_FILE_TYPE: u32 = 0o040_000;
 /// atomic at the syscall boundary.
 #[derive(Debug)]
 pub struct FileBlobStore {
-    data_dir: PathBuf,
-    /// Pinned directory object used for every file open, rename, and
-    /// directory durability sync after startup. The lexical `data_dir` is
-    /// retained only for diagnostics.
-    directory: Arc<StoreDirectory>,
-    object_identity: FileStoreObjectIdentity,
-    /// Exclusive advisory lock on `data_dir`, held for the lifetime
-    /// of this instance. Two live instances on one directory would
-    /// each replay `manifest.log` into the same `next_slot`, assign
-    /// the same slot to different blob GUIDs, and append conflicting
-    /// set deltas — permanently corrupting the manifest. The kernel
-    /// releases the lock when this handle closes, so a crashed
-    /// holder never leaves a stale lock behind.
-    store_lock: File,
+    /// One indivisible root capability shared with a pre-open reservation.
+    /// It retains the configured parent/leaf binding, the directory object,
+    /// and the exact `store.lock` open-file-description for this instance's
+    /// complete lifetime.
+    root: Arc<HeldFileStoreRoot>,
     data_file: File,
     read_index_file: File,
     value_segment_file: File,
@@ -405,21 +408,212 @@ impl FreeSlotRange {
 
 #[derive(Debug)]
 pub(crate) struct StoreDirectory {
+    /// Full configured locator. This closes the case where the held parent
+    /// descriptor remains self-consistent after the pathname naming that
+    /// parent was renamed or replaced.
+    configured: PathBuf,
+    /// Directory containing the configured store leaf. Retaining this fd is
+    /// what lets later adoption distinguish the originally reserved name from
+    /// a path that was renamed, unlinked, or replaced in the meantime.
+    parent: File,
+    leaf: CString,
     file: File,
 }
 
+#[derive(Debug)]
+struct StorePath {
+    configured: PathBuf,
+    parent: PathBuf,
+    leaf: CString,
+}
+
+impl StorePath {
+    fn new(path: &Path) -> Result<Self> {
+        // Freeze the acquisition-time locator without resolving the final
+        // component. Relative caller spelling is retained separately by the
+        // reservation for configuration matching; authority checks use only
+        // this absolute lexical path after acquisition.
+        let configured = std::path::absolute(path)?;
+        let Some(std::path::Component::Normal(leaf)) = configured.components().next_back() else {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store path must end in a normal directory name",
+            )));
+        };
+        let leaf = CString::new(leaf.as_bytes()).map_err(|_| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store directory name contains NUL",
+            ))
+        })?;
+        let parent = configured
+            .parent()
+            .expect("an absolute path with a normal leaf has a parent")
+            .to_path_buf();
+        Ok(Self {
+            configured,
+            parent,
+            leaf,
+        })
+    }
+
+    fn open_parent(&self) -> Result<File> {
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&self.parent)?;
+        if !parent.metadata()?.is_dir() {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store parent is not a directory",
+            )));
+        }
+        Ok(parent)
+    }
+}
+
+fn openat_file(
+    directory: &File,
+    name: &CString,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> Result<File> {
+    let fd = loop {
+        // SAFETY: `directory` is a live directory descriptor, `name` is a
+        // NUL-terminated relative filename, and successful ownership of the
+        // returned descriptor is transferred exactly once to `File`.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                libc::c_uint::from(mode),
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(Error::BlobStoreIo(error));
+        }
+    };
+    // SAFETY: `openat` returned a new owned descriptor above.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn entry_metadata_at(directory: &File, name: &CString) -> Result<Option<libc::stat>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    loop {
+        // SAFETY: the directory and relative C string are live; `stat` points
+        // to writable storage initialized on success.
+        let rc = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: successful `fstatat` initialized the structure.
+            return Ok(Some(unsafe { stat.assume_init() }));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(Error::BlobStoreIo(error));
+    }
+}
+
 impl StoreDirectory {
-    fn open(path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(path)?;
-        Self::open_existing(path)
+    fn create_new(path: &Path) -> Result<Self> {
+        let locator = StorePath::new(path)?;
+        std::fs::create_dir_all(&locator.parent)?;
+        let parent = locator.open_parent()?;
+        if entry_metadata_at(&parent, &locator.leaf)?.is_some() {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "fresh file-store directory already exists at {}",
+                    locator.configured.display()
+                ),
+            )));
+        }
+        loop {
+            // SAFETY: `parent` and `leaf` remain live for the syscall.
+            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), locator.leaf.as_ptr(), 0o700) };
+            if rc == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(Error::BlobStoreIo(error));
+            }
+        }
+        parent.sync_all()?;
+        let file = openat_file(
+            &parent,
+            &locator.leaf,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        let directory = Self {
+            configured: locator.configured,
+            parent,
+            leaf: locator.leaf,
+            file,
+        };
+        directory.finish_open(&directory.configured)?;
+        // A process that won the directory flock during the narrow
+        // mkdir/open window must not turn Fresh into an implicit reopen.
+        directory.validate_fresh_authority_set()?;
+        Ok(directory)
     }
 
     fn open_existing(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        if !file.metadata()?.is_dir() {
+        let locator = StorePath::new(path)?;
+        let parent = locator.open_parent()?;
+        let file = openat_file(
+            &parent,
+            &locator.leaf,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        let directory = Self {
+            configured: locator.configured,
+            parent,
+            leaf: locator.leaf,
+            file,
+        };
+        directory.finish_open(&directory.configured)?;
+        Ok(directory)
+    }
+
+    fn open_or_create(path: &Path) -> Result<(Self, bool)> {
+        match Self::open_existing(path) {
+            Ok(directory) => Ok((directory, false)),
+            Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::NotFound => {
+                match Self::create_new(path) {
+                    Ok(directory) => Ok((directory, true)),
+                    Err(Error::BlobStoreIo(error))
+                        if error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        Self::open_existing(path).map(|directory| (directory, false))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_open(&self, path: &Path) -> Result<()> {
+        if !self.file.metadata()?.is_dir() {
             return Err(Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-store path is not a directory",
@@ -429,46 +623,85 @@ impl StoreDirectory {
         // same-directory unlink/replacement of store.lock unable to admit a
         // second compliant opener; a rename of the directory itself yields a
         // distinct object identity and all I/O below remains pinned here.
-        acquire_flock(&file, path, DIR_LOCK_ACQUIRE_TIMEOUT, "store directory")?;
+        self.validate_binding()?;
+        acquire_flock(
+            &self.file,
+            path,
+            DIR_LOCK_ACQUIRE_TIMEOUT,
+            "store directory",
+        )?;
         pause_after_directory_open();
-        Ok(Self { file })
+        self.validate_binding()
+    }
+
+    fn validate_binding(&self) -> Result<()> {
+        let held = self.file.metadata()?;
+        let parent_linked = entry_metadata_at(&self.parent, &self.leaf)?.ok_or_else(|| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file-store directory was unlinked while reserved",
+            ))
+        })?;
+        if stat_mode(&parent_linked) & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
+            || held.dev() != stat_device(&parent_linked)?
+            || held.ino() != parent_linked.st_ino
+        {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "file-store directory was renamed or replaced while reserved",
+            )));
+        }
+        let locator_linked = std::fs::symlink_metadata(&self.configured)?;
+        if !locator_linked.is_dir()
+            || held.dev() != locator_linked.dev()
+            || held.ino() != locator_linked.ino()
+        {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "configured file-store locator no longer names the held directory",
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_fresh_authority_set(&self) -> Result<()> {
+        for name in std::iter::once(LOCK_FILENAME).chain(PREEXISTING_AUTHORITY_FILENAMES) {
+            if self.entry_metadata(name)?.is_some() {
+                return Err(Error::BlobStoreIo(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "fresh file-store directory gained authority files while being reserved",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_fresh_data_authority_set(&self) -> Result<()> {
+        for name in PREEXISTING_AUTHORITY_FILENAMES {
+            if self.entry_metadata(name)?.is_some() {
+                return Err(Error::BlobStoreIo(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "fresh file-store directory gained authority files while being reserved",
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn open_at(&self, name: &str, flags: libc::c_int, mode: libc::mode_t) -> Result<File> {
+        self.validate_binding()?;
         let name = CString::new(name).map_err(|_| {
             Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-store filename contains NUL",
             ))
         })?;
-        let fd = loop {
-            // SAFETY: `self.file` is a live directory descriptor, `name` is a
-            // NUL-terminated relative filename, and successful ownership of
-            // the returned descriptor is transferred exactly once to `File`.
-            let fd = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    flags,
-                    libc::c_uint::from(mode),
-                )
-            };
-            if fd >= 0 {
-                break fd;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(Error::BlobStoreIo(error));
-            }
-        };
-        // SAFETY: `openat` returned a new owned descriptor above.
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = openat_file(&self.file, &name, flags, mode)?;
         if !file.metadata()?.is_file() {
             return Err(Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("file-store entry {name:?} is not a regular file"),
             )));
         }
+        self.validate_binding()?;
         Ok(file)
     }
 
@@ -510,50 +743,64 @@ impl StoreDirectory {
     }
 
     fn create_new_at(&self, name: &str, flags: libc::c_int) -> Result<File> {
-        let file = self.open_at(
-            name,
+        self.create_new_at_with_identity(name, flags, |_| Ok(()))
+    }
+
+    fn create_new_at_with_identity<F>(
+        &self,
+        name: &str,
+        flags: libc::c_int,
+        record_identity: F,
+    ) -> Result<File>
+    where
+        F: FnOnce(AuthorityFileIdentity) -> Result<()>,
+    {
+        self.validate_binding()?;
+        let relative_name = CString::new(name).map_err(|_| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store filename contains NUL",
+            ))
+        })?;
+        let file = openat_file(
+            &self.file,
+            &relative_name,
             flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
+        let metadata = AuthorityFileMetadata::from_file(&file)?;
+        // The inode is now irrevocably named. Record its identity before any
+        // locator revalidation, chmod, or sync can fail so the same live
+        // reservation can distinguish its own partial create on retry.
+        record_identity(metadata.identity())?;
+        if metadata.mode & FILE_TYPE_MASK != REGULAR_FILE_TYPE {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file-store entry {relative_name:?} is not a regular file"),
+            )));
+        }
+        self.validate_binding()?;
+        #[cfg(test)]
+        reservation_authority_create_failpoint()?;
         self.secure_authority_file(name, &file, true)?;
         Ok(file)
     }
 
     fn entry_metadata(&self, name: &str) -> Result<Option<libc::stat>> {
+        self.validate_binding()?;
         let name = CString::new(name).map_err(|_| {
             Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-store filename contains NUL",
             ))
         })?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        loop {
-            // SAFETY: the directory and relative C string are live; `stat`
-            // points to writable storage initialized on success.
-            let rc = unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc == 0 {
-                // SAFETY: successful `fstatat` initialized the structure.
-                return Ok(Some(unsafe { stat.assume_init() }));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(Error::BlobStoreIo(error));
-        }
+        let metadata = entry_metadata_at(&self.file, &name)?;
+        self.validate_binding()?;
+        Ok(metadata)
     }
 
     fn rename_at(&self, from: &str, to: &str) -> Result<()> {
+        self.validate_binding()?;
         let from = CString::new(from).expect("static filename has no NUL");
         let to = CString::new(to).expect("static filename has no NUL");
         loop {
@@ -568,6 +815,7 @@ impl StoreDirectory {
                 )
             };
             if rc == 0 {
+                self.validate_binding()?;
                 return Ok(());
             }
             let error = io::Error::last_os_error();
@@ -578,7 +826,9 @@ impl StoreDirectory {
     }
 
     fn sync(&self) -> Result<()> {
+        self.validate_binding()?;
         self.file.sync_all()?;
+        self.validate_binding()?;
         Ok(())
     }
 
@@ -702,14 +952,1036 @@ impl StoreDirectory {
         }
         Ok(final_held.identity())
     }
+}
 
-    pub(crate) fn open_wal(&self) -> Result<File> {
-        let file = self.open_or_create_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
-        // Startup is the only creation point. Syncing the held directory is
-        // cheap here and makes a newly-created WAL name durable without ever
-        // reopening the configured pathname.
-        self.sync()?;
+/// The indivisible kernel-object capability behind a reservation and an open
+/// file store. Sharing this value shares the original directory and lock
+/// open-file-descriptions; no descriptor is reopened during adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileStoreKind {
+    Db,
+    StandaloneTree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileContentWitness {
+    bytes: u64,
+    crc32: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorityContentTruth {
+    identity: AuthorityFileIdentity,
+    content: FileContentWitness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestRecoveryTruth {
+    identities: ManifestFileIdentities,
+    snapshot_content: Option<FileContentWitness>,
+    log_content: Option<FileContentWitness>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExistingRecoveryTruth {
+    kind: FileStoreKind,
+    data: AuthorityFileIdentity,
+    read_index: AuthorityFileIdentity,
+    value_segment: AuthorityFileIdentity,
+    manifest: ManifestRecoveryTruth,
+    wal: AuthorityContentTruth,
+}
+
+fn file_content_witness(file: &File) -> Result<FileContentWitness> {
+    let bytes = file.metadata()?.len();
+    let witness = file_prefix_content_witness(file, bytes)?;
+    if file.metadata()?.len() != bytes {
+        return Err(reservation_adoption_error(
+            "recovery authority length changed during read-only proof",
+        ));
+    }
+    Ok(witness)
+}
+
+fn file_prefix_content_witness(file: &File, bytes: u64) -> Result<FileContentWitness> {
+    const CHUNK_BYTES: usize = 16 * 1024;
+
+    if file.metadata()?.len() < bytes {
+        return Err(reservation_adoption_error(
+            "recovery authority is shorter than its validated prefix",
+        ));
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; CHUNK_BYTES];
+    let mut offset = 0u64;
+    while offset < bytes {
+        let remaining = bytes - offset;
+        let count = usize::try_from(remaining.min(CHUNK_BYTES as u64))
+            .expect("witness chunk length is bounded by CHUNK_BYTES");
+        file.read_exact_at(&mut buffer[..count], offset)?;
+        hasher.update(&buffer[..count]);
+        offset += count as u64;
+    }
+    Ok(FileContentWitness {
+        bytes,
+        crc32: hasher.finalize(),
+    })
+}
+
+fn classify_existing_store_kind(
+    entries: &HashMap<BlobGuid, ManifestEntry>,
+) -> Result<FileStoreKind> {
+    match (
+        entries.contains_key(&db_root_guid_for_tree_id(DB_CATALOG_TREE_ID)),
+        entries.contains_key(&ROOT_BLOB_GUID),
+    ) {
+        (true, false) => Ok(FileStoreKind::Db),
+        (false, true) => Ok(FileStoreKind::StandaloneTree),
+        (false, false) => Err(Error::node_corrupt(
+            "FileBlobStore::Manifest::store kind root is missing",
+        )),
+        (true, true) => Err(Error::node_corrupt(
+            "FileBlobStore::Manifest::store kind is ambiguous",
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ReservationAdoptionState {
+    Create {
+        kind: Option<FileStoreKind>,
+        created: HashMap<String, AuthorityFileIdentity>,
+    },
+    ExistingUnverified,
+    ReadyExisting(ExistingRecoveryTruth),
+    ExistingVerified(ExistingRecoveryTruth),
+    OpenOrCreate,
+    Adopted,
+}
+
+#[derive(Debug)]
+struct HeldFileStoreRoot {
+    data_dir: PathBuf,
+    directory: Arc<StoreDirectory>,
+    store_lock: Arc<File>,
+    object_identity: FileStoreObjectIdentity,
+    adoption: Mutex<ReservationAdoptionState>,
+}
+
+impl HeldFileStoreRoot {
+    fn bind_kind(&self, requested: FileStoreKind) -> Result<()> {
+        let mut state = self.adoption.lock().unwrap();
+        match &mut *state {
+            ReservationAdoptionState::Create { kind, .. } => match *kind {
+                None => {
+                    *kind = Some(requested);
+                    Ok(())
+                }
+                Some(bound) if bound == requested => Ok(()),
+                Some(_) => Err(reservation_adoption_error(
+                    "fresh reservation is permanently bound to a different store kind",
+                )),
+            },
+            ReservationAdoptionState::ReadyExisting(truth)
+            | ReservationAdoptionState::ExistingVerified(truth)
+                if truth.kind == requested =>
+            {
+                Ok(())
+            }
+            ReservationAdoptionState::ReadyExisting(_)
+            | ReservationAdoptionState::ExistingVerified(_) => Err(reservation_adoption_error(
+                "existing reservation store kind does not match the requested API",
+            )),
+            ReservationAdoptionState::ExistingUnverified => Err(reservation_adoption_error(
+                "existing reservation has not proved its store kind",
+            )),
+            ReservationAdoptionState::OpenOrCreate => Ok(()),
+            ReservationAdoptionState::Adopted => Err(reservation_adoption_error(
+                "file-store reservation was already adopted",
+            )),
+        }
+    }
+
+    fn validate(&self) -> Result<FileStoreObjectIdentity> {
+        // `StoreDirectory::validate_binding` jointly proves the full locator
+        // and leaf stability inside the held parent, including replacement of
+        // the whole configured parent path.
+        self.directory.validate_binding()?;
+        acquire_flock(
+            &self.directory.file,
+            &self.data_dir,
+            Duration::ZERO,
+            "store directory",
+        )?;
+        self.directory.validate_binding()?;
+        validate_lock_file(&self.store_lock)?;
+        acquire_flock(
+            &self.store_lock,
+            &self.data_dir,
+            Duration::ZERO,
+            LOCK_FILENAME,
+        )?;
+        validate_lock_file(&self.store_lock)?;
+        verify_named_lock(&self.directory, &self.store_lock)?;
+        validate_lock_file(&self.store_lock)?;
+        self.directory.validate_binding()?;
+        let actual = object_identity(&self.directory, &self.store_lock)?;
+        if actual != self.object_identity {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "held file-store root identity changed",
+            )));
+        }
+        Ok(actual)
+    }
+
+    fn adoption_state(&self) -> ReservationAdoptionState {
+        self.adoption.lock().unwrap().clone()
+    }
+
+    fn prepare_for_adoption(&self) -> Result<()> {
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. } => {
+                self.validate_create_authority_set(&created)
+            }
+            ReservationAdoptionState::ExistingUnverified => Err(reservation_adoption_error(
+                "existing reservation has not proved durable recovery truth",
+            )),
+            ReservationAdoptionState::ReadyExisting(expected) => {
+                let actual = self.prove_existing_recovery_truth()?;
+                if expected != actual {
+                    return Err(reservation_adoption_error(
+                        "existing recovery authority changed after reservation",
+                    ));
+                }
+                let mut state = self.adoption.lock().unwrap();
+                match &*state {
+                    ReservationAdoptionState::ReadyExisting(current) if *current == expected => {
+                        *state = ReservationAdoptionState::ExistingVerified(expected);
+                        Ok(())
+                    }
+                    ReservationAdoptionState::ExistingVerified(current) if *current == expected => {
+                        Ok(())
+                    }
+                    _ => Err(reservation_adoption_error(
+                        "file-store reservation adoption state changed during validation",
+                    )),
+                }
+            }
+            ReservationAdoptionState::ExistingVerified(truth) => {
+                self.validate_existing_recovery_truth(truth)
+            }
+            ReservationAdoptionState::OpenOrCreate => self.validate().map(|_| ()),
+            ReservationAdoptionState::Adopted => Err(reservation_adoption_error(
+                "file-store reservation was already adopted",
+            )),
+        }
+    }
+
+    fn mark_ready_existing(&self) -> Result<()> {
+        let truth = self.prove_existing_recovery_truth()?;
+        let mut state = self.adoption.lock().unwrap();
+        if !matches!(*state, ReservationAdoptionState::ExistingUnverified) {
+            return Err(reservation_adoption_error(
+                "existing reservation state changed during acquisition",
+            ));
+        }
+        *state = ReservationAdoptionState::ReadyExisting(truth);
+        Ok(())
+    }
+
+    fn mark_adopted(&self) {
+        let mut state = self.adoption.lock().unwrap();
+        debug_assert!(!matches!(*state, ReservationAdoptionState::Adopted));
+        *state = ReservationAdoptionState::Adopted;
+    }
+
+    fn open_existing_at_unrestricted(
+        &self,
+        name: &str,
+        flags: libc::c_int,
+    ) -> Result<Option<File>> {
+        self.validate()?;
+        let file = self.directory.open_existing_at(name, flags)?;
+        self.validate()?;
         Ok(file)
+    }
+
+    fn open_existing_at(&self, name: &str, flags: libc::c_int) -> Result<Option<File>> {
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. } => {
+                self.validate_create_authority_set(&created)?;
+                let file = if let Some(expected) = created.get(name).copied() {
+                    Some(self.open_created_authority_at(name, flags, expected)?)
+                } else {
+                    let file = self.open_existing_at_unrestricted(name, flags)?;
+                    if file.is_some() {
+                        return Err(reservation_adoption_error(
+                            "fresh reservation refused an authority file it did not create",
+                        ));
+                    }
+                    None
+                };
+                self.validate_create_authority_set(&created)?;
+                Ok(file)
+            }
+            ReservationAdoptionState::ExistingUnverified
+            | ReservationAdoptionState::ReadyExisting(_) => Err(reservation_adoption_error(
+                "existing reservation has not proved durable recovery truth",
+            )),
+            ReservationAdoptionState::ExistingVerified(truth) => {
+                self.validate_existing_recovery_truth(truth)?;
+                let file = self.open_existing_at_unrestricted(name, flags)?;
+                self.validate_existing_recovery_truth(truth)?;
+                Ok(file)
+            }
+            ReservationAdoptionState::OpenOrCreate | ReservationAdoptionState::Adopted => {
+                self.open_existing_at_unrestricted(name, flags)
+            }
+        }
+    }
+
+    fn open_or_create_at(&self, name: &str, flags: libc::c_int) -> Result<File> {
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. } => {
+                self.open_or_create_for_create(name, flags, &created)
+            }
+            ReservationAdoptionState::ExistingUnverified
+            | ReservationAdoptionState::ReadyExisting(_) => Err(reservation_adoption_error(
+                "existing reservation has not proved durable recovery truth",
+            )),
+            ReservationAdoptionState::ExistingVerified(truth) => {
+                self.validate_existing_recovery_truth(truth)?;
+                let file = self
+                    .directory
+                    .open_existing_at(name, flags)?
+                    .ok_or_else(|| missing_existing_authority_error(name))?;
+                self.validate_existing_recovery_truth(truth)?;
+                Ok(file)
+            }
+            ReservationAdoptionState::OpenOrCreate | ReservationAdoptionState::Adopted => {
+                self.validate()?;
+                let file = self.directory.open_or_create_at(name, flags)?;
+                self.validate()?;
+                Ok(file)
+            }
+        }
+    }
+
+    fn create_new_at(&self, name: &str, flags: libc::c_int) -> Result<File> {
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. } => {
+                self.create_new_for_create(name, flags, &created)
+            }
+            ReservationAdoptionState::ExistingUnverified
+            | ReservationAdoptionState::ReadyExisting(_)
+            | ReservationAdoptionState::ExistingVerified(_) => Err(reservation_adoption_error(
+                "existing reservation refused authority-file creation before adoption",
+            )),
+            ReservationAdoptionState::OpenOrCreate | ReservationAdoptionState::Adopted => {
+                self.validate()?;
+                let file = self.directory.create_new_at(name, flags)?;
+                self.validate()?;
+                Ok(file)
+            }
+        }
+    }
+
+    fn entry_metadata(&self, name: &str) -> Result<Option<libc::stat>> {
+        self.validate()?;
+        let metadata = self.directory.entry_metadata(name)?;
+        self.validate()?;
+        Ok(metadata)
+    }
+
+    fn rename_at(&self, from: &str, to: &str) -> Result<()> {
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. } => {
+                self.rename_for_create(from, to, &created)
+            }
+            ReservationAdoptionState::ExistingUnverified
+            | ReservationAdoptionState::ReadyExisting(_)
+            | ReservationAdoptionState::ExistingVerified(_) => Err(reservation_adoption_error(
+                "existing reservation refused authority-file rename before adoption",
+            )),
+            ReservationAdoptionState::OpenOrCreate | ReservationAdoptionState::Adopted => {
+                self.validate()?;
+                self.directory.rename_at(from, to)?;
+                self.validate()?;
+                Ok(())
+            }
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.validate()?;
+        self.directory.sync()?;
+        self.validate()?;
+        Ok(())
+    }
+
+    fn validate_authority_file(&self, name: &str, file: &File) -> Result<AuthorityFileIdentity> {
+        self.validate()?;
+        let identity = self.directory.validate_authority_file(name, file)?;
+        self.validate()?;
+        match self.adoption_state() {
+            ReservationAdoptionState::Create { created, .. }
+                if created.get(name).copied() != Some(identity) =>
+            {
+                return Err(reservation_adoption_error(
+                    "fresh reservation authority descriptor is not in its creation ledger",
+                ));
+            }
+            ReservationAdoptionState::ExistingUnverified
+            | ReservationAdoptionState::ReadyExisting(_) => {
+                return Err(reservation_adoption_error(
+                    "existing reservation has not proved durable recovery truth",
+                ));
+            }
+            ReservationAdoptionState::ExistingVerified(truth) => {
+                self.validate_existing_recovery_truth(truth)?;
+            }
+            ReservationAdoptionState::Create { .. }
+            | ReservationAdoptionState::OpenOrCreate
+            | ReservationAdoptionState::Adopted => {}
+        }
+        Ok(identity)
+    }
+
+    fn open_wal(&self) -> Result<File> {
+        self.validate()?;
+        let file = self.open_or_create_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
+        self.sync()?;
+        self.validate()?;
+        Ok(file)
+    }
+
+    fn open_or_create_for_create(
+        &self,
+        name: &str,
+        flags: libc::c_int,
+        created: &HashMap<String, AuthorityFileIdentity>,
+    ) -> Result<File> {
+        self.validate_create_authority_set(created)?;
+        if let Some(expected) = created.get(name).copied() {
+            let file = self.open_created_authority_at(name, flags, expected)?;
+            self.validate_create_authority_set(created)?;
+            return Ok(file);
+        }
+
+        let file = self
+            .directory
+            .create_new_at_with_identity(name, flags, |identity| {
+                self.record_created_authority(name, identity)
+            })?;
+        self.validate()?;
+        Ok(file)
+    }
+
+    fn create_new_for_create(
+        &self,
+        name: &str,
+        flags: libc::c_int,
+        created: &HashMap<String, AuthorityFileIdentity>,
+    ) -> Result<File> {
+        self.validate_create_authority_set(created)?;
+        if created.contains_key(name) {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("fresh reservation already created file-store entry {name}"),
+            )));
+        }
+        let file = self
+            .directory
+            .create_new_at_with_identity(name, flags, |identity| {
+                self.record_created_authority(name, identity)
+            })?;
+        self.validate()?;
+        Ok(file)
+    }
+
+    fn open_created_authority_at(
+        &self,
+        name: &str,
+        flags: libc::c_int,
+        expected: AuthorityFileIdentity,
+    ) -> Result<File> {
+        self.validate()?;
+        let file = self.directory.open_at(
+            name,
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )?;
+        let actual = AuthorityFileMetadata::from_file(&file)?;
+        if !actual.has_safe_shape(unsafe { libc::geteuid() }) || actual.identity() != expected {
+            return Err(created_authority_replaced_error(name));
+        }
+        self.directory.secure_authority_file(name, &file, true)?;
+        self.validate()?;
+        Ok(file)
+    }
+
+    fn record_created_authority(&self, name: &str, identity: AuthorityFileIdentity) -> Result<()> {
+        let mut state = self.adoption.lock().unwrap();
+        let ReservationAdoptionState::Create { created, .. } = &mut *state else {
+            return Err(reservation_adoption_error(
+                "fresh reservation state changed while recording a created inode",
+            ));
+        };
+        match created.entry(name.to_owned()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(identity);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == identity => {
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(created_authority_replaced_error(name))
+            }
+        }
+    }
+
+    fn rename_for_create(
+        &self,
+        from: &str,
+        to: &str,
+        created: &HashMap<String, AuthorityFileIdentity>,
+    ) -> Result<()> {
+        self.validate_create_authority_set(created)?;
+        let moved = created.get(from).copied().ok_or_else(|| {
+            reservation_adoption_error("fresh reservation refused a foreign rename source")
+        })?;
+        self.directory.rename_at(from, to)?;
+        let actual = self
+            .directory
+            .entry_metadata(to)?
+            .ok_or_else(|| missing_created_authority_error(to))?;
+        let actual = AuthorityFileMetadata::from_stat(actual)?;
+        if actual.identity() != moved {
+            return Err(created_authority_replaced_error(to));
+        }
+        let mut state = self.adoption.lock().unwrap();
+        let ReservationAdoptionState::Create { created, .. } = &mut *state else {
+            return Err(reservation_adoption_error(
+                "fresh reservation state changed while recording a rename",
+            ));
+        };
+        created.remove(from);
+        created.insert(to.to_owned(), moved);
+        drop(state);
+        self.validate()?;
+        Ok(())
+    }
+
+    fn validate_create_authority_set(
+        &self,
+        created: &HashMap<String, AuthorityFileIdentity>,
+    ) -> Result<()> {
+        self.validate()?;
+        for name in PREEXISTING_AUTHORITY_FILENAMES {
+            self.validate_created_authority_name(name, created.get(name).copied())?;
+        }
+        for (name, expected) in created {
+            if !PREEXISTING_AUTHORITY_FILENAMES.contains(&name.as_str()) {
+                self.validate_created_authority_name(name, Some(*expected))?;
+            }
+        }
+        self.validate()?;
+        Ok(())
+    }
+
+    fn validate_created_authority_name(
+        &self,
+        name: &str,
+        expected: Option<AuthorityFileIdentity>,
+    ) -> Result<()> {
+        let actual = self.directory.entry_metadata(name)?;
+        match (actual, expected) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(missing_created_authority_error(name)),
+            (Some(_), None) => Err(reservation_adoption_error(
+                "fresh reservation found an authority inode outside its creation ledger",
+            )),
+            (Some(actual), Some(expected)) => {
+                let actual = AuthorityFileMetadata::from_stat(actual)?;
+                if !actual.has_safe_shape(unsafe { libc::geteuid() })
+                    || actual.identity() != expected
+                {
+                    return Err(created_authority_replaced_error(name));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn prove_existing_recovery_truth(&self) -> Result<ExistingRecoveryTruth> {
+        let data = self
+            .open_existing_at_unrestricted(DATA_FILENAME, libc::O_RDONLY)?
+            .ok_or_else(|| missing_existing_authority_error(DATA_FILENAME))?;
+        let data_identity = self
+            .directory
+            .validate_authority_file(DATA_FILENAME, &data)?;
+        let data_len = data.metadata()?.len();
+        let read_index = self
+            .open_existing_at_unrestricted(READ_INDEX_FILENAME, libc::O_RDONLY)?
+            .ok_or_else(|| missing_existing_authority_error(READ_INDEX_FILENAME))?;
+        let read_index_identity = self
+            .directory
+            .validate_authority_file(READ_INDEX_FILENAME, &read_index)?;
+        let value_segment = self
+            .open_existing_at_unrestricted(VALUE_SEGMENT_FILENAME, libc::O_RDONLY)?
+            .ok_or_else(|| missing_existing_authority_error(VALUE_SEGMENT_FILENAME))?;
+        let value_segment_identity = self
+            .directory
+            .validate_authority_file(VALUE_SEGMENT_FILENAME, &value_segment)?;
+        let (manifest, kind) = Manifest::prove_existing_recovery_truth(self, data_len)?;
+        let wal = self
+            .open_existing_at_unrestricted(WAL_FILENAME, libc::O_RDONLY)?
+            .ok_or_else(|| missing_existing_authority_error(WAL_FILENAME))?;
+        let wal_content_before = file_content_witness(&wal)?;
+        replay_file(&wal, 0, None, |_, _, _| Ok(()))?;
+        let wal_identity = self.directory.validate_authority_file(WAL_FILENAME, &wal)?;
+        let wal_content_after = file_content_witness(&wal)?;
+        if wal_content_before != wal_content_after {
+            return Err(reservation_adoption_error(
+                "WAL content changed during read-only recovery proof",
+            ));
+        }
+        let truth = ExistingRecoveryTruth {
+            kind,
+            data: data_identity,
+            read_index: read_index_identity,
+            value_segment: value_segment_identity,
+            manifest,
+            wal: AuthorityContentTruth {
+                identity: wal_identity,
+                content: wal_content_after,
+            },
+        };
+        self.validate_existing_recovery_truth(truth)?;
+        Ok(truth)
+    }
+
+    fn validate_existing_recovery_truth(&self, truth: ExistingRecoveryTruth) -> Result<()> {
+        self.validate()?;
+        self.validate_existing_authority_name(DATA_FILENAME, Some(truth.data))?;
+        self.validate_existing_authority_name(READ_INDEX_FILENAME, Some(truth.read_index))?;
+        self.validate_existing_authority_name(VALUE_SEGMENT_FILENAME, Some(truth.value_segment))?;
+        self.validate_existing_authority_name(
+            MANIFEST_FILENAME,
+            truth.manifest.identities.snapshot,
+        )?;
+        self.validate_existing_authority_name(
+            MANIFEST_LOG_FILENAME,
+            truth.manifest.identities.log,
+        )?;
+        self.validate_existing_authority_name(WAL_FILENAME, Some(truth.wal.identity))?;
+        self.validate()?;
+        Ok(())
+    }
+
+    fn validate_manifest_content_before_recovery(&self) -> Result<()> {
+        let ReservationAdoptionState::ExistingVerified(truth) = self.adoption_state() else {
+            return Ok(());
+        };
+        self.validate_existing_content(
+            MANIFEST_FILENAME,
+            truth.manifest.identities.snapshot,
+            truth.manifest.snapshot_content,
+        )?;
+        self.validate_existing_content(
+            MANIFEST_LOG_FILENAME,
+            truth.manifest.identities.log,
+            truth.manifest.log_content,
+        )
+    }
+
+    fn validate_wal_content_before_recovery(&self, file: &File) -> Result<()> {
+        let ReservationAdoptionState::ExistingVerified(truth) = self.adoption_state() else {
+            return Ok(());
+        };
+        let identity = self.directory.validate_authority_file(WAL_FILENAME, file)?;
+        let content = file_content_witness(file)?;
+        if identity != truth.wal.identity || content != truth.wal.content {
+            return Err(reservation_adoption_error(
+                "WAL changed after its read-only recovery proof",
+            ));
+        }
+        Ok(())
+    }
+
+    fn truncate_wal_recovery_tail(&self, file: &File, valid_bytes: u64) -> Result<()> {
+        let ReservationAdoptionState::ExistingVerified(expected) = self.adoption_state() else {
+            file.set_len(valid_bytes)?;
+            return Ok(());
+        };
+        self.validate_wal_content_before_recovery(file)?;
+        let repaired_content = file_prefix_content_witness(file, valid_bytes)?;
+        let mut state = self.adoption.lock().unwrap();
+        let ReservationAdoptionState::ExistingVerified(current) = &mut *state else {
+            return Err(reservation_adoption_error(
+                "existing reservation state changed before WAL repair",
+            ));
+        };
+        if *current != expected {
+            return Err(reservation_adoption_error(
+                "existing recovery truth changed before WAL repair",
+            ));
+        }
+        file.set_len(valid_bytes)?;
+        current.wal.content = repaired_content;
+        Ok(())
+    }
+
+    fn validate_manifest_file_content_before_recovery(
+        &self,
+        name: &str,
+        file: &File,
+    ) -> Result<()> {
+        let ReservationAdoptionState::ExistingVerified(truth) = self.adoption_state() else {
+            return Ok(());
+        };
+        let (expected_identity, expected_content) = match name {
+            MANIFEST_FILENAME => (
+                truth.manifest.identities.snapshot,
+                truth.manifest.snapshot_content,
+            ),
+            MANIFEST_LOG_FILENAME => (truth.manifest.identities.log, truth.manifest.log_content),
+            _ => {
+                return Err(Error::BlobStoreIo(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "content witness requested for a non-manifest authority file",
+                )))
+            }
+        };
+        let identity = self.directory.validate_authority_file(name, file)?;
+        let content = file_content_witness(file)?;
+        if Some(identity) != expected_identity || Some(content) != expected_content {
+            return Err(reservation_adoption_error(
+                "manifest changed after its read-only recovery proof",
+            ));
+        }
+        Ok(())
+    }
+
+    fn truncate_manifest_log_recovery_tail(
+        &self,
+        file: &File,
+        replay: ManifestLogReplay,
+    ) -> Result<()> {
+        let ReservationAdoptionState::ExistingVerified(expected) = self.adoption_state() else {
+            file.set_len(replay.valid_bytes)?;
+            return Ok(());
+        };
+        self.validate_manifest_file_content_before_recovery(MANIFEST_LOG_FILENAME, file)?;
+        let mut state = self.adoption.lock().unwrap();
+        let ReservationAdoptionState::ExistingVerified(current) = &mut *state else {
+            return Err(reservation_adoption_error(
+                "existing reservation state changed before manifest repair",
+            ));
+        };
+        if *current != expected {
+            return Err(reservation_adoption_error(
+                "existing recovery truth changed before manifest repair",
+            ));
+        }
+        file.set_len(replay.valid_bytes)?;
+        current.manifest.log_content = Some(replay.valid_content);
+        Ok(())
+    }
+
+    fn validate_existing_content(
+        &self,
+        name: &str,
+        expected_identity: Option<AuthorityFileIdentity>,
+        expected_content: Option<FileContentWitness>,
+    ) -> Result<()> {
+        let file = self.open_existing_at_unrestricted(name, libc::O_RDONLY)?;
+        match (file, expected_identity, expected_content) {
+            (None, None, None) => Ok(()),
+            (Some(file), Some(expected_identity), Some(expected_content)) => {
+                let identity = self.directory.validate_authority_file(name, &file)?;
+                let content = file_content_witness(&file)?;
+                if identity != expected_identity || content != expected_content {
+                    return Err(reservation_adoption_error(
+                        "manifest content changed after its read-only recovery proof",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(reservation_adoption_error(
+                "manifest authority set changed after its read-only recovery proof",
+            )),
+        }
+    }
+
+    fn validate_existing_authority_name(
+        &self,
+        name: &str,
+        expected: Option<AuthorityFileIdentity>,
+    ) -> Result<()> {
+        let actual = self.directory.entry_metadata(name)?;
+        match (actual, expected) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(missing_existing_authority_error(name)),
+            (Some(_), None) => Err(reservation_adoption_error(
+                "existing reservation recovery authority set changed after proof",
+            )),
+            (Some(actual), Some(expected)) => {
+                let actual = AuthorityFileMetadata::from_stat(actual)?;
+                if !actual.is_exact(unsafe { libc::geteuid() }) || actual.identity() != expected {
+                    return Err(reservation_adoption_error(
+                        "existing reservation recovery authority inode changed after proof",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStoreReservationMode {
+    Create,
+    ReadyExisting,
+    OpenOrCreate,
+}
+
+fn reservation_adoption_error(message: &'static str) -> Error {
+    Error::BlobStoreIo(io::Error::new(io::ErrorKind::PermissionDenied, message))
+}
+
+fn missing_existing_authority_error(name: &str) -> Error {
+    Error::BlobStoreIo(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("existing file-store recovery authority {name} is missing"),
+    ))
+}
+
+fn missing_created_authority_error(name: &str) -> Error {
+    Error::BlobStoreIo(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("file-store entry {name} created by this reservation is missing"),
+    ))
+}
+
+fn created_authority_replaced_error(name: &str) -> Error {
+    Error::BlobStoreIo(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("file-store entry {name} no longer matches this reservation's creation ledger"),
+    ))
+}
+
+/// An exclusive pre-open reservation for one file-backed Holt store.
+///
+/// The token is intentionally not [`Clone`]. While ready, it retains the
+/// original parent-directory descriptor, store leaf name, store-directory
+/// descriptor, and `store.lock` open-file-description. A successful
+/// [`crate::DB::open_with_file_store_reservation`] or
+/// [`crate::Tree::open_with_file_store_reservation`] adopts those exact
+/// kernel objects; an error or unwind leaves the token ready and locked for a
+/// later retry.
+///
+/// A create token also keeps a private `(name, device, inode)` ledger for
+/// every authority file it creates, so a retry cannot adopt bytes inserted by
+/// another actor. An existing token becomes ready only after read-only
+/// validation of a non-empty manifest, its packed-data bounds, both required
+/// accelerator inodes, and a complete WAL scan; that authority set remains
+/// pinned to the token until adoption succeeds.
+pub struct FileStoreReservation {
+    data_dir: PathBuf,
+    object_identity: FileStoreObjectIdentity,
+    mode: FileStoreReservationMode,
+    root: Option<Arc<HeldFileStoreRoot>>,
+}
+
+impl std::fmt::Debug for FileStoreReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileStoreReservation")
+            .field("object_identity", &self.object_identity)
+            .field("mode", &self.mode)
+            .field("ready", &self.root.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileStoreReservation {
+    /// Exclusively create and reserve a fresh store directory.
+    ///
+    /// This operation fails with [`io::ErrorKind::AlreadyExists`] if the leaf
+    /// already exists; Fresh never silently adopts an existing store.
+    pub fn acquire_for_create<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
+        let data_dir = data_dir.into();
+        let root = reserve_store_root(
+            &data_dir,
+            RootAcquireMode::Create,
+            FileStoreReservationMode::Create,
+        )?;
+        Ok(Self::from_root(
+            root,
+            FileStoreReservationMode::Create,
+            data_dir,
+        ))
+    }
+
+    /// Exclusively reserve an existing store whose held directory and
+    /// `store.lock` identity must equal `expected`.
+    ///
+    /// This operation never creates or repairs the directory, lock, or any
+    /// authoritative store entry. It returns a ready token only after a
+    /// read-only proof of recognizable data, manifest, and WAL recovery
+    /// truth; a merely prepared directory is not an existing store.
+    pub fn acquire_existing<P: Into<PathBuf>>(
+        data_dir: P,
+        expected: FileStoreObjectIdentity,
+    ) -> Result<Self> {
+        let data_dir = data_dir.into();
+        let root = reserve_store_root(
+            &data_dir,
+            RootAcquireMode::Existing(expected),
+            FileStoreReservationMode::ReadyExisting,
+        )?;
+        root.mark_ready_existing()?;
+        Ok(Self::from_root(
+            root,
+            FileStoreReservationMode::ReadyExisting,
+            data_dir,
+        ))
+    }
+
+    fn acquire_open_or_create(
+        data_dir: PathBuf,
+        expected: Option<FileStoreObjectIdentity>,
+    ) -> Result<Self> {
+        let mode = expected.map_or(RootAcquireMode::OpenOrCreate, RootAcquireMode::Existing);
+        let root = reserve_store_root(&data_dir, mode, FileStoreReservationMode::OpenOrCreate)?;
+        Ok(Self::from_root(
+            root,
+            FileStoreReservationMode::OpenOrCreate,
+            data_dir,
+        ))
+    }
+
+    fn from_root(
+        root: Arc<HeldFileStoreRoot>,
+        mode: FileStoreReservationMode,
+        configured_dir: PathBuf,
+    ) -> Self {
+        Self {
+            data_dir: configured_dir,
+            object_identity: root.object_identity,
+            mode,
+            root: Some(root),
+        }
+    }
+
+    /// Caller-supplied store locator used for exact configuration matching.
+    ///
+    /// Authority checks do not resolve this spelling again; they use the
+    /// absolute lexical locator frozen when the reservation was acquired.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Filesystem identity obtained from the descriptors this token holds.
+    #[must_use]
+    pub fn object_identity(&self) -> FileStoreObjectIdentity {
+        self.object_identity
+    }
+
+    /// Whether this token still owns a reservation that can be adopted.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.root.is_some()
+    }
+
+    /// Revalidate the reserved parent/leaf, directory, and lock binding.
+    pub fn validate(&self) -> Result<FileStoreObjectIdentity> {
+        self.ready_root()?.validate()
+    }
+
+    fn ready_root(&self) -> Result<&Arc<HeldFileStoreRoot>> {
+        self.root.as_ref().ok_or_else(|| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store reservation was already adopted",
+            ))
+        })
+    }
+
+    fn root_for_open(
+        &self,
+        configured_dir: &Path,
+        expected: Option<FileStoreObjectIdentity>,
+        kind: FileStoreKind,
+    ) -> Result<Arc<HeldFileStoreRoot>> {
+        if configured_dir != self.data_dir {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "file-store reservation locator {} does not match configured locator {}",
+                    self.data_dir.display(),
+                    configured_dir.display()
+                ),
+            )));
+        }
+        if self.mode == FileStoreReservationMode::Create && expected.is_some() {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fresh file-store reservation cannot satisfy an expected existing identity",
+            )));
+        }
+        if let Some(expected) = expected {
+            if expected != self.object_identity {
+                return Err(Error::FileStoreIdentityMismatch {
+                    expected,
+                    actual: self.object_identity,
+                });
+            }
+        }
+        let root = Arc::clone(self.ready_root()?);
+        // This state-only transition precedes locator validation and every
+        // authority-file open performed by adoption. Errors and unwinds keep
+        // the same permanent binding on the still-ready token.
+        root.bind_kind(kind)?;
+        root.validate()?;
+        Ok(root)
+    }
+
+    fn root_for_open_or_create(
+        &self,
+        configured_dir: &Path,
+        expected: Option<FileStoreObjectIdentity>,
+    ) -> Result<Arc<HeldFileStoreRoot>> {
+        debug_assert_eq!(self.mode, FileStoreReservationMode::OpenOrCreate);
+        if configured_dir != self.data_dir {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "internal file-store locator changed while opening",
+            )));
+        }
+        if let Some(expected) = expected {
+            if expected != self.object_identity {
+                return Err(Error::FileStoreIdentityMismatch {
+                    expected,
+                    actual: self.object_identity,
+                });
+            }
+        }
+        let root = Arc::clone(self.ready_root()?);
+        root.validate()?;
+        Ok(root)
+    }
+
+    pub(crate) fn mark_adopted(&mut self) {
+        debug_assert!(self.root.is_some());
+        panic_before_reservation_mark_adopted();
+        if let Some(root) = self.root.as_ref() {
+            root.mark_adopted();
+        }
+        drop(self.root.take());
     }
 }
 
@@ -948,6 +2220,21 @@ fn acquire_store_lock(directory: &StoreDirectory, path: &Path) -> Result<File> {
     Ok(lock)
 }
 
+fn create_store_lock(directory: &StoreDirectory, path: &Path) -> Result<File> {
+    let lock = directory.open_at(
+        LOCK_FILENAME,
+        libc::O_RDWR
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CREAT
+            | libc::O_EXCL,
+        0o600,
+    )?;
+    finish_store_lock_open(directory, path, &lock, true)?;
+    Ok(lock)
+}
+
 fn acquire_existing_store_lock_unmodified(directory: &StoreDirectory, path: &Path) -> Result<File> {
     if !directory.validate_preexisting_lock_file()? {
         return Err(Error::BlobStoreIo(io::Error::new(
@@ -1035,34 +2322,75 @@ fn object_identity(directory: &StoreDirectory, lock: &File) -> Result<FileStoreO
     })
 }
 
-fn open_store_root(
+#[derive(Debug, Clone, Copy)]
+enum RootAcquireMode {
+    Create,
+    Existing(FileStoreObjectIdentity),
+    OpenOrCreate,
+}
+
+fn reserve_store_root(
     data_dir: &Path,
-    expected: Option<FileStoreObjectIdentity>,
-) -> Result<(Arc<StoreDirectory>, File, FileStoreObjectIdentity)> {
-    if let Some(expected) = expected {
-        // Expected-aware reopen is deliberately non-creating and
-        // non-repairing until both held kernel objects compare exactly.
-        let directory = Arc::new(StoreDirectory::open_existing(data_dir)?);
-        let store_lock = acquire_existing_store_lock_unmodified(&directory, data_dir)?;
-        let actual = object_identity(&directory, &store_lock)?;
-        if actual != expected {
-            return Err(Error::FileStoreIdentityMismatch { expected, actual });
+    mode: RootAcquireMode,
+    reservation_mode: FileStoreReservationMode,
+) -> Result<Arc<HeldFileStoreRoot>> {
+    let (directory, store_lock) = match mode {
+        RootAcquireMode::Create => {
+            let directory = Arc::new(StoreDirectory::create_new(data_dir)?);
+            let store_lock = create_store_lock(&directory, data_dir)?;
+            directory.validate_fresh_data_authority_set()?;
+            (directory, store_lock)
         }
-        finish_store_lock_open(&directory, data_dir, &store_lock, false)?;
-        Ok((directory, store_lock, actual))
-    } else {
-        let directory = Arc::new(StoreDirectory::open(data_dir)?);
-        directory.validate_preexisting_authority_files()?;
-        let store_lock = acquire_store_lock(&directory, data_dir)?;
-        let actual = object_identity(&directory, &store_lock)?;
-        Ok((directory, store_lock, actual))
-    }
+        RootAcquireMode::Existing(expected) => {
+            // Expected-aware reservation is deliberately non-creating and
+            // non-repairing until both held kernel objects compare exactly.
+            let directory = Arc::new(StoreDirectory::open_existing(data_dir)?);
+            let store_lock = acquire_existing_store_lock_unmodified(&directory, data_dir)?;
+            let actual = object_identity(&directory, &store_lock)?;
+            if actual != expected {
+                return Err(Error::FileStoreIdentityMismatch { expected, actual });
+            }
+            finish_store_lock_open(&directory, data_dir, &store_lock, false)?;
+            directory.validate_preexisting_authority_files()?;
+            (directory, store_lock)
+        }
+        RootAcquireMode::OpenOrCreate => {
+            let (directory, _created) = StoreDirectory::open_or_create(data_dir)?;
+            let directory = Arc::new(directory);
+            directory.validate_preexisting_authority_files()?;
+            let store_lock = acquire_store_lock(&directory, data_dir)?;
+            (directory, store_lock)
+        }
+    };
+    let store_lock = Arc::new(store_lock);
+    let object_identity = object_identity(&directory, &store_lock)?;
+    let root = Arc::new(HeldFileStoreRoot {
+        data_dir: directory.configured.clone(),
+        directory,
+        store_lock,
+        object_identity,
+        adoption: Mutex::new(match reservation_mode {
+            FileStoreReservationMode::Create => ReservationAdoptionState::Create {
+                kind: None,
+                created: HashMap::new(),
+            },
+            FileStoreReservationMode::ReadyExisting => ReservationAdoptionState::ExistingUnverified,
+            FileStoreReservationMode::OpenOrCreate => ReservationAdoptionState::OpenOrCreate,
+        }),
+    });
+    root.validate()?;
+    Ok(root)
 }
 
 #[cfg(test)]
 std::thread_local! {
     static LOCK_CONTENTION_NOTIFIER: std::cell::RefCell<Option<crossbeam_channel::Sender<()>>> =
         const { std::cell::RefCell::new(None) };
+    static RESERVATION_ADOPTION_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RESERVATION_OUTER_ADOPTION_PANIC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static RESERVATION_AUTHORITY_CREATE_ERROR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1084,7 +2412,54 @@ impl FileBlobStore {
     ) {
         LOCK_CONTENTION_NOTIFIER.with(|slot| *slot.borrow_mut() = Some(notifier));
     }
+
+    pub(crate) fn panic_next_reservation_adoption_for_test() {
+        RESERVATION_ADOPTION_PANIC.with(|slot| slot.set(true));
+    }
+
+    pub(crate) fn fail_next_reservation_authority_create_for_test() {
+        RESERVATION_AUTHORITY_CREATE_ERROR.with(|slot| slot.set(true));
+    }
+
+    pub(crate) fn panic_next_reservation_outer_adoption_for_test() {
+        RESERVATION_OUTER_ADOPTION_PANIC.with(|slot| slot.set(true));
+    }
 }
+
+#[cfg(test)]
+fn reservation_authority_create_failpoint() -> Result<()> {
+    RESERVATION_AUTHORITY_CREATE_ERROR.with(|slot| {
+        if slot.replace(false) {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "injected error after reservation authority inode creation",
+            )));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn panic_after_reservation_authority_open() {
+    RESERVATION_ADOPTION_PANIC.with(|slot| {
+        assert!(!slot.replace(false), "injected reservation adoption unwind");
+    });
+}
+
+#[cfg(not(test))]
+fn panic_after_reservation_authority_open() {}
+
+#[cfg(test)]
+fn panic_before_reservation_mark_adopted() {
+    RESERVATION_OUTER_ADOPTION_PANIC.with(|slot| {
+        assert!(
+            !slot.replace(false),
+            "injected unwind before reservation ownership transfer"
+        );
+    });
+}
+
+#[cfg(not(test))]
+fn panic_before_reservation_mark_adopted() {}
 
 #[cfg(test)]
 struct OpenDirectoryBarrier {
@@ -1302,6 +2677,24 @@ impl FileBlobStore {
         Self::open_with_registered_buffer_capacity(data_dir, slots, expected)
     }
 
+    pub(crate) fn open_with_reservation(
+        data_dir: &Path,
+        buffer_pool_size: usize,
+        expected: Option<FileStoreObjectIdentity>,
+        reservation: &mut FileStoreReservation,
+        kind: FileStoreKind,
+    ) -> Result<Self> {
+        let root = reservation.root_for_open(data_dir, expected, kind)?;
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let registered_buffer_slots = registered_buffer_slots(buffer_pool_size);
+        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+        let registered_buffer_slots = {
+            let _ = buffer_pool_size;
+            REGISTERED_BUFFER_MAX_SLOTS
+        };
+        Self::open_with_registered_buffer_capacity_from_root(root, registered_buffer_slots)
+    }
+
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
         data_dir: P,
@@ -1309,7 +2702,22 @@ impl FileBlobStore {
         expected: Option<FileStoreObjectIdentity>,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        let (directory, store_lock, object_identity) = open_store_root(&data_dir, expected)?;
+        let mut reservation =
+            FileStoreReservation::acquire_open_or_create(data_dir.clone(), expected)?;
+        let root = reservation.root_for_open_or_create(&data_dir, expected)?;
+        let store =
+            Self::open_with_registered_buffer_capacity_from_root(root, registered_buffer_slots)?;
+        reservation.mark_adopted();
+        Ok(store)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn open_with_registered_buffer_capacity_from_root(
+        root: Arc<HeldFileStoreRoot>,
+        registered_buffer_slots: usize,
+    ) -> Result<Self> {
+        root.prepare_for_adoption()?;
+        root.validate()?;
 
         let data_flags = {
             #[cfg(target_os = "linux")]
@@ -1322,12 +2730,13 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = directory.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
+        let data_file = root.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
         let read_index_file =
-            directory.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
+            root.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
         let value_segment_file =
-            directory.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
-        directory.sync()?;
+            root.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
+        root.sync()?;
+        panic_after_reservation_authority_open();
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -1338,8 +2747,8 @@ impl FileBlobStore {
         }
 
         let health = Arc::new(FileStoreHealth::default());
-        let manifest = Manifest::load_or_create(&directory, Arc::clone(&health))?;
-        let wal_guard = directory.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
+        let manifest = Manifest::load_or_create(&root, Arc::clone(&health))?;
+        let wal_guard = root.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -1356,10 +2765,7 @@ impl FileBlobStore {
         };
 
         Ok(Self {
-            data_dir,
-            directory,
-            object_identity,
-            store_lock,
+            root,
             data_file,
             read_index_file,
             value_segment_file,
@@ -1386,7 +2792,24 @@ impl FileBlobStore {
         expected: Option<FileStoreObjectIdentity>,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        let (directory, store_lock, object_identity) = open_store_root(&data_dir, expected)?;
+        let mut reservation =
+            FileStoreReservation::acquire_open_or_create(data_dir.clone(), expected)?;
+        let root = reservation.root_for_open_or_create(&data_dir, expected)?;
+        let store = Self::open_with_registered_buffer_capacity_from_root(
+            root,
+            REGISTERED_BUFFER_MAX_SLOTS,
+        )?;
+        reservation.mark_adopted();
+        Ok(store)
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn open_with_registered_buffer_capacity_from_root(
+        root: Arc<HeldFileStoreRoot>,
+        _registered_buffer_slots: usize,
+    ) -> Result<Self> {
+        root.prepare_for_adoption()?;
+        root.validate()?;
 
         let data_flags = {
             #[cfg(target_os = "linux")]
@@ -1399,12 +2822,13 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = directory.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
+        let data_file = root.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
         let read_index_file =
-            directory.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
+            root.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
         let value_segment_file =
-            directory.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
-        directory.sync()?;
+            root.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
+        root.sync()?;
+        panic_after_reservation_authority_open();
 
         #[cfg(target_os = "macos")]
         unsafe {
@@ -1412,16 +2836,13 @@ impl FileBlobStore {
         }
 
         let health = Arc::new(FileStoreHealth::default());
-        let manifest = Manifest::load_or_create(&directory, Arc::clone(&health))?;
-        let wal_guard = directory.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
+        let manifest = Manifest::load_or_create(&root, Arc::clone(&health))?;
+        let wal_guard = root.open_existing_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
         Ok(Self {
-            data_dir,
-            directory,
-            object_identity,
-            store_lock,
+            root,
             data_file,
             read_index_file,
             value_segment_file,
@@ -1437,20 +2858,20 @@ impl FileBlobStore {
         })
     }
 
-    /// Configured pathname used to open this store.
+    /// Acquisition-time absolute lexical pathname of this store.
     ///
-    /// The path may be renamed or replaced after open. It is retained for
-    /// diagnostics only; all I/O uses the held directory object and callers
-    /// that need fencing material should use [`Self::object_identity`].
+    /// The path remains part of the live authority binding. If it or its
+    /// parent path is renamed, unlinked, or replaced, later authority
+    /// validation fails closed even though held descriptors still exist.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
-        &self.data_dir
+        &self.root.data_dir
     }
 
     /// Return the filesystem objects actually held by this store instance.
     #[must_use]
     pub fn object_identity(&self) -> FileStoreObjectIdentity {
-        self.object_identity
+        self.root.object_identity
     }
 
     pub(crate) fn open_wal_file(&self) -> Result<File> {
@@ -1458,18 +2879,34 @@ impl FileBlobStore {
         self.ensure_mutations_healthy()?;
         let mut guard = self.wal_guard.lock().unwrap();
         if let Some(file) = guard.as_ref() {
-            self.directory.validate_authority_file(WAL_FILENAME, file)?;
+            self.root.validate_authority_file(WAL_FILENAME, file)?;
+            self.root.validate_wal_content_before_recovery(file)?;
             return Ok(file.try_clone()?);
         }
-        let file = self.directory.open_wal()?;
-        self.directory
-            .validate_authority_file(WAL_FILENAME, &file)?;
+        let file = self.root.open_wal()?;
+        self.root.validate_authority_file(WAL_FILENAME, &file)?;
+        self.root.validate_wal_content_before_recovery(&file)?;
         *guard = Some(file.try_clone()?);
         Ok(file)
     }
 
+    pub(crate) fn validate_wal_recovery_content(&self, file: &File) -> Result<()> {
+        self.root.validate_wal_content_before_recovery(file)
+    }
+
+    pub(crate) fn truncate_wal_recovery_tail(&self, file: &File, valid_bytes: u64) -> Result<()> {
+        self.root.truncate_wal_recovery_tail(file, valid_bytes)
+    }
+
     pub(crate) fn journal_health(&self) -> Arc<FileStoreHealth> {
         Arc::clone(&self.health)
+    }
+
+    pub(crate) fn requires_existing_recovery_truth(&self) -> bool {
+        matches!(
+            self.root.adoption_state(),
+            ReservationAdoptionState::ExistingVerified(_)
+        )
     }
 
     /// Dynamically validate the entire authoritative file-store object set.
@@ -1493,48 +2930,23 @@ impl FileBlobStore {
     }
 
     fn validate_object_set_once(&self) -> Result<ObjectSetSnapshot> {
-        acquire_flock(
-            &self.directory.file,
-            &self.data_dir,
-            Duration::ZERO,
-            "store directory",
-        )?;
-        validate_lock_file(&self.store_lock)?;
-        acquire_flock(
-            &self.store_lock,
-            &self.data_dir,
-            Duration::ZERO,
-            LOCK_FILENAME,
-        )?;
-        validate_lock_file(&self.store_lock)?;
-        verify_named_lock(&self.directory, &self.store_lock)?;
-        validate_lock_file(&self.store_lock)?;
-        let root = object_identity(&self.directory, &self.store_lock)?;
-        if root != self.object_identity {
-            return Err(Error::BlobStoreIo(io::Error::other(
-                "held file-store root identity changed",
-            )));
-        }
+        let root = self.root.validate()?;
 
         let data = self
-            .directory
+            .root
             .validate_authority_file(DATA_FILENAME, &self.data_file)?;
         let read_index = self
-            .directory
+            .root
             .validate_authority_file(READ_INDEX_FILENAME, &self.read_index_file)?;
         let value_segment = self
-            .directory
+            .root
             .validate_authority_file(VALUE_SEGMENT_FILENAME, &self.value_segment_file)?;
-        let manifest = self
-            .manifest
-            .write()
-            .unwrap()
-            .validate_files(&self.directory)?;
+        let manifest = self.manifest.write().unwrap().validate_files(&self.root)?;
         let wal_guard = self.wal_guard.lock().unwrap();
         let wal = if let Some(file) = wal_guard.as_ref() {
-            Some(self.directory.validate_authority_file(WAL_FILENAME, file)?)
+            Some(self.root.validate_authority_file(WAL_FILENAME, file)?)
         } else {
-            ensure_authority_entry_absent(&self.directory, WAL_FILENAME)?;
+            ensure_authority_entry_absent(&self.root, WAL_FILENAME)?;
             None
         };
 
@@ -1902,7 +3314,7 @@ impl FileBlobStore {
         let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
             let mut m = self.manifest.write().unwrap();
-            if let Err(e) = m.persist_pending_deltas(&self.directory) {
+            if let Err(e) = m.persist_pending_deltas(&self.root) {
                 self.manifest_dirty.store(true, Ordering::Release);
                 return Err(e);
             }
@@ -2226,7 +3638,7 @@ impl FileBlobStore {
 
 impl BlobStore for FileBlobStore {
     fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
-        Some(self.object_identity)
+        Some(self.root.object_identity)
     }
 
     fn validate_file_store_object_set(&self) -> Result<Option<FileStoreObjectIdentity>> {
@@ -2663,8 +4075,8 @@ impl BlobStore for FileBlobStore {
                 m.apply_relocation_plan(&plan)?
             };
             if slots_trimmed != 0 || !plan.is_empty() {
-                m.persist_snapshot(&self.directory)?;
-                m.truncate_log(&self.directory)?;
+                m.persist_snapshot(&self.root)?;
+                m.truncate_log(&self.root)?;
                 m.pending_log.clear();
                 self.manifest_dirty.store(false, Ordering::Release);
             }
@@ -2715,12 +4127,117 @@ struct SlotMove {
 }
 
 impl Manifest {
-    fn load_or_create(directory: &StoreDirectory, health: Arc<FileStoreHealth>) -> Result<Self> {
+    fn prove_existing_recovery_truth(
+        directory: &HeldFileStoreRoot,
+        data_len: u64,
+    ) -> Result<(ManifestRecoveryTruth, FileStoreKind)> {
+        let max_entries = usize::try_from(data_len / u64::from(PAGE_SIZE)).unwrap_or(usize::MAX);
+        let mut snapshot_file =
+            directory.open_existing_at_unrestricted(MANIFEST_FILENAME, libc::O_RDONLY)?;
+        let snapshot_content_before = snapshot_file
+            .as_ref()
+            .map(file_content_witness)
+            .transpose()?;
+        let (mut entries, mut next_slot) = match snapshot_file.as_mut() {
+            Some(file) => {
+                let parsed = Self::parse_snapshot_with_max_entries(file, max_entries)?;
+                directory
+                    .directory
+                    .validate_authority_file(MANIFEST_FILENAME, file)?;
+                parsed
+            }
+            None => (HashMap::new(), 0),
+        };
+        let snapshot = snapshot_file
+            .as_ref()
+            .map(|file| {
+                directory
+                    .directory
+                    .validate_authority_file(MANIFEST_FILENAME, file)
+            })
+            .transpose()?;
+        let snapshot_content = snapshot_file
+            .as_ref()
+            .map(file_content_witness)
+            .transpose()?;
+        if snapshot_content_before != snapshot_content {
+            return Err(reservation_adoption_error(
+                "manifest snapshot changed during read-only recovery proof",
+            ));
+        }
+
+        let mut log_file =
+            directory.open_existing_at_unrestricted(MANIFEST_LOG_FILENAME, libc::O_RDONLY)?;
+        let log_content_before = log_file.as_ref().map(file_content_witness).transpose()?;
+        if let Some(file) = log_file.as_mut() {
+            Self::replay_log_read_only(file, &mut entries, &mut next_slot, max_entries)?;
+        }
+        let log = log_file
+            .as_ref()
+            .map(|file| {
+                directory
+                    .directory
+                    .validate_authority_file(MANIFEST_LOG_FILENAME, file)
+            })
+            .transpose()?;
+        let log_content = log_file.as_ref().map(file_content_witness).transpose()?;
+        if log_content_before != log_content {
+            return Err(reservation_adoption_error(
+                "manifest log changed during read-only recovery proof",
+            ));
+        }
+
+        if snapshot.is_none() && log.is_none() {
+            return Err(missing_existing_authority_error(
+                "manifest.bin or manifest.log",
+            ));
+        }
+        if entries.is_empty() {
+            return Err(Error::node_corrupt(
+                "FileBlobStore::Manifest::existing recovery truth is empty",
+            ));
+        }
+        let kind = classify_existing_store_kind(&entries)?;
+        let required_slots = entries
+            .values()
+            .map(|entry| entry.slot)
+            .max()
+            .and_then(|slot| slot.checked_add(1))
+            .ok_or_else(|| Error::node_corrupt("FileBlobStore::Manifest::slot overflow"))?;
+        let required_bytes = required_slots
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| Error::node_corrupt("FileBlobStore::Manifest::data length overflow"))?;
+        if data_len < required_bytes || next_slot < required_slots {
+            return Err(Error::node_corrupt(
+                "FileBlobStore::Manifest::data file is shorter than recovery truth",
+            ));
+        }
+        let used_slots = entries.values().map(|entry| entry.slot).collect::<Vec<_>>();
+        ReusableSlots::reconstruct(next_slot, &used_slots)?;
+        directory.validate()?;
+        Ok((
+            ManifestRecoveryTruth {
+                identities: ManifestFileIdentities { snapshot, log },
+                snapshot_content,
+                log_content,
+            },
+            kind,
+        ))
+    }
+
+    fn load_or_create(directory: &HeldFileStoreRoot, health: Arc<FileStoreHealth>) -> Result<Self> {
+        // Existing adoption must compare the manifest bytes proved at
+        // reservation time before this method reaches its torn-tail repair.
+        directory.validate_manifest_content_before_recovery()?;
         let mut snapshot_file = directory.open_existing_at(MANIFEST_FILENAME, libc::O_RDWR)?;
         let (mut entries, mut next_slot) = match snapshot_file.as_mut() {
             Some(file) => {
+                directory
+                    .validate_manifest_file_content_before_recovery(MANIFEST_FILENAME, file)?;
                 let parsed = Self::parse_snapshot(file)?;
                 directory.validate_authority_file(MANIFEST_FILENAME, file)?;
+                directory
+                    .validate_manifest_file_content_before_recovery(MANIFEST_FILENAME, file)?;
                 parsed
             }
             None => (HashMap::new(), 0),
@@ -2730,14 +4247,18 @@ impl Manifest {
             directory.open_existing_at(MANIFEST_LOG_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
         let replay = match log_file.as_mut() {
             Some(file) => {
+                directory
+                    .validate_manifest_file_content_before_recovery(MANIFEST_LOG_FILENAME, file)?;
                 let replay = Self::replay_log(file, &mut entries, &mut next_slot)?;
                 directory.validate_authority_file(MANIFEST_LOG_FILENAME, file)?;
+                directory
+                    .validate_manifest_file_content_before_recovery(MANIFEST_LOG_FILENAME, file)?;
                 if replay.valid_bytes < replay.file_bytes {
                     // The inode and directory entry have already been
                     // validated and exclusively flocked. Revalidate on both
                     // sides of the only recovery-time mutation.
                     directory.validate_authority_file(MANIFEST_LOG_FILENAME, file)?;
-                    file.set_len(replay.valid_bytes)?;
+                    directory.truncate_manifest_log_recovery_tail(file, replay)?;
                     file.sync_all()?;
                     directory.validate_authority_file(MANIFEST_LOG_FILENAME, file)?;
                 }
@@ -2746,6 +4267,10 @@ impl Manifest {
             None => ManifestLogReplay {
                 file_bytes: 0,
                 valid_bytes: 0,
+                valid_content: FileContentWitness {
+                    bytes: 0,
+                    crc32: crc32fast::hash(&[]),
+                },
             },
         };
         let used_slots: Vec<_> = entries.values().map(|entry| entry.slot).collect();
@@ -2766,6 +4291,13 @@ impl Manifest {
     }
 
     fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, ManifestEntry>, u64)> {
+        Self::parse_snapshot_with_max_entries(f, usize::MAX)
+    }
+
+    fn parse_snapshot_with_max_entries(
+        f: &mut File,
+        max_entries: usize,
+    ) -> Result<(HashMap<BlobGuid, ManifestEntry>, u64)> {
         // Header: magic 8 + version 2 + count 4 + reserved 2 + next_slot 8 = 24 B.
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
@@ -2779,8 +4311,28 @@ impl Manifest {
             ));
         }
         let count = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
+        if count > max_entries {
+            return Err(Error::node_corrupt(
+                "FileBlobStore::Manifest::entry count exceeds packed data bounds",
+            ));
+        }
         // hdr[14..16] reserved (zero).
         let next_slot = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        let expected_bytes = 24u64
+            .checked_add(
+                u64::try_from(count)
+                    .unwrap_or(u64::MAX)
+                    .checked_mul(24)
+                    .ok_or_else(|| {
+                        Error::node_corrupt("FileBlobStore::Manifest::entry length overflow")
+                    })?,
+            )
+            .ok_or_else(|| Error::node_corrupt("FileBlobStore::Manifest::length overflow"))?;
+        if f.metadata()?.len() != expected_bytes {
+            return Err(Error::node_corrupt(
+                "FileBlobStore::Manifest::snapshot length",
+            ));
+        }
 
         let mut entries = HashMap::with_capacity(count);
         let mut used_slots = Vec::with_capacity(count);
@@ -2908,7 +4460,7 @@ impl Manifest {
         Ok(self.trim_trailing_free_slots())
     }
 
-    fn persist_pending_deltas(&mut self, directory: &StoreDirectory) -> Result<()> {
+    fn persist_pending_deltas(&mut self, directory: &HeldFileStoreRoot) -> Result<()> {
         if self.pending_log.is_empty() {
             return Ok(());
         }
@@ -2960,7 +4512,7 @@ impl Manifest {
 
     fn create_snapshot_temp(
         &mut self,
-        directory: &StoreDirectory,
+        directory: &HeldFileStoreRoot,
         temp_name: &str,
     ) -> Result<File> {
         #[cfg(test)]
@@ -3005,7 +4557,7 @@ impl Manifest {
         Ok(file)
     }
 
-    fn persist_snapshot(&mut self, directory: &StoreDirectory) -> Result<()> {
+    fn persist_snapshot(&mut self, directory: &HeldFileStoreRoot) -> Result<()> {
         self.ensure_snapshot_healthy()?;
         #[cfg(test)]
         manifest_persist_failpoint(ManifestPersistFailpoint::SnapshotAuthorityValidate)?;
@@ -3093,7 +4645,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn truncate_log(&mut self, directory: &StoreDirectory) -> Result<()> {
+    fn truncate_log(&mut self, directory: &HeldFileStoreRoot) -> Result<()> {
         self.ensure_snapshot_healthy()?;
         if let Some(f) = self.log_file.as_ref() {
             #[cfg(test)]
@@ -3113,6 +4665,97 @@ impl Manifest {
         }
         self.log_bytes = 0;
         Ok(())
+    }
+
+    fn replay_log_read_only(
+        f: &File,
+        entries: &mut HashMap<BlobGuid, ManifestEntry>,
+        next_slot: &mut u64,
+        max_entries: usize,
+    ) -> Result<ManifestLogReplay> {
+        let file_bytes = f.metadata()?.len();
+        let mut offset = 0u64;
+        let mut valid_bytes = 0u64;
+        let mut header = [0u8; MANIFEST_LOG_HEADER_SIZE];
+        let mut body = [0u8; MANIFEST_LOG_SET_BODY_SIZE];
+        let mut footer = [0u8; MANIFEST_LOG_FOOTER_SIZE];
+
+        while offset < file_bytes {
+            let remaining = file_bytes - offset;
+            if remaining < MANIFEST_LOG_HEADER_SIZE as u64 {
+                break;
+            }
+            f.read_exact_at(&mut header, offset)?;
+            if header[..4] != MANIFEST_LOG_MAGIC {
+                return Err(Error::node_corrupt("FileBlobStore::ManifestLog::magic"));
+            }
+            let body_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let ty = header[8];
+            let expected_body_len = match ty {
+                MANIFEST_LOG_TY_SET => MANIFEST_LOG_SET_BODY_SIZE,
+                MANIFEST_LOG_TY_DELETE => MANIFEST_LOG_DELETE_BODY_SIZE,
+                _ => {
+                    return Err(Error::node_corrupt(
+                        "FileBlobStore::ManifestLog::unknown op",
+                    ))
+                }
+            };
+            if body_len != expected_body_len {
+                return Err(Error::node_corrupt(match ty {
+                    MANIFEST_LOG_TY_SET => "FileBlobStore::ManifestLog::set length",
+                    _ => "FileBlobStore::ManifestLog::delete length",
+                }));
+            }
+            let record_len = MANIFEST_LOG_HEADER_SIZE
+                .checked_add(body_len)
+                .and_then(|len| len.checked_add(MANIFEST_LOG_FOOTER_SIZE))
+                .ok_or_else(|| {
+                    Error::node_corrupt("FileBlobStore::ManifestLog::record length overflow")
+                })?;
+            if remaining < record_len as u64 {
+                break;
+            }
+            let body_offset = offset + MANIFEST_LOG_HEADER_SIZE as u64;
+            f.read_exact_at(&mut body[..body_len], body_offset)?;
+            f.read_exact_at(&mut footer, body_offset + u64::try_from(body_len).unwrap())?;
+            let expected_crc = u32::from_le_bytes(footer);
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&header);
+            hasher.update(&body[..body_len]);
+            if expected_crc != hasher.finalize() {
+                return Err(Error::node_corrupt("FileBlobStore::ManifestLog::crc"));
+            }
+            match ty {
+                MANIFEST_LOG_TY_SET => {
+                    let mut guid = [0u8; 16];
+                    guid.copy_from_slice(&body[..16]);
+                    let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                    let following_slot = slot.checked_add(1).ok_or_else(|| {
+                        Error::node_corrupt("FileBlobStore::ManifestLog::slot overflow")
+                    })?;
+                    entries.insert(guid, ManifestEntry { slot });
+                    if entries.len() > max_entries {
+                        return Err(Error::node_corrupt(
+                            "FileBlobStore::ManifestLog::entry count exceeds packed data bounds",
+                        ));
+                    }
+                    *next_slot = (*next_slot).max(following_slot);
+                }
+                MANIFEST_LOG_TY_DELETE => {
+                    let mut guid = [0u8; 16];
+                    guid.copy_from_slice(&body[..16]);
+                    entries.remove(&guid);
+                }
+                _ => unreachable!("manifest log type was validated above"),
+            }
+            offset += record_len as u64;
+            valid_bytes = offset;
+        }
+        Ok(ManifestLogReplay {
+            file_bytes,
+            valid_bytes,
+            valid_content: file_prefix_content_witness(f, valid_bytes)?,
+        })
     }
 
     fn replay_log(
@@ -3189,6 +4832,10 @@ impl Manifest {
         Ok(ManifestLogReplay {
             file_bytes: buf.len() as u64,
             valid_bytes: valid_offset as u64,
+            valid_content: FileContentWitness {
+                bytes: valid_offset as u64,
+                crc32: crc32fast::hash(&buf[..valid_offset]),
+            },
         })
     }
 
@@ -3204,7 +4851,7 @@ impl Manifest {
         }
     }
 
-    fn validate_snapshot_authority(&mut self, directory: &StoreDirectory) -> Result<()> {
+    fn validate_snapshot_authority(&mut self, directory: &HeldFileStoreRoot) -> Result<()> {
         let result = if let Some(snapshot) = self.snapshot_file.as_ref() {
             directory
                 .validate_authority_file(MANIFEST_FILENAME, snapshot)
@@ -3222,7 +4869,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn validate_files(&mut self, directory: &StoreDirectory) -> Result<ManifestFileIdentities> {
+    fn validate_files(&mut self, directory: &HeldFileStoreRoot) -> Result<ManifestFileIdentities> {
         self.ensure_snapshot_healthy()?;
         let snapshot_result = if let Some(file) = self.snapshot_file.as_ref() {
             directory
@@ -3258,6 +4905,7 @@ struct ManifestFileIdentities {
 struct ManifestLogReplay {
     file_bytes: u64,
     valid_bytes: u64,
+    valid_content: FileContentWitness,
 }
 
 fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> {
@@ -3285,7 +4933,7 @@ fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> 
     Ok(())
 }
 
-fn ensure_authority_entry_absent(directory: &StoreDirectory, name: &str) -> Result<()> {
+fn ensure_authority_entry_absent(directory: &HeldFileStoreRoot, name: &str) -> Result<()> {
     if directory.entry_metadata(name)?.is_some() {
         return Err(Error::BlobStoreIo(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -3543,7 +5191,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&store.directory)
+            .persist_snapshot(&store.root)
             .unwrap();
     }
 
@@ -3595,7 +5243,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&store.directory)
+            .persist_snapshot(&store.root)
             .unwrap();
         drop(store.open_wal_file().unwrap());
         Some(store)
@@ -3901,7 +5549,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&source.directory)
+            .persist_snapshot(&source.root)
             .unwrap();
         let source_path = source_dir.path().join(MANIFEST_FILENAME);
         std::fs::hard_link(&source_path, target_dir.path().join(MANIFEST_FILENAME)).unwrap();
@@ -4020,7 +5668,7 @@ mod tests {
                 .manifest
                 .write()
                 .unwrap()
-                .persist_snapshot(&worker_store.directory)
+                .persist_snapshot(&worker_store.root)
         });
 
         barrier.entered.wait();
@@ -4043,7 +5691,7 @@ mod tests {
                 .manifest
                 .write()
                 .unwrap()
-                .persist_snapshot(&store.directory)
+                .persist_snapshot(&store.root)
                 .is_err());
             let manifest = store.manifest.read().unwrap();
             assert_eq!(held_manifest_file_count(&manifest), held_files);
@@ -4068,7 +5716,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&store.directory)
+            .persist_snapshot(&store.root)
             .unwrap();
         let log_path = dir.path().join(MANIFEST_LOG_FILENAME);
         assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 37);
@@ -4130,7 +5778,7 @@ mod tests {
                 .manifest
                 .write()
                 .unwrap()
-                .persist_snapshot(&store.directory)
+                .persist_snapshot(&store.root)
                 .unwrap();
             let log_path = dir.path().join(MANIFEST_LOG_FILENAME);
             assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 37);
@@ -4195,7 +5843,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&store.directory)
+            .persist_snapshot(&store.root)
             .unwrap();
 
         let store = Arc::new(store);
@@ -4477,7 +6125,7 @@ mod tests {
                 .manifest
                 .write()
                 .unwrap()
-                .persist_snapshot(&store.directory)
+                .persist_snapshot(&store.root)
                 .unwrap();
             drop(store.open_wal_file().unwrap());
         }
@@ -4598,7 +6246,7 @@ mod tests {
             .manifest
             .write()
             .unwrap()
-            .persist_snapshot(&store.directory)
+            .persist_snapshot(&store.root)
             .unwrap();
 
         assert_eq!(file_state(external.path()), before);
@@ -4760,7 +6408,7 @@ mod tests {
     }
 
     #[test]
-    fn db_open_stays_on_pinned_directory_across_path_swap() {
+    fn db_open_fails_closed_when_reserved_directory_path_is_swapped() {
         let parent = tempfile::tempdir().unwrap();
         let path = parent.path().join("store");
         let held_path = parent.path().join("held-store");
@@ -4779,19 +6427,11 @@ mod tests {
         std::fs::rename(&path, &held_path).unwrap();
         std::fs::create_dir(&path).unwrap();
         barrier.release.wait();
-        let db = match opener.join().unwrap() {
-            Ok(db) => db,
-            Err(Error::BlobStoreIo(error)) if error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!("skipping: O_DIRECT not supported on this fs");
-                return;
-            }
-            Err(error) => panic!("unexpected DB open error: {error}"),
-        };
-
-        let held = File::open(&held_path).unwrap().metadata().unwrap();
-        let identity = db.file_store_object_identity().unwrap();
-        assert_eq!(identity.directory_device, held.dev());
-        assert_eq!(identity.directory_inode, held.ino());
+        let error = opener
+            .join()
+            .unwrap()
+            .expect_err("open adopted a directory whose configured path was swapped");
+        assert!(matches!(error, Error::BlobStoreIo(_)));
         for filename in [
             LOCK_FILENAME,
             DATA_FILENAME,
@@ -4800,12 +6440,56 @@ mod tests {
             MANIFEST_LOG_FILENAME,
             WAL_FILENAME,
         ] {
-            assert!(held_path.join(filename).exists(), "missing {filename}");
+            assert!(
+                !held_path.join(filename).exists(),
+                "failed open touched {filename} in the renamed directory"
+            );
             assert!(
                 !path.join(filename).exists(),
-                "mixed {filename} into replacement"
+                "failed open touched {filename} in the replacement directory"
             );
         }
+    }
+
+    #[test]
+    fn held_store_does_not_rebind_name_authority_after_parent_replacement() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let configured_parent = sandbox.path().join("configured-parent");
+        let held_parent = sandbox.path().join("held-parent");
+        let path = configured_parent.join("store");
+        std::fs::create_dir(&configured_parent).unwrap();
+        let Some(store) = try_open(&path) else {
+            return;
+        };
+
+        store.write_blob([0xD5; 16], &buf_with(0x45)).unwrap();
+        assert!(!path.join(MANIFEST_LOG_FILENAME).exists());
+
+        std::fs::rename(&configured_parent, &held_parent).unwrap();
+        std::fs::create_dir(&configured_parent).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let held_store = held_parent.join("store");
+
+        assert!(
+            store.flush().is_err(),
+            "manifest publication followed the held parent after its configured locator changed"
+        );
+        assert!(store.validate_object_set().is_err());
+        assert!(
+            !held_store.join(MANIFEST_LOG_FILENAME).exists(),
+            "failed publication mutated manifest authority through the renamed parent"
+        );
+        assert!(
+            !path.join(MANIFEST_LOG_FILENAME).exists(),
+            "failed publication rebound manifest authority to the replacement store"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::remove_dir(&configured_parent).unwrap();
+        std::fs::rename(&held_parent, &configured_parent).unwrap();
+
+        store.flush().unwrap();
+        assert!(path.join(MANIFEST_LOG_FILENAME).exists());
     }
 
     #[test]
@@ -5595,7 +7279,7 @@ mod tests {
             b.manifest
                 .write()
                 .unwrap()
-                .persist_snapshot(&b.directory)
+                .persist_snapshot(&b.root)
                 .unwrap();
         }
 

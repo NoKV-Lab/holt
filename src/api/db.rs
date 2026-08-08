@@ -27,11 +27,12 @@ use crate::engine::RangeEntry;
 use crate::journal::codec::{BatchEncoder, MAX_ATOMIC_WAL_OPS, MAX_ATOMIC_WAL_RECORD_BYTES};
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
-use crate::store::blob_store::{BlobStore, FileBlobStore, FileStoreObjectIdentity};
+use crate::store::blob_store::{
+    db_root_guid_for_tree_id, BlobStore, FileBlobStore, FileStoreKind, FileStoreObjectIdentity,
+    FileStoreReservation, DB_CATALOG_TREE_ID,
+};
 use crate::store::BufferManager;
 
-const DB_ROOT_TAG: u8 = 0xDB;
-const DB_CATALOG_TREE_ID: u64 = 0x686f_6c74_6462_0001;
 const FIRST_USER_TREE_ID: u64 = 1;
 const CATALOG_NEXT_TREE_ID_KEY: &[u8] = b"\0next-tree-id";
 const CATALOG_VALUE_MAGIC: &[u8; 8] = b"holtdb02";
@@ -231,6 +232,30 @@ impl DB {
         Self::open_with_buffer_manager(cfg, opened.manager, opened.file_store)
     }
 
+    /// Open a file-backed database by adopting an exclusive pre-open
+    /// reservation.
+    ///
+    /// The configured file locator must exactly match the reservation. Holt
+    /// uses the reservation's original directory and `store.lock`
+    /// open-file-descriptions instead of reopening either name, and preserves
+    /// its create-versus-existing intent through manifest and WAL recovery.
+    /// On any error or unwind the token remains ready and keeps the exclusion
+    /// lock; only a completely opened `DB` consumes it.
+    pub fn open_with_file_store_reservation(
+        mut cfg: TreeConfig,
+        reservation: &mut FileStoreReservation,
+    ) -> Result<Self> {
+        cfg.checkpoint.auto_merge = false;
+        let opened = Tree::open_buffer_manager_with_file_store_reservation(
+            &cfg,
+            reservation,
+            FileStoreKind::Db,
+        )?;
+        let db = Self::open_with_buffer_manager(cfg, opened.manager, opened.file_store)?;
+        reservation.mark_adopted();
+        Ok(db)
+    }
+
     #[cfg(test)]
     fn open_with_blob_store(mut cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
         cfg.checkpoint.auto_merge = false;
@@ -250,12 +275,14 @@ impl DB {
             Some(file_store) => {
                 let wal = file_store.open_wal_file()?;
                 file_store.validate_object_set()?;
+                file_store.validate_wal_recovery_content(&wal)?;
                 let wal_len = wal.metadata()?.len();
                 let next_seq = if wal_len != 0 {
                     let start = std::time::Instant::now();
-                    let (next_seq, replay_stats) = replay_wal(&wal, &bm, None, |tree_id| {
-                        Ok(root_guid_for_tree_id(tree_id))
-                    })?;
+                    let (next_seq, replay_stats) =
+                        replay_wal(&wal, &bm, None, Some(file_store.as_ref()), |tree_id| {
+                            Ok(root_guid_for_tree_id(tree_id))
+                        })?;
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -1461,11 +1488,7 @@ fn count_group_wal_ops(group: &DBBatchGroup) -> u64 {
 }
 
 fn root_guid_for_tree_id(tree_id: u64) -> BlobGuid {
-    let mut guid = [0u8; 16];
-    guid[0..8].copy_from_slice(&tree_id.to_le_bytes());
-    guid[8..15].copy_from_slice(b"holt-db");
-    guid[15] = DB_ROOT_TAG;
-    guid
+    db_root_guid_for_tree_id(tree_id)
 }
 
 fn validate_tree_name(name: &str) -> Result<&[u8]> {
@@ -1549,9 +1572,13 @@ fn next_allocated_tree_id(tree_id: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::journal::group_commit::JournalShutdownBarrier;
-    use crate::store::blob_store::{AlignedBlobBuf, FileBlobStore, MemoryBlobStore};
+    use crate::store::blob_store::{
+        AlignedBlobBuf, FileBlobStore, FileStoreReservation, MemoryBlobStore,
+    };
     use crate::CommitPhase;
     use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::thread;
@@ -1564,6 +1591,202 @@ mod tests {
         cfg.checkpoint.enabled = false;
         cfg.buffer_pool_size = 16;
         cfg
+    }
+
+    fn authority_snapshot(
+        path: &std::path::Path,
+    ) -> Vec<(std::ffi::OsString, u64, u64, u32, u64, Vec<u8>)> {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.nlink(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn append_torn_suffix(path: &std::path::Path) -> u64 {
+        let original_len = std::fs::metadata(path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"torn").unwrap();
+        file.sync_all().unwrap();
+        original_len
+    }
+
+    #[test]
+    fn fresh_reservation_permanently_binds_db_kind_across_outer_unwind() {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("db-kind");
+        let mut cfg = TreeConfig::new(&path);
+        cfg.checkpoint.enabled = false;
+        let mut reservation = FileStoreReservation::acquire_for_create(&path).unwrap();
+        FileBlobStore::panic_next_reservation_outer_adoption_for_test();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = DB::open_with_file_store_reservation(cfg.clone(), &mut reservation);
+        }));
+        assert!(unwind.is_err());
+        assert!(reservation.is_ready());
+        let after_db_unwind = authority_snapshot(&path);
+
+        Tree::open_with_file_store_reservation(cfg.clone(), &mut reservation)
+            .expect_err("DB-bound fresh token was reused as a standalone Tree");
+        assert_eq!(authority_snapshot(&path), after_db_unwind);
+        assert!(reservation.is_ready());
+
+        let db = DB::open_with_file_store_reservation(cfg, &mut reservation)
+            .expect("DB-bound token was not retryable as the same kind");
+        assert!(!reservation.is_ready());
+        drop(db);
+    }
+
+    #[test]
+    fn fresh_reservation_permanently_binds_tree_kind_across_outer_unwind() {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("tree-kind");
+        let mut cfg = TreeConfig::new(&path);
+        cfg.checkpoint.enabled = false;
+        let mut reservation = FileStoreReservation::acquire_for_create(&path).unwrap();
+        FileBlobStore::panic_next_reservation_outer_adoption_for_test();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Tree::open_with_file_store_reservation(cfg.clone(), &mut reservation);
+        }));
+        assert!(unwind.is_err());
+        assert!(reservation.is_ready());
+        let after_tree_unwind = authority_snapshot(&path);
+
+        DB::open_with_file_store_reservation(cfg.clone(), &mut reservation)
+            .expect_err("Tree-bound fresh token was reused as a DB");
+        assert_eq!(authority_snapshot(&path), after_tree_unwind);
+        assert!(reservation.is_ready());
+
+        let tree = Tree::open_with_file_store_reservation(cfg, &mut reservation)
+            .expect("Tree-bound token was not retryable as the same kind");
+        assert!(!reservation.is_ready());
+        drop(tree);
+    }
+
+    #[test]
+    fn existing_recovery_repairs_remain_retryable_after_outer_unwind() {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("existing-recovery-retry");
+        let mut cfg = TreeConfig::new(&path);
+        cfg.checkpoint.enabled = false;
+        let identity = {
+            let db = DB::open(cfg.clone()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            tree.put(b"key", b"value").unwrap();
+            db.checkpoint().unwrap();
+            db.file_store_object_identity().unwrap()
+        };
+        let manifest_len = append_torn_suffix(&path.join("manifest.log"));
+        let wal_len = append_torn_suffix(&path.join("journal.wal"));
+        let mut reservation = FileStoreReservation::acquire_existing(&path, identity).unwrap();
+        FileBlobStore::panic_next_reservation_outer_adoption_for_test();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = DB::open_with_file_store_reservation(
+                cfg.clone().with_expected_file_store_identity(identity),
+                &mut reservation,
+            );
+        }));
+        assert!(unwind.is_err());
+        assert!(reservation.is_ready());
+        assert_eq!(
+            std::fs::metadata(path.join("manifest.log")).unwrap().len(),
+            manifest_len
+        );
+        assert_eq!(
+            std::fs::metadata(path.join("journal.wal")).unwrap().len(),
+            wal_len
+        );
+
+        let db = DB::open_with_file_store_reservation(
+            cfg.with_expected_file_store_identity(identity),
+            &mut reservation,
+        )
+        .expect("token-owned recovery repairs were not retryable after outer unwind");
+        let tree = db.open_tree("objects").unwrap();
+        assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
+        assert!(!reservation.is_ready());
+        drop(tree);
+        drop(db);
+    }
+
+    #[test]
+    fn reservation_remains_ready_after_open_unwind() {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("store");
+        let mut reservation = FileStoreReservation::acquire_for_create(&path).unwrap();
+        FileBlobStore::panic_next_reservation_adoption_for_test();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = DB::open_with_file_store_reservation(TreeConfig::new(&path), &mut reservation);
+        }));
+        assert!(unwind.is_err());
+        assert!(reservation.is_ready());
+        reservation.validate().unwrap();
+
+        let data = path.join("blobs.dat");
+        let original = path.join("blobs.dat.reservation-original");
+        let original_inode = std::fs::metadata(&data).unwrap().ino();
+        std::fs::rename(&data, &original).unwrap();
+        let replacement = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&data)
+            .unwrap();
+        replacement.sync_all().unwrap();
+        let replacement_inode = replacement.metadata().unwrap().ino();
+        drop(replacement);
+        assert_ne!(replacement_inode, original_inode);
+
+        DB::open_with_file_store_reservation(TreeConfig::new(&path), &mut reservation)
+            .expect_err("fresh retry adopted a shape-valid replacement inode");
+        assert!(reservation.is_ready());
+        assert_eq!(std::fs::metadata(&data).unwrap().ino(), replacement_inode);
+
+        std::fs::remove_file(&data).unwrap();
+        std::fs::rename(&original, &data).unwrap();
+        let db =
+            DB::open_with_file_store_reservation(TreeConfig::new(&path), &mut reservation).unwrap();
+        assert!(!reservation.is_ready());
+        drop(db);
+    }
+
+    #[test]
+    fn reservation_creation_error_keeps_its_exact_inode_retryable() {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("store");
+        let mut reservation = FileStoreReservation::acquire_for_create(&path).unwrap();
+        FileBlobStore::fail_next_reservation_authority_create_for_test();
+
+        DB::open_with_file_store_reservation(TreeConfig::new(&path), &mut reservation)
+            .expect_err("injected post-create error did not escape adoption");
+        assert!(reservation.is_ready());
+        reservation.validate().unwrap();
+        let data_inode = std::fs::metadata(path.join("blobs.dat")).unwrap().ino();
+
+        let db =
+            DB::open_with_file_store_reservation(TreeConfig::new(&path), &mut reservation).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.join("blobs.dat")).unwrap().ino(),
+            data_inode
+        );
+        assert!(!reservation.is_ready());
+        drop(db);
     }
 
     #[test]

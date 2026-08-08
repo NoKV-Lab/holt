@@ -31,12 +31,29 @@ pub mod memory;
 pub use aligned::AlignedBlobBuf;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) use buffer_pool::BlobBufPool;
-pub use file::FileBlobStore;
+pub(crate) use file::FileStoreKind;
+pub use file::{FileBlobStore, FileStoreReservation};
 pub use memory::MemoryBlobStore;
 
 use crate::api::errors::Result;
 use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::BlobGuid;
+
+/// Durable root namespace reserved for the multi-tree database catalog.
+///
+/// This is part of the file-store incarnation discriminator, so the DB and
+/// reservation preflight must derive the exact same on-disk root GUID.
+pub(crate) const DB_CATALOG_TREE_ID: u64 = 0x686f_6c74_6462_0001;
+
+const DB_ROOT_TAG: u8 = 0xDB;
+
+pub(crate) fn db_root_guid_for_tree_id(tree_id: u64) -> BlobGuid {
+    let mut guid = [0u8; 16];
+    guid[0..8].copy_from_slice(&tree_id.to_le_bytes());
+    guid[8..15].copy_from_slice(b"holt-db");
+    guid[15] = DB_ROOT_TAG;
+    guid
+}
 
 /// Stable filesystem identity of one open file-backed store.
 ///

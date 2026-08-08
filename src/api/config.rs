@@ -152,9 +152,10 @@ impl TreeConfig {
     /// Lexical WAL pathname derived from this configuration, if any.
     ///
     /// File-backed trees configure their log as `<dir>/journal.wal`; memory
-    /// trees have no WAL. This is not the identity of a live store: after
-    /// open, the configured directory may be renamed or replaced while Holt
-    /// continues using its held directory and WAL descriptors. Use
+    /// trees have no WAL. This is not the identity of a live store. An already
+    /// opened descriptor remains pinned to its original object, but renaming,
+    /// unlinking, or replacing the configured locator makes later name-based
+    /// authority operations and full-object validation fail closed. Use
     /// [`crate::DB::validate_file_store_object_set`] when fencing a live DB.
     #[must_use]
     pub fn wal_path(&self) -> Option<PathBuf> {
