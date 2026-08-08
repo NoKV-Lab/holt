@@ -329,6 +329,32 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
     BATCH_RECORD_ENVELOPE_LEN.saturating_add(encoded_batch_inner_len(ops))
 }
 
+fn encoded_insert_only_batch_record_len<T: InsertBatchEntry>(entries: &[T]) -> usize {
+    let mut len = BATCH_RECORD_ENVELOPE_LEN;
+    let mut index = 0usize;
+    while index < entries.len() {
+        let plan = insert_run_plan(entries, index).expect("insert-only batch entry");
+        len = len.saturating_add(plan.encoded_len(&entries[index..index + plan.len]));
+        index += plan.len;
+    }
+    len
+}
+
+#[derive(Clone, Copy)]
+enum PreflightedBatch<'a> {
+    Atomic(&'a [BatchOp]),
+    PutMany(&'a [(&'a [u8], &'a [u8])]),
+}
+
+impl PreflightedBatch<'_> {
+    fn encoded_record_len(self) -> usize {
+        match self {
+            Self::Atomic(ops) => encoded_batch_record_len(ops),
+            Self::PutMany(entries) => encoded_insert_only_batch_record_len(entries),
+        }
+    }
+}
+
 /// Incremental exact WAL admission shared by standalone and DB batches.
 /// Static framing and compressed put-run bytes are charged before preflight;
 /// each rename's captured value is charged before it is retained.
@@ -451,7 +477,7 @@ struct InsertRunPlan {
 }
 
 impl InsertRunPlan {
-    fn encoded_len(self, ops: &[BatchOp]) -> usize {
+    fn encoded_len<T: InsertBatchEntry>(self, ops: &[T]) -> usize {
         match self.encoding {
             InsertRunEncoding::Fixed { key_len, value_len } => {
                 if self.len == 1 {
@@ -467,7 +493,7 @@ impl InsertRunPlan {
             InsertRunEncoding::Prefix { prefix_len } => {
                 let mut len = (1usize + 8 + 4 + 4).saturating_add(prefix_len);
                 for op in ops {
-                    let (key, value) = batch_insert_parts(op).expect("prefix run insert op");
+                    let (key, value) = op.insert_parts().expect("prefix run insert op");
                     len = len
                         .saturating_add(4)
                         .saturating_add(key.len() - prefix_len)
@@ -480,41 +506,63 @@ impl InsertRunPlan {
     }
 }
 
-fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
-    match op {
-        BatchOp::Put { key, value }
-        | BatchOp::PutIfAbsent { key, value }
-        | BatchOp::CompareAndPut { key, value, .. } => Some((key, value)),
-        BatchOp::Delete { .. }
-        | BatchOp::DeleteIfVersion { .. }
-        | BatchOp::AssertVersion { .. }
-        | BatchOp::AssertPrefixEmpty { .. }
-        | BatchOp::Rename { .. } => None,
-    }
+trait InsertBatchEntry {
+    fn insert_parts(&self) -> Option<(&[u8], &[u8])>;
+
+    fn insert_condition(&self) -> Option<engine::InsertCondition>;
 }
 
-fn batch_insert_condition(op: &BatchOp) -> Option<engine::InsertCondition> {
-    match op {
-        BatchOp::Put { .. } => Some(engine::InsertCondition::Always),
-        BatchOp::PutIfAbsent { .. } => Some(engine::InsertCondition::IfAbsent),
-        BatchOp::CompareAndPut { expected, .. } => {
-            Some(engine::InsertCondition::IfVersion(expected.as_u64()))
+impl InsertBatchEntry for BatchOp {
+    fn insert_parts(&self) -> Option<(&[u8], &[u8])> {
+        match self {
+            Self::Put { key, value }
+            | Self::PutIfAbsent { key, value }
+            | Self::CompareAndPut { key, value, .. } => Some((key, value)),
+            Self::Delete { .. }
+            | Self::DeleteIfVersion { .. }
+            | Self::AssertVersion { .. }
+            | Self::AssertPrefixEmpty { .. }
+            | Self::Rename { .. } => None,
         }
-        BatchOp::Delete { .. }
-        | BatchOp::DeleteIfVersion { .. }
-        | BatchOp::AssertVersion { .. }
-        | BatchOp::AssertPrefixEmpty { .. }
-        | BatchOp::Rename { .. } => None,
+    }
+
+    fn insert_condition(&self) -> Option<engine::InsertCondition> {
+        match self {
+            Self::Put { .. } => Some(engine::InsertCondition::Always),
+            Self::PutIfAbsent { .. } => Some(engine::InsertCondition::IfAbsent),
+            Self::CompareAndPut { expected, .. } => {
+                Some(engine::InsertCondition::IfVersion(expected.as_u64()))
+            }
+            Self::Delete { .. }
+            | Self::DeleteIfVersion { .. }
+            | Self::AssertVersion { .. }
+            | Self::AssertPrefixEmpty { .. }
+            | Self::Rename { .. } => None,
+        }
     }
 }
 
-fn same_shape_insert_run_len(ops: &[BatchOp], start: usize) -> usize {
-    let Some((first_key, first_value)) = batch_insert_parts(&ops[start]) else {
+impl InsertBatchEntry for (&[u8], &[u8]) {
+    fn insert_parts(&self) -> Option<(&[u8], &[u8])> {
+        Some(*self)
+    }
+
+    fn insert_condition(&self) -> Option<engine::InsertCondition> {
+        Some(engine::InsertCondition::IfAbsent)
+    }
+}
+
+fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
+    op.insert_parts()
+}
+
+fn same_shape_insert_run_len<T: InsertBatchEntry>(ops: &[T], start: usize) -> usize {
+    let Some((first_key, first_value)) = ops[start].insert_parts() else {
         return 0;
     };
     let mut end = start + 1;
     while end < ops.len() {
-        match batch_insert_parts(&ops[end]) {
+        match ops[end].insert_parts() {
             Some((key, value))
                 if key.len() == first_key.len() && value.len() == first_value.len() =>
             {
@@ -526,8 +574,8 @@ fn same_shape_insert_run_len(ops: &[BatchOp], start: usize) -> usize {
     end - start
 }
 
-fn insert_run_plan(ops: &[BatchOp], start: usize) -> Option<InsertRunPlan> {
-    let (first_key, first_value) = batch_insert_parts(&ops[start])?;
+fn insert_run_plan<T: InsertBatchEntry>(ops: &[T], start: usize) -> Option<InsertRunPlan> {
+    let (first_key, first_value) = ops[start].insert_parts()?;
     let fixed_len = same_shape_insert_run_len(ops, start);
     let fixed = InsertRunPlan {
         len: fixed_len,
@@ -549,7 +597,7 @@ fn insert_run_plan(ops: &[BatchOp], start: usize) -> Option<InsertRunPlan> {
 
     let individual_len = ops[start..start + prefix.len]
         .iter()
-        .map(|op| batch_insert_parts(op).expect("prefix run insert op"))
+        .map(|op| op.insert_parts().expect("prefix run insert op"))
         .fold(0usize, |len, (key, value)| {
             len.saturating_add(1 + 8 + 4)
                 .saturating_add(key.len())
@@ -568,13 +616,13 @@ struct PrefixInsertRun {
     prefix_len: usize,
 }
 
-fn same_prefix_insert_run(ops: &[BatchOp], start: usize) -> Option<PrefixInsertRun> {
-    let (first_key, _) = batch_insert_parts(&ops[start])?;
+fn same_prefix_insert_run<T: InsertBatchEntry>(ops: &[T], start: usize) -> Option<PrefixInsertRun> {
+    let (first_key, _) = ops[start].insert_parts()?;
     let mut prefix_len = first_key.len();
     let mut len = 1usize;
     let mut end = start + 1;
     while end < ops.len() {
-        let Some((key, _)) = batch_insert_parts(&ops[end]) else {
+        let Some((key, _)) = ops[end].insert_parts() else {
             break;
         };
         prefix_len = common_prefix_len(&first_key[..prefix_len], key);
@@ -986,26 +1034,30 @@ impl Tree {
         // consistent with the apply): present in the tree OR seen earlier
         // in this batch ⇒ `AlreadyExists`; otherwise queue the insert.
         let mut results = Vec::with_capacity(entries.len());
-        let mut new_ops: Vec<BatchOp> = Vec::new();
+        let mut fresh_entries = Vec::new();
         let mut creating: HashSet<&[u8]> = HashSet::new();
         for &(key, value) in entries {
+            // Match `put_if_absent`: malformed input is rejected even when the
+            // key already exists or was duplicated earlier in this request.
+            // Validate the entire request before any batch walker can mutate.
+            Self::validate_insert_shape(key, value)?;
             let fresh = creating.insert(key) && self.get_version(key)?.is_none();
             if fresh {
                 results.push(PutOutcome::Created);
-                new_ops.push(BatchOp::PutIfAbsent {
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                });
+                fresh_entries.push((key, value));
             } else {
                 results.push(PutOutcome::AlreadyExists);
             }
         }
 
-        if !new_ops.is_empty() {
-            let base_seq = self
-                .next_seq
-                .fetch_add(new_ops.len() as u64, Ordering::Relaxed);
-            self.commit_batch(&new_ops, base_seq)?;
+        if !fresh_entries.is_empty() {
+            let count = validate_atomic_op_count(fresh_entries.len())?;
+            let encoded_bytes = encoded_insert_only_batch_record_len(&fresh_entries);
+            if let Some(journal) = &self.journal {
+                BatchWalAdmission::new(encoded_bytes, journal.max_record_bytes())?;
+            }
+            let base_seq = reserve_seq_range(&self.next_seq, count)?;
+            self.commit_preflighted_batch(PreflightedBatch::PutMany(&fresh_entries), base_seq)?;
         }
         Ok(results)
     }
@@ -1495,11 +1547,18 @@ impl Tree {
         self.apply_batch(batch.pending)
     }
 
-    pub(crate) fn apply_batch(&self, mut pending: Vec<BatchOp>) -> Result<bool> {
+    pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
+        self.apply_batch_locked(pending)
+    }
+
+    /// Validate, admit, and commit an owned atomic batch while the caller holds
+    /// the tree's maintenance and mutation gates. Borrowed put-many requests
+    /// perform the same checks before entering the shared preflighted commit.
+    fn apply_batch_locked(&self, mut pending: Vec<BatchOp>) -> Result<bool> {
         let count = validate_atomic_op_count(pending.iter().filter(|op| op.emits_wal()).count())?;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
@@ -1523,7 +1582,7 @@ impl Tree {
             return Ok(false);
         }
         if count != 0 {
-            self.commit_batch(&pending, base_seq)?;
+            self.commit_preflighted_batch(PreflightedBatch::Atomic(&pending), base_seq)?;
         }
         Ok(true)
     }
@@ -1531,16 +1590,23 @@ impl Tree {
     /// Commit a pre-validated batch under one WAL record. The caller
     /// holds the maintenance + mutation gates and has reserved the
     /// `base_seq` range; every inner op applies via the run walker.
-    fn commit_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<()> {
+    fn commit_preflighted_batch(&self, batch: PreflightedBatch<'_>, base_seq: u64) -> Result<()> {
         // W2D-strict protocol: all inner ops' walker mutations +
         // `mark_dirty` calls, plus the single envelope WAL submit, happen
         // under `commit_gate` — see `Tree::put_inner_conditional`.
         if let Some(journal) = &self.journal {
-            let mut record = journal.prepare_record(encoded_batch_record_len(pending))?;
+            let mut record = journal.prepare_record(batch.encoded_record_len())?;
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
-                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
+                match batch {
+                    PreflightedBatch::Atomic(ops) => {
+                        self.apply_batch_walker_inline(ops, base_seq, Some(&mut enc))?;
+                    }
+                    PreflightedBatch::PutMany(entries) => {
+                        self.apply_put_many_walker_inline(entries, base_seq, Some(&mut enc))?;
+                    }
+                }
                 let _n = enc.finish();
                 journal.submit(record, self.cfg.durability.wal_sync())?
             };
@@ -1549,7 +1615,14 @@ impl Tree {
             }
         } else {
             let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
-            self.apply_batch_walker_inline(pending, base_seq, None)?;
+            match batch {
+                PreflightedBatch::Atomic(ops) => {
+                    self.apply_batch_walker_inline(ops, base_seq, None)?;
+                }
+                PreflightedBatch::PutMany(entries) => {
+                    self.apply_put_many_walker_inline(entries, base_seq, None)?;
+                }
+            }
             drop(commit);
             if self.cfg.memory_flush_on_write {
                 self.flush_inline()?;
@@ -1793,7 +1866,7 @@ impl Tree {
             if let Some(plan) = insert_run_plan(pending, i) {
                 let run_len = plan.len;
                 let first_seq = base_seq + seq_offset;
-                self.apply_batch_insert_run_walker(&pending[i..i + run_len], first_seq)?;
+                self.apply_insert_run_walker(&pending[i..i + run_len], first_seq)?;
                 seq_offset += run_len as u64;
                 if let Some(enc) = enc.as_deref_mut() {
                     match plan.encoding {
@@ -1916,16 +1989,60 @@ impl Tree {
         Ok(())
     }
 
-    fn apply_batch_insert_run_walker(&self, ops: &[BatchOp], first_seq: u64) -> Result<()> {
+    fn apply_put_many_walker_inline(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        base_seq: u64,
+        mut enc: Option<&mut crate::journal::codec::BatchEncoder<'_>>,
+    ) -> Result<()> {
+        let mut index = 0usize;
+        while index < entries.len() {
+            let plan = insert_run_plan(entries, index).expect("put-many entry is insert-like");
+            let run = &entries[index..index + plan.len];
+            self.apply_insert_run_walker(run, base_seq + index as u64)?;
+            if let Some(enc) = enc.as_deref_mut() {
+                match plan.encoding {
+                    InsertRunEncoding::Fixed { key_len, value_len } => {
+                        enc.push_insert_run(
+                            self.tree_id,
+                            plan.len,
+                            key_len,
+                            value_len,
+                            run.iter()
+                                .map(|entry| entry.insert_parts().expect("put-many entry")),
+                        );
+                    }
+                    InsertRunEncoding::Prefix { prefix_len } => {
+                        let (key, _) = run[0].insert_parts().expect("put-many prefix entry");
+                        enc.push_insert_prefix_run(
+                            self.tree_id,
+                            &key[..prefix_len],
+                            plan.len,
+                            run.iter()
+                                .map(|entry| entry.insert_parts().expect("put-many entry")),
+                        );
+                    }
+                }
+            }
+            index += plan.len;
+        }
+        Ok(())
+    }
+
+    fn apply_insert_run_walker<T: InsertBatchEntry>(
+        &self,
+        ops: &[T],
+        first_seq: u64,
+    ) -> Result<()> {
         if ops.len() == 1 {
-            return self.apply_single_insert_batch_op(&ops[0], first_seq);
+            return self.apply_single_insert_op(&ops[0], first_seq);
         }
 
         let mut items = Vec::with_capacity(ops.len());
         for (idx, op) in ops.iter().enumerate() {
             let seq = first_seq + idx as u64;
-            let (key, value) = batch_insert_parts(op).expect("not an insert-like batch op");
-            let condition = batch_insert_condition(op).expect("not an insert-like batch op");
+            let (key, value) = op.insert_parts().expect("not an insert-like batch op");
+            let condition = op.insert_condition().expect("not an insert-like batch op");
             items.push(engine::InsertBatchItem::new(
                 engine::SearchKey::user(key),
                 value,
@@ -1957,9 +2074,9 @@ impl Tree {
         Ok(())
     }
 
-    fn apply_single_insert_batch_op(&self, op: &BatchOp, seq: u64) -> Result<()> {
-        let (key, value) = batch_insert_parts(op).expect("not an insert-like batch op");
-        let condition = batch_insert_condition(op).expect("not an insert-like batch op");
+    fn apply_single_insert_op<T: InsertBatchEntry>(&self, op: &T, seq: u64) -> Result<()> {
+        let (key, value) = op.insert_parts().expect("not an insert-like batch op");
+        let condition = op.insert_condition().expect("not an insert-like batch op");
         let outcome = engine::insert_multi_conditional(
             &self.store,
             &self.root_pin,
@@ -3496,6 +3613,221 @@ mod tests {
     }
 
     #[test]
+    fn put_many_if_absent_rejects_a_late_invalid_shape_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            tree.put(b"old", b"value").unwrap();
+            tree.checkpoint().unwrap();
+            let journal = tree.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+            assert_eq!(tree.store.dirty_count(), 0);
+
+            let oversized = vec![0xA5; u16::MAX as usize + 1];
+            let error = tree
+                .put_many_if_absent(&[
+                    (b"fresh-valid".as_slice(), b"value".as_slice()),
+                    (b"fresh-invalid".as_slice(), oversized.as_slice()),
+                ])
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::ValueTooLong { len } if len == u16::MAX as usize + 1
+            ));
+            assert_eq!(tree.get(b"old").unwrap().as_deref(), Some(&b"value"[..]));
+            assert!(tree.get(b"fresh-valid").unwrap().is_none());
+            assert!(tree.get(b"fresh-invalid").unwrap().is_none());
+            assert_eq!(tree.store.dirty_count(), 0);
+            assert_eq!(journal.stats().appends, appends_before);
+
+            let error = tree
+                .put_many_if_absent(&[
+                    (b"another-fresh".as_slice(), b"value".as_slice()),
+                    (b"old".as_slice(), oversized.as_slice()),
+                ])
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::ValueTooLong { len } if len == u16::MAX as usize + 1
+            ));
+            assert!(tree.get(b"another-fresh").unwrap().is_none());
+            assert_eq!(tree.store.dirty_count(), 0);
+            assert_eq!(journal.stats().appends, appends_before);
+
+            journal.set_max_record_bytes_for_test(128);
+            let admitted_shape = vec![0xC3; 4 * 1024];
+            let error = tree
+                .put_many_if_absent(&[(b"over-test-ceiling".as_slice(), admitted_shape.as_slice())])
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::AtomicRecordTooLarge { max_bytes: 128, .. }
+            ));
+            assert!(tree.get(b"over-test-ceiling").unwrap().is_none());
+            assert_eq!(tree.store.dirty_count(), 0);
+            assert_eq!(journal.stats().appends, appends_before);
+        }
+
+        let reopened = Tree::open(cfg).unwrap();
+        assert_eq!(
+            reopened.get(b"old").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        assert!(reopened.get(b"fresh-valid").unwrap().is_none());
+        assert!(reopened.get(b"fresh-invalid").unwrap().is_none());
+        assert!(reopened.get(b"another-fresh").unwrap().is_none());
+        assert!(reopened.get(b"over-test-ceiling").unwrap().is_none());
+    }
+
+    #[test]
+    fn put_many_if_absent_enforces_native_operation_boundary_before_mutation() {
+        const MAX: usize = crate::journal::codec::MAX_ATOMIC_WAL_OPS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+
+        let rejected_keys = (0..=MAX)
+            .map(|index| {
+                let mut key = [0u8; 64];
+                key[0] = 0xFF;
+                key[56..].copy_from_slice(&(index as u64).to_be_bytes());
+                key
+            })
+            .collect::<Vec<_>>();
+        let accepted_keys = (0..MAX)
+            .map(|index| {
+                let mut key = [0u8; 64];
+                key[0] = 0x7F;
+                key[56..].copy_from_slice(&(index as u64).to_be_bytes());
+                key
+            })
+            .collect::<Vec<_>>();
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            let journal = tree.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+            // Every entry borrows the same near-maximum value. Retaining owned
+            // BatchOps before the operation ceiling would attempt almost 4 GiB
+            // of duplicate payload allocation merely to return a typed error.
+            let repeated_large_value = vec![0xD4; u16::MAX as usize];
+            let rejected_entries = rejected_keys
+                .iter()
+                .map(|key| (key.as_slice(), repeated_large_value.as_slice()))
+                .collect::<Vec<_>>();
+            let logical_payload_bytes =
+                rejected_entries.len() as u64 * u64::try_from(repeated_large_value.len()).unwrap();
+            assert_eq!(logical_payload_bytes, u64::from(u32::MAX));
+            let error = tree.put_many_if_absent(&rejected_entries).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::AtomicRecordTooManyOperations {
+                    operations,
+                    max_operations,
+                } if operations == MAX + 1 && max_operations == MAX
+            ));
+            assert!(tree.get(&rejected_keys[0]).unwrap().is_none());
+            assert!(tree.get(&rejected_keys[MAX]).unwrap().is_none());
+            assert_eq!(tree.store.dirty_count(), 0);
+            assert_eq!(journal.stats().appends, appends_before);
+
+            let accepted_entries = accepted_keys
+                .iter()
+                .map(|key| (key.as_slice(), b"".as_slice()))
+                .collect::<Vec<_>>();
+            let outcomes = tree.put_many_if_absent(&accepted_entries).unwrap();
+            assert_eq!(outcomes.len(), MAX);
+            assert!(outcomes
+                .iter()
+                .all(|outcome| *outcome == crate::PutOutcome::Created));
+            assert!(tree.get(&accepted_keys[0]).unwrap().is_some());
+            assert!(tree.get(&accepted_keys[MAX - 1]).unwrap().is_some());
+            assert_eq!(journal.stats().appends, appends_before + 1);
+        }
+
+        let reopened = Tree::open(cfg).unwrap();
+        assert!(reopened.get(&rejected_keys[0]).unwrap().is_none());
+        assert!(reopened.get(&rejected_keys[MAX]).unwrap().is_none());
+        assert!(reopened.get(&accepted_keys[0]).unwrap().is_some());
+        assert!(reopened.get(&accepted_keys[MAX - 1]).unwrap().is_some());
+    }
+
+    #[test]
+    fn put_many_if_absent_reserves_the_sequence_tail_without_wrapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+
+        {
+            let tree = Tree::open(cfg.clone()).unwrap();
+            tree.put(b"old", b"value").unwrap();
+            tree.checkpoint().unwrap();
+            let journal = tree.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+
+            tree.next_seq.store(u64::MAX - 1, Ordering::Release);
+            let error = tree
+                .put_many_if_absent(&[
+                    (b"overflow-a".as_slice(), b"value".as_slice()),
+                    (b"overflow-b".as_slice(), b"value".as_slice()),
+                ])
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::WalSequenceExhausted { requested: 2 }
+            ));
+            assert!(tree.get(b"overflow-a").unwrap().is_none());
+            assert!(tree.get(b"overflow-b").unwrap().is_none());
+            assert_eq!(tree.store.dirty_count(), 0);
+            assert_eq!(journal.stats().appends, appends_before);
+
+            tree.next_seq.store(u64::MAX - 2, Ordering::Release);
+            tree.put_many_if_absent(&[
+                (b"last-a".as_slice(), b"value".as_slice()),
+                (b"last-b".as_slice(), b"value".as_slice()),
+            ])
+            .unwrap();
+            assert_eq!(tree.next_seq.load(Ordering::Acquire), u64::MAX);
+            let appends_after_tail = journal.stats().appends;
+
+            let error = tree
+                .put_many_if_absent(&[(b"past-end".as_slice(), b"value".as_slice())])
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::WalSequenceExhausted { requested: 1 }
+            ));
+            assert!(tree.get(b"past-end").unwrap().is_none());
+            assert_eq!(journal.stats().appends, appends_after_tail);
+        }
+
+        let reopened = Tree::open(cfg).unwrap();
+        assert_eq!(
+            reopened.get(b"old").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        assert!(reopened.get(b"overflow-a").unwrap().is_none());
+        assert!(reopened.get(b"overflow-b").unwrap().is_none());
+        assert_eq!(
+            reopened.get(b"last-a").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        assert_eq!(
+            reopened.get(b"last-b").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        assert!(reopened.get(b"past-end").unwrap().is_none());
+        assert_eq!(reopened.next_seq.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
     fn oversized_delete_key_cannot_commit_a_wal_that_reader_would_reject() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = TreeConfig::new(dir.path());
@@ -3608,8 +3940,14 @@ mod tests {
             .collect::<Vec<_>>();
         let naive = super::BATCH_RECORD_ENVELOPE_LEN + OPERATIONS * (1 + 8 + 4 + KEY_BYTES + 4);
         let exact = super::encoded_batch_record_len(&pending);
+        let borrowed = pending
+            .iter()
+            .map(|op| super::batch_insert_parts(op).unwrap())
+            .collect::<Vec<_>>();
+        let borrowed_exact = super::encoded_insert_only_batch_record_len(&borrowed);
         assert_eq!(naive, 16_781_093);
         assert_eq!(exact, 68_656);
+        assert_eq!(borrowed_exact, exact);
         assert!(naive > RING_BYTES);
         assert!(exact < RING_BYTES);
         super::BatchWalAdmission::new(exact, RING_BYTES).unwrap();

@@ -3524,6 +3524,37 @@ mod tests {
         encoded
     }
 
+    fn oversized_pre_poison_record() -> Vec<u8> {
+        let mut encoded = Vec::new();
+        crate::journal::codec::encode_insert_record(
+            &mut encoded,
+            1,
+            0,
+            b"oversized-pre-poison-key",
+            &[0xA5; 512],
+        );
+        encoded
+    }
+
+    fn prepare_store_for_journal_poison(store: &FileBlobStore) {
+        store.write_blob([0xE6; 16], &buf_with(0x56)).unwrap();
+        store.flush().unwrap();
+        store
+            .manifest
+            .write()
+            .unwrap()
+            .persist_snapshot(&store.directory)
+            .unwrap();
+    }
+
+    fn poison_store_after_manifest_delta(store: &FileBlobStore) {
+        store.write_blob([0xE7; 16], &buf_with(0x57)).unwrap();
+        store.manifest.write().unwrap().log_bytes = MANIFEST_LOG_MIN_COMPACT_BYTES;
+        set_manifest_persist_failpoint(ManifestPersistFailpoint::PostDeltaSyncValidate);
+        assert!(store.flush().is_err());
+        assert!(store.health.is_poisoned());
+    }
+
     #[test]
     fn data_preallocation_rounds_in_adaptive_chunks() {
         assert_eq!(round_up_slots(1), DATA_PREALLOC_SMALL_CHUNK_SLOTS);
@@ -4269,6 +4300,161 @@ mod tests {
         })
         .unwrap();
         assert_eq!(replayed, 1);
+    }
+
+    #[test]
+    fn manifest_poison_wins_oversized_health_handoff_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        prepare_store_for_journal_poison(&store);
+
+        let store = Arc::new(store);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let wal = store.open_wal_file().unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::open_or_create_file_with_limits(
+                wal,
+                0,
+                Arc::clone(&store),
+                256,
+                4 * 1024,
+            )
+            .unwrap(),
+        );
+        assert_eq!(Arc::strong_count(&store), 3);
+        let encoded = oversized_pre_poison_record();
+        assert!(encoded.len() > 256);
+
+        let before_health = crate::journal::group_commit::JournalTestBarrier::new();
+        journal.install_before_oversized_health_barrier(Arc::clone(&before_health));
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let submit_journal = Arc::clone(&journal);
+        let submitter = thread::spawn(move || {
+            let mut record = submit_journal.prepare_record(encoded.len()).unwrap();
+            record.extend_from_slice(&encoded);
+            result_tx
+                .send(submit_journal.submit(record, true).map(|_| ()))
+                .unwrap();
+        });
+
+        before_health.wait();
+        poison_store_after_manifest_delta(&store);
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            crate::journal::codec::FILE_HEADER_SIZE as u64
+        );
+        before_health.release();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("oversized submit deadlocked behind manifest poison");
+        assert!(matches!(
+            result,
+            Err(Error::CommitOutcomeUnknown {
+                phase: crate::CommitPhase::WalAppend,
+                ..
+            })
+        ));
+        submitter.join().unwrap();
+        assert_eq!(journal.stats().written_work, 0);
+        assert_eq!(journal.stats().appends, 0);
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            crate::journal::codec::FILE_HEADER_SIZE as u64
+        );
+
+        drop(journal);
+        assert_eq!(Arc::strong_count(&store), 1);
+        let mut replayed = 0usize;
+        crate::journal::reader::replay(&wal_path, |_, _, _| {
+            replayed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, 0);
+        drop(store);
+        drop(FileBlobStore::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn manifest_poison_after_oversized_append_blocks_sync_ack_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        prepare_store_for_journal_poison(&store);
+
+        let store = Arc::new(store);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let wal = store.open_wal_file().unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::open_or_create_file_with_limits(
+                wal,
+                0,
+                Arc::clone(&store),
+                256,
+                4 * 1024,
+            )
+            .unwrap(),
+        );
+        assert_eq!(Arc::strong_count(&store), 3);
+        let encoded = oversized_pre_poison_record();
+        let encoded_len = encoded.len();
+        assert!(encoded_len > 256);
+
+        let after_append = crate::journal::group_commit::JournalTestBarrier::new();
+        journal.install_after_oversized_append_barrier(Arc::clone(&after_append));
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let submit_journal = Arc::clone(&journal);
+        let submitter = thread::spawn(move || {
+            let mut record = submit_journal.prepare_record(encoded.len()).unwrap();
+            record.extend_from_slice(&encoded);
+            let result = submit_journal
+                .submit(record, true)
+                .and_then(|ack| ack.expect("sync submit returns an acknowledgement").wait());
+            result_tx.send(result).unwrap();
+        });
+
+        after_append.wait();
+        assert_eq!(journal.stats().written_work, 1);
+        assert_eq!(journal.stats().flushed_work, 0);
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            (crate::journal::codec::FILE_HEADER_SIZE + encoded_len) as u64
+        );
+        poison_store_after_manifest_delta(&store);
+        after_append.release();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("oversized sync acknowledgement deadlocked behind manifest poison");
+        assert!(matches!(
+            result,
+            Err(Error::CommitOutcomeUnknown {
+                phase: crate::CommitPhase::WalSync,
+                ..
+            })
+        ));
+        submitter.join().unwrap();
+        assert_eq!(journal.stats().written_work, 1);
+        assert_eq!(journal.stats().flushed_work, 0);
+        assert_eq!(journal.stats().appends, 1);
+
+        drop(journal);
+        assert_eq!(Arc::strong_count(&store), 1);
+        let mut replayed = 0usize;
+        crate::journal::reader::replay(&wal_path, |op, seq, _| {
+            assert!(matches!(op, crate::journal::wal_op::WalOp::Insert { .. }));
+            assert_eq!(seq, 1);
+            replayed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, 1);
+        drop(store);
+        drop(FileBlobStore::open(dir.path()).unwrap());
     }
 
     #[test]

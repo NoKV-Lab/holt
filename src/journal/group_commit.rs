@@ -311,6 +311,10 @@ struct Shared {
     after_snapshot_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
     #[cfg(test)]
     before_sync_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
+    #[cfg(test)]
+    before_oversized_health_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
+    #[cfg(test)]
+    after_oversized_append_barrier: Mutex<Option<Arc<JournalTestBarrier>>>,
 }
 
 /// Buffer admitted before a tree mutation begins.
@@ -435,7 +439,7 @@ impl JournalShutdownBarrier {
 /// One-shot deterministic barrier used by WAL interleaving tests.
 #[cfg(test)]
 #[derive(Debug)]
-struct JournalTestBarrier {
+pub(crate) struct JournalTestBarrier {
     entered_tx: Sender<()>,
     entered_rx: Receiver<()>,
     release_tx: Sender<()>,
@@ -444,7 +448,7 @@ struct JournalTestBarrier {
 
 #[cfg(test)]
 impl JournalTestBarrier {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (entered_tx, entered_rx) = bounded(1);
         let (release_tx, release_rx) = bounded(1);
         Arc::new(Self {
@@ -460,13 +464,13 @@ impl JournalTestBarrier {
         let _ = self.release_rx.recv();
     }
 
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         self.entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("journal test barrier was not reached");
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.release_tx
             .send(())
             .expect("journal test barrier waiter disappeared");
@@ -839,6 +843,8 @@ impl Shared {
         // handing work to this thread. Re-enter here so the direct append is
         // itself ordered against poison without recursively acquiring a read
         // lock while a poison writer may be queued.
+        #[cfg(test)]
+        Self::pause_once(&self.before_oversized_health_barrier);
         let Ok(_health) = self.enter_file_store_health() else {
             let failure = JournalFailure {
                 phase: CommitPhase::WalAppend,
@@ -941,6 +947,23 @@ impl Journal {
         Self::from_writer(writer, Some(resource_guard))
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_or_create_file_with_limits(
+        file: File,
+        tree_id: u64,
+        resource_guard: Arc<FileBlobStore>,
+        ring_capacity: usize,
+        max_record_bytes: usize,
+    ) -> Result<Self> {
+        let writer = WalWriter::open_or_create_file(file, tree_id)?;
+        Self::from_writer_with_limits(
+            writer,
+            Some(resource_guard),
+            ring_capacity,
+            max_record_bytes,
+        )
+    }
+
     fn from_writer(writer: WalWriter, resource_guard: Option<Arc<FileBlobStore>>) -> Result<Self> {
         Self::from_writer_with_limits(
             writer,
@@ -1009,6 +1032,10 @@ impl Journal {
             after_snapshot_barrier: Mutex::new(None),
             #[cfg(test)]
             before_sync_barrier: Mutex::new(None),
+            #[cfg(test)]
+            before_oversized_health_barrier: Mutex::new(None),
+            #[cfg(test)]
+            after_oversized_append_barrier: Mutex::new(None),
         });
 
         let worker_shared = Arc::clone(&shared);
@@ -1306,6 +1333,28 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_before_oversized_health_barrier(&self, barrier: Arc<JournalTestBarrier>) {
+        assert!(self
+            .shared
+            .before_oversized_health_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier)
+            .is_none());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_after_oversized_append_barrier(&self, barrier: Arc<JournalTestBarrier>) {
+        assert!(self
+            .shared
+            .after_oversized_append_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier)
+            .is_none());
+    }
+
+    #[cfg(test)]
     fn wake_depth_for_test(&self) -> usize {
         self.shared.wake_tx.len()
     }
@@ -1429,6 +1478,10 @@ fn run_flusher(
                 // after the loop's first drain but before this control recv.
                 shared.drain_and_maybe_sync();
                 let result = shared.append_oversized(&record, target);
+                #[cfg(test)]
+                if result.is_ok() {
+                    Shared::pause_once(&shared.after_oversized_append_barrier);
+                }
                 let _ = ack.send(result);
             }
             Ok(Control::Stop) => {
