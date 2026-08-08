@@ -3512,6 +3512,18 @@ mod tests {
         b
     }
 
+    fn encoded_pre_poison_record() -> Vec<u8> {
+        let mut encoded = Vec::new();
+        crate::journal::codec::encode_insert_record(
+            &mut encoded,
+            1,
+            0,
+            b"pre-poison-key",
+            b"pre-poison-value",
+        );
+        encoded
+    }
+
     #[test]
     fn data_preallocation_rounds_in_adaptive_chunks() {
         assert_eq!(round_up_slots(1), DATA_PREALLOC_SMALL_CHUNK_SLOTS);
@@ -4171,14 +4183,7 @@ mod tests {
         // cache can be replayed as an outcome-unknown commit after restart.
         // The health boundary below must prevent fsync/ACK, not pretend bytes
         // already published before poison can always be withdrawn.
-        let mut encoded = Vec::new();
-        crate::journal::codec::encode_insert_record(
-            &mut encoded,
-            1,
-            0,
-            b"pre-poison-key",
-            b"pre-poison-value",
-        );
+        let encoded = encoded_pre_poison_record();
         let encoded_len = encoded.len();
         let mut record = journal.prepare_record(encoded_len).unwrap();
         record.extend_from_slice(&encoded);
