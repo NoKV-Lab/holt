@@ -7,6 +7,23 @@ use crate::store::{AllocError, FreeError};
 /// Result alias used throughout the crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// WAL phase after which Holt can no longer determine whether a commit will
+/// be recovered.
+///
+/// Callers must not blindly retry an operation that returns
+/// [`Error::CommitOutcomeUnknown`]. Reconcile the logical operation through
+/// an application-level idempotency record, then retry only when that record
+/// proves the original commit absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPhase {
+    /// The encoded record may have been appended fully, partially, or not at
+    /// all when the journal reported failure.
+    WalAppend,
+    /// The record reached the WAL writer, but the requested `sync_data`
+    /// durability boundary did not produce a reliable acknowledgement.
+    WalSync,
+}
+
 pub(crate) fn is_blob_store_not_found(error: &Error) -> bool {
     matches!(
         error,
@@ -46,6 +63,22 @@ pub enum Error {
     ValueTooLong {
         /// Caller-supplied length.
         len: usize,
+    },
+    /// A single encoded atomic WAL record exceeds Holt's advertised native
+    /// ceiling. Admission happens before any tree mutation.
+    AtomicRecordTooLarge {
+        /// Proven upper bound for the final encoded record.
+        encoded_bytes: usize,
+        /// Maximum encoded bytes accepted as one native atomic WAL record.
+        max_bytes: usize,
+    },
+    /// A WAL append or sync failed after the operation crossed its commit
+    /// boundary, so recovery may expose either the old or the new state.
+    CommitOutcomeUnknown {
+        /// Last WAL phase whose result could not be established.
+        phase: CommitPhase,
+        /// Static journal diagnostic for operators.
+        context: &'static str,
     },
     /// A walker arm hit a code path that the engine doesn't yet
     /// implement (e.g. degenerate `Leaf` / `EmptyRoot` spillover
@@ -191,6 +224,20 @@ impl std::fmt::Display for Error {
             Self::KeyTooLong { len } => write!(f, "key too long ({len} bytes; max {})", u16::MAX),
             Self::ValueTooLong { len } => {
                 write!(f, "value too long ({len} bytes; max {})", u16::MAX)
+            }
+            Self::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "atomic WAL record too large ({encoded_bytes} encoded bytes; max {max_bytes})"
+            ),
+            Self::CommitOutcomeUnknown { phase, context } => {
+                let phase = match phase {
+                    CommitPhase::WalAppend => "WAL append",
+                    CommitPhase::WalSync => "WAL sync",
+                };
+                write!(f, "commit outcome unknown during {phase}: {context}")
             }
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
             Self::Internal(what) => write!(f, "internal invariant violated: {what}"),
@@ -373,6 +420,37 @@ mod tests {
 
         for (actual, expected) in cases {
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn atomic_commit_error_display_includes_limit_and_phase() {
+        assert_eq!(
+            Error::AtomicRecordTooLarge {
+                encoded_bytes: 257,
+                max_bytes: 256,
+            }
+            .to_string(),
+            "atomic WAL record too large (257 encoded bytes; max 256)"
+        );
+        for (phase, expected) in [
+            (
+                CommitPhase::WalAppend,
+                "commit outcome unknown during WAL append: injected failure",
+            ),
+            (
+                CommitPhase::WalSync,
+                "commit outcome unknown during WAL sync: injected failure",
+            ),
+        ] {
+            assert_eq!(
+                Error::CommitOutcomeUnknown {
+                    phase,
+                    context: "injected failure",
+                }
+                .to_string(),
+                expected
+            );
         }
     }
 

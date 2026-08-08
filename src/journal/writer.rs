@@ -60,6 +60,10 @@ pub struct WalWriter {
     /// File-header info recovered on open.
     #[cfg(test)]
     header: FileHeader,
+    #[cfg(test)]
+    fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 impl WalWriter {
@@ -84,6 +88,10 @@ impl WalWriter {
             bytes_written: FILE_HEADER_SIZE as u64,
             #[cfg(test)]
             header,
+            #[cfg(test)]
+            fail_next_append: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
     }
 
@@ -107,6 +115,10 @@ impl WalWriter {
             bytes_written,
             #[cfg(test)]
             header,
+            #[cfg(test)]
+            fail_next_append: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
     }
 
@@ -145,6 +157,10 @@ impl WalWriter {
                 bytes_written: FILE_HEADER_SIZE as u64,
                 #[cfg(test)]
                 header,
+                #[cfg(test)]
+                fail_next_append: false,
+                #[cfg(test)]
+                fail_next_sync: false,
             });
         }
 
@@ -163,6 +179,10 @@ impl WalWriter {
             bytes_written: len,
             #[cfg(test)]
             header,
+            #[cfg(test)]
+            fail_next_append: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
     }
 
@@ -211,8 +231,29 @@ impl WalWriter {
     /// Used by the journal coordinator after callers encode into
     /// owned buffers.
     pub(crate) fn append_encoded(&mut self, record: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_append) {
+            return Err(std::io::Error::other("injected WAL append failure").into());
+        }
         self.pending.extend_from_slice(record);
         self.maybe_drain()
+    }
+
+    /// Append one already-encoded record directly to the OS page cache.
+    ///
+    /// The oversized-record lane uses this after draining the ordinary
+    /// writer prefix. Writing from the caller-owned slice avoids temporarily
+    /// duplicating a record that may be close to the native atomic ceiling.
+    /// This is an append boundary only; it deliberately does not `sync_data`.
+    pub(crate) fn append_encoded_direct(&mut self, record: &[u8]) -> Result<()> {
+        self.drain_to_os()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_append) {
+            return Err(std::io::Error::other("injected WAL append failure").into());
+        }
+        self.file.write_all(record)?;
+        self.bytes_written += record.len() as u64;
+        Ok(())
     }
 
     fn maybe_drain(&mut self) -> Result<()> {
@@ -245,8 +286,22 @@ impl WalWriter {
     /// page cache.
     pub fn flush(&mut self) -> Result<()> {
         self.drain_to_os()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(std::io::Error::other("injected WAL sync failure").into());
+        }
         self.file.sync_data()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&mut self) {
+        self.fail_next_append = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync(&mut self) {
+        self.fail_next_sync = true;
     }
 
     /// Drop pending records without writing them. Useful when a

@@ -665,7 +665,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open_or_create(&dir.path().join("wal.log"), 0).unwrap());
-        journal.submit(vec![1, 2, 3, 4], false).unwrap(); // -> needs_checkpoint()
+        let mut record = journal.prepare_record(4).unwrap();
+        record.extend_from_slice(&[1, 2, 3, 4]);
+        journal.submit(record, false).unwrap(); // -> needs_checkpoint()
         assert!(journal.needs_checkpoint());
 
         bm.write_blob([0x55; 16], &test_blob([0x55; 16])).unwrap();

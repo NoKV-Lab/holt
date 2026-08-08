@@ -17,9 +17,9 @@
 //! `needs_checkpoint`, the reopen signal, and the checkpoint round-trip are
 //! preserved bit-for-bit. `record_base` is the reopen offset (1 when the
 //! file already had records, else 0). `written/flushed = record_base +
-//! ring.committed_records()` at drain/fsync time; `queued = record_base +
-//! records submitted this process`. They reconcile because every `submit`
-//! both bumps `queued` and appends exactly one ring record.
+//! ring.committed_records() + oversized_records` at drain/fsync time;
+//! `queued = record_base + records submitted this process`. They reconcile
+//! because each admitted record is published through exactly one ordered lane.
 //!
 //! ## Durability: the flusher drains PROMPTLY
 //!
@@ -31,15 +31,17 @@
 //! checkpoint barrier), exactly like legacy group commit.
 
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{CommitPhase, Error, Result};
 
+use super::codec::MAX_ATOMIC_WAL_RECORD_BYTES;
 use super::ring::{ReserveTicket, WalRing};
 use super::writer::WalWriter;
 
@@ -57,8 +59,8 @@ pub(crate) struct JournalStats {
     pub(crate) checkpoint_debt: u64,
 }
 
-/// In-RAM ring capacity. 16 MiB absorbs large metadata bursts between
-/// checkpoints; records are ≤ ~512 KB so a single record always fits.
+/// In-RAM ring capacity. Records larger than this use the bounded oversized
+/// lane instead of permanently multiplying every store's resident WAL RAM.
 const RING_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
 /// Flusher idle poll. Bounds the async RAM→page-cache window (process-crash
 /// durability) and the latency a sync waiter adds if a wake is ever missed.
@@ -72,11 +74,184 @@ enum Control {
     Flush,
     /// Drain, then truncate the WAL to its header and reset the ring.
     Truncate(Sender<Result<()>>),
+    /// Drain the preceding ring prefix, append one oversized record directly,
+    /// and acknowledge only after its bytes have reached the OS page cache.
+    AppendOversized {
+        record: Vec<u8>,
+        target: u64,
+        ack: Sender<std::result::Result<(), JournalFailure>>,
+    },
     Stop,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JournalFailure {
+    phase: CommitPhase,
+    context: &'static str,
+}
+
+impl JournalFailure {
+    const fn unknown(self) -> Error {
+        Error::CommitOutcomeUnknown {
+            phase: self.phase,
+            context: self.context,
+        }
+    }
+}
+
+const RECORD_LANE_WRITE_BIT: usize = 1usize << (usize::BITS - 1);
+const RECORD_LANE_COUNT_MASK: usize = RECORD_LANE_WRITE_BIT - 1;
+
+/// Writer-preferred admission gate joining the ring and oversized lanes.
+/// Small records hold a shared permit only through publication; an oversized
+/// waiter blocks new small admissions, drains existing publishers, then owns
+/// the direct-append position exclusively.
+#[derive(Debug)]
+struct RecordLane {
+    /// High bit = oversized pending/active; low bits = active small permits.
+    /// Uncontended small admission is one lock-free CAS.
+    state: AtomicUsize,
+    waiting_oversized: AtomicUsize,
+    /// Serializes only oversized writers. Small records never take this lock.
+    oversized_serial: Mutex<()>,
+    wait_mx: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Default for RecordLane {
+    fn default() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            waiting_oversized: AtomicUsize::new(0),
+            oversized_serial: Mutex::new(()),
+            wait_mx: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+impl RecordLane {
+    fn enter_small(&self) -> RecordLanePermit<'_> {
+        loop {
+            if self.waiting_oversized.load(Ordering::Acquire) == 0 {
+                let state = self.state.load(Ordering::Relaxed);
+                if state & RECORD_LANE_WRITE_BIT == 0
+                    && state & RECORD_LANE_COUNT_MASK != RECORD_LANE_COUNT_MASK
+                    && self
+                        .state
+                        .compare_exchange_weak(
+                            state,
+                            state + 1,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    return RecordLanePermit {
+                        lane: self,
+                        kind: RecordLaneKind::Small,
+                        oversized_serial: None,
+                    };
+                }
+            }
+
+            let mut guard = self.wait_mx.lock().unwrap();
+            while self.state.load(Ordering::Acquire) & RECORD_LANE_WRITE_BIT != 0
+                || self.waiting_oversized.load(Ordering::Acquire) != 0
+            {
+                guard = self.cv.wait(guard).unwrap();
+            }
+        }
+    }
+
+    fn enter_oversized(&self) -> RecordLanePermit<'_> {
+        self.waiting_oversized.fetch_add(1, Ordering::AcqRel);
+        let oversized_serial = self.oversized_serial.lock().unwrap();
+
+        // Only the oversized-serial owner changes the write bit. Preserve the
+        // existing small count and block every later small CAS before waiting
+        // for that finite predecessor set to drain.
+        loop {
+            let state = self.state.load(Ordering::Relaxed);
+            debug_assert_eq!(state & RECORD_LANE_WRITE_BIT, 0);
+            if self
+                .state
+                .compare_exchange_weak(
+                    state,
+                    state | RECORD_LANE_WRITE_BIT,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.waiting_oversized.fetch_sub(1, Ordering::AcqRel);
+
+        let mut guard = self.wait_mx.lock().unwrap();
+        while self.state.load(Ordering::Acquire) & RECORD_LANE_COUNT_MASK != 0 {
+            guard = self.cv.wait(guard).unwrap();
+        }
+        drop(guard);
+        RecordLanePermit {
+            lane: self,
+            kind: RecordLaneKind::Oversized,
+            oversized_serial: Some(oversized_serial),
+        }
+    }
+
+    #[cfg(test)]
+    fn oversized_waiting(&self) -> bool {
+        self.waiting_oversized.load(Ordering::Acquire) != 0
+            || self.state.load(Ordering::Acquire) & RECORD_LANE_WRITE_BIT != 0
+    }
+
+    fn notify_waiters(&self) {
+        let _guard = self.wait_mx.lock().unwrap();
+        self.cv.notify_all();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordLaneKind {
+    Small,
+    Oversized,
+}
+
+#[derive(Debug)]
+struct RecordLanePermit<'a> {
+    lane: &'a RecordLane,
+    kind: RecordLaneKind,
+    oversized_serial: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl Drop for RecordLanePermit<'_> {
+    fn drop(&mut self) {
+        match self.kind {
+            RecordLaneKind::Small => {
+                let previous = self.lane.state.fetch_sub(1, Ordering::Release);
+                debug_assert_ne!(previous & RECORD_LANE_COUNT_MASK, 0);
+                if previous & RECORD_LANE_WRITE_BIT != 0 && previous & RECORD_LANE_COUNT_MASK == 1 {
+                    self.lane.notify_waiters();
+                }
+            }
+            RecordLaneKind::Oversized => {
+                debug_assert_eq!(
+                    self.lane.state.load(Ordering::Relaxed),
+                    RECORD_LANE_WRITE_BIT
+                );
+                self.lane.state.store(0, Ordering::Release);
+                drop(self.oversized_serial.take());
+                self.lane.notify_waiters();
+            }
+        }
+    }
 }
 
 struct Shared {
     ring: WalRing,
+    record_lane: RecordLane,
     writer: Mutex<WalWriter>,
     /// Reopen offset: records already on disk before this process's ring.
     record_base: u64,
@@ -87,15 +262,21 @@ struct Shared {
     checkpointed: AtomicU64,
     /// Highest record count some waiter needs fsync-durable.
     sync_target: AtomicU64,
+    /// Oversized records appended outside the ring. Added to the ring's
+    /// committed-record count so every watermark remains in one record domain.
+    oversized_records: AtomicU64,
+    /// Production is fixed at [`MAX_ATOMIC_WAL_RECORD_BYTES`]. Atomic only so
+    /// unit tests can exercise admission without allocating hundreds of MiB.
+    max_record_bytes: AtomicUsize,
 
     appends: AtomicU64,
     batches: AtomicU64,
     syncs: AtomicU64,
 
-    /// Sticky flusher error message; fanned out to waiters and future
-    /// barriers (a `&'static str` because `Error` is not `Clone`, matching
-    /// how the legacy worker collapses failures to `Error::Internal`).
-    err: Mutex<Option<&'static str>>,
+    /// Sticky flusher phase/error; fanned out to commit waiters and future
+    /// checkpoint barriers. Static context keeps the failure copyable without
+    /// erasing whether append or sync became uncertain.
+    err: Mutex<Option<JournalFailure>>,
     /// Condvar handshake for `flushed`/`err` waiters.
     flushed_mx: Mutex<()>,
     flushed_cv: Condvar,
@@ -107,6 +288,56 @@ struct Shared {
     record_pool: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     shutdown_barrier: Mutex<Option<Arc<JournalShutdownBarrier>>>,
+}
+
+/// Buffer admitted before a tree mutation begins.
+///
+/// `admitted_upper_bound` may be conservative for a DB batch, but submit
+/// rejects any encoder drift where the actual bytes exceed it. The lane permit
+/// also prevents a large record from being overtaken by later ring records.
+pub(crate) struct PreparedRecord<'a> {
+    shared: &'a Shared,
+    bytes: Option<Vec<u8>>,
+    admitted_upper_bound: usize,
+    permit: RecordLanePermit<'a>,
+}
+
+impl PreparedRecord<'_> {
+    fn take_bytes(&mut self) -> Vec<u8> {
+        self.bytes.take().expect("prepared record bytes taken once")
+    }
+
+    fn lane_kind(&self) -> RecordLaneKind {
+        self.permit.kind
+    }
+}
+
+impl Deref for PreparedRecord<'_> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes
+            .as_ref()
+            .expect("prepared record bytes available")
+    }
+}
+
+impl DerefMut for PreparedRecord<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bytes
+            .as_mut()
+            .expect("prepared record bytes available")
+    }
+}
+
+impl Drop for PreparedRecord<'_> {
+    fn drop(&mut self) {
+        if self.permit.kind == RecordLaneKind::Small {
+            if let Some(bytes) = self.bytes.take() {
+                self.shared.recycle(bytes);
+            }
+        }
+    }
 }
 
 /// Deterministic worker-shutdown probe for lifecycle regression tests.
@@ -174,14 +405,14 @@ impl JournalShutdownBarrier {
 }
 
 impl Shared {
-    fn sticky_err(&self) -> Option<&'static str> {
+    fn sticky_err(&self) -> Option<JournalFailure> {
         *self.err.lock().unwrap()
     }
 
-    fn set_err(&self, msg: &'static str) {
+    fn set_err(&self, failure: JournalFailure) {
         let mut slot = self.err.lock().unwrap();
         if slot.is_none() {
-            *slot = Some(msg);
+            *slot = Some(failure);
         }
         drop(slot);
         // Wake any sync waiters so they observe the error.
@@ -199,7 +430,10 @@ impl Shared {
         // which (addr-before-records publish ordering) is >= end(rc), so the
         // copy drains >= rc records and `base + rc` is a safe lower bound.
         let rc = self.ring.committed_records();
-        let written_to = self.record_base + rc;
+        let written_to = self
+            .record_base
+            .saturating_add(rc)
+            .saturating_add(self.oversized_records.load(Ordering::Acquire));
 
         let mut sink_err: Option<&'static str> = None;
         let mut freed_space = false;
@@ -212,7 +446,10 @@ impl Shared {
             });
             if let Some(msg) = sink_err {
                 drop(w);
-                self.set_err(msg);
+                self.set_err(JournalFailure {
+                    phase: CommitPhase::WalAppend,
+                    context: msg,
+                });
                 return;
             }
             if copied > 0 {
@@ -226,7 +463,10 @@ impl Shared {
             if want_sync {
                 if w.flush().is_err() {
                     drop(w);
-                    self.set_err("journal flusher fsync failed");
+                    self.set_err(JournalFailure {
+                        phase: CommitPhase::WalSync,
+                        context: "journal flusher fsync failed",
+                    });
                     return;
                 }
                 self.syncs.fetch_add(1, Ordering::Relaxed);
@@ -249,14 +489,31 @@ impl Shared {
     /// (built-in backpressure). Parks on `space_cv` instead of spinning;
     /// rare in practice (the ring is sized to absorb bursts between
     /// checkpoints), but bounds RAM and CPU under sustained overload.
-    fn wait_for_ring_space(&self, ticket: &ReserveTicket) -> Result<()> {
-        let _ = self.control_tx.send(Control::Flush);
+    fn wait_for_ring_space(
+        &self,
+        ticket: &ReserveTicket,
+    ) -> std::result::Result<(), JournalFailure> {
+        if self.control_tx.send(Control::Flush).is_err() {
+            let failure = JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "journal flusher stopped during WAL ring backpressure",
+            };
+            self.set_err(failure);
+            return Err(failure);
+        }
         let mut guard = self.space_mx.lock().unwrap();
         while !self.ring.reserve_space_ready(ticket) {
-            if let Some(m) = self.sticky_err() {
-                return Err(Error::Internal(m));
+            if let Some(failure) = self.sticky_err() {
+                return Err(failure);
             }
-            let _ = self.control_tx.send(Control::Flush);
+            if self.control_tx.send(Control::Flush).is_err() {
+                let failure = JournalFailure {
+                    phase: CommitPhase::WalAppend,
+                    context: "journal flusher stopped during WAL ring backpressure",
+                };
+                self.set_err(failure);
+                return Err(failure);
+            }
             let (next, _timeout) = self
                 .space_cv
                 .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
@@ -268,41 +525,73 @@ impl Shared {
 
     /// Block until `flushed >= target` (or a flusher error). Used by sync
     /// appends (`JournalAck::wait`) and `flush_up_to`.
-    fn flush_to(&self, target: u64) -> Result<()> {
+    fn flush_to(&self, target: u64) -> std::result::Result<(), JournalFailure> {
         if target <= self.flushed.load(Ordering::Acquire) {
             return match self.sticky_err() {
-                Some(m) => Err(Error::Internal(m)),
+                Some(failure) => Err(failure),
                 None => Ok(()),
             };
         }
         self.sync_target.fetch_max(target, Ordering::AcqRel);
-        // Wake the flusher; the Flush is advisory (the loop recomputes the
-        // sync target), so a full channel / closed receiver is non-fatal.
-        let _ = self.control_tx.send(Control::Flush);
+        // Wake the flusher. A disconnected receiver is an acknowledgement
+        // failure, not an advisory miss: no worker remains to advance the
+        // requested append/fsync boundary.
+        if self.control_tx.send(Control::Flush).is_err() {
+            let failure = self.stopped_before_target(target);
+            self.set_err(failure);
+            return Err(failure);
+        }
         let mut guard = self.flushed_mx.lock().unwrap();
         loop {
-            if let Some(m) = self.sticky_err() {
-                return Err(Error::Internal(m));
+            if let Some(failure) = self.sticky_err() {
+                return Err(failure);
             }
             if self.flushed.load(Ordering::Acquire) >= target {
                 return Ok(());
             }
-            guard = self.flushed_cv.wait(guard).unwrap();
+            let (next, timeout) = self
+                .flushed_cv
+                .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
+                .unwrap();
+            guard = next;
+            if timeout.timed_out() && self.control_tx.send(Control::Flush).is_err() {
+                drop(guard);
+                let failure = self.stopped_before_target(target);
+                self.set_err(failure);
+                return Err(failure);
+            }
         }
     }
 
-    fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
+    fn stopped_before_target(&self, target: u64) -> JournalFailure {
+        if target <= self.written.load(Ordering::Acquire) {
+            JournalFailure {
+                phase: CommitPhase::WalSync,
+                context: "journal flusher stopped before WAL sync acknowledgement",
+            }
+        } else {
+            JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "journal flusher stopped before WAL append acknowledgement",
+            }
+        }
+    }
+
+    fn record_buffer(&self, min_capacity: usize) -> Result<Vec<u8>> {
         if min_capacity <= RECORD_BUFFER_RETAIN_MAX {
             if let Ok(mut pool) = self.record_pool.try_lock() {
                 while let Some(mut buf) = pool.pop() {
                     if buf.capacity() >= min_capacity {
                         buf.clear();
-                        return buf;
+                        return Ok(buf);
                     }
                 }
             }
         }
-        Vec::with_capacity(min_capacity)
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(min_capacity)
+            .map_err(|_| Error::Internal("journal record buffer allocation failed"))?;
+        Ok(buf)
     }
 
     fn recycle(&self, mut buf: Vec<u8>) {
@@ -326,8 +615,43 @@ impl Shared {
             return;
         }
         if self.writer.lock().unwrap().drain_to_os().is_err() {
-            self.set_err("journal flusher final drain failed");
+            self.set_err(JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "journal flusher final drain failed",
+            });
         }
+    }
+
+    /// Append one record outside the fixed ring. The caller owns the
+    /// oversized lane exclusively, so every preceding small publisher has
+    /// completed and no later small record can enter until this returns.
+    fn append_oversized(
+        &self,
+        record: &[u8],
+        target: u64,
+    ) -> std::result::Result<(), JournalFailure> {
+        if let Some(failure) = self.sticky_err() {
+            return Err(failure);
+        }
+
+        // A prior ring drain can leave a sub-threshold prefix in WalWriter's
+        // private buffer. Hand it to the OS before attempting the large
+        // record, otherwise a failure on the latter could strand an already
+        // acknowledged earlier prefix behind it.
+        let result = self.writer.lock().unwrap().append_encoded_direct(record);
+        if result.is_err() {
+            let failure = JournalFailure {
+                phase: CommitPhase::WalAppend,
+                context: "journal oversized append failed",
+            };
+            self.set_err(failure);
+            return Err(failure);
+        }
+
+        self.oversized_records.fetch_add(1, Ordering::AcqRel);
+        self.written.fetch_max(target, Ordering::AcqRel);
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -346,7 +670,21 @@ pub(crate) struct JournalAck {
 
 impl JournalAck {
     pub(crate) fn wait(self) -> Result<()> {
-        self.shared.flush_to(self.target)
+        self.shared.flush_to(self.target).map_err(|failure| {
+            // A sync failure proves only the prefix reported by `written`
+            // reached the writer. A concurrently published successor beyond
+            // that prefix failed before its own append boundary.
+            if failure.phase == CommitPhase::WalSync
+                && self.target > self.shared.written.load(Ordering::Acquire)
+            {
+                Error::CommitOutcomeUnknown {
+                    phase: CommitPhase::WalAppend,
+                    context: "journal stopped before this WAL record was appended",
+                }
+            } else {
+                failure.unknown()
+            }
+        })
     }
 }
 
@@ -367,6 +705,17 @@ impl Journal {
         Self::from_writer(writer, None)
     }
 
+    #[cfg(test)]
+    fn open_or_create_with_limits(
+        path: &std::path::Path,
+        tree_id: u64,
+        ring_capacity: usize,
+        max_record_bytes: usize,
+    ) -> Result<Self> {
+        let writer = WalWriter::open_or_create(path, tree_id)?;
+        Self::from_writer_with_limits(writer, None, ring_capacity, max_record_bytes)
+    }
+
     /// Open a descriptor-backed WAL whose worker keeps `resource_guard` live.
     ///
     /// The guard is deliberately type-erased: the journal may retain the
@@ -385,6 +734,25 @@ impl Journal {
         writer: WalWriter,
         resource_guard: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Self> {
+        Self::from_writer_with_limits(
+            writer,
+            resource_guard,
+            RING_CAPACITY_BYTES,
+            MAX_ATOMIC_WAL_RECORD_BYTES,
+        )
+    }
+
+    fn from_writer_with_limits(
+        writer: WalWriter,
+        resource_guard: Option<Arc<dyn Send + Sync>>,
+        ring_capacity: usize,
+        max_record_bytes: usize,
+    ) -> Result<Self> {
+        if max_record_bytes < ring_capacity {
+            return Err(Error::Internal(
+                "journal record ceiling is smaller than ring capacity",
+            ));
+        }
         let record_base = u64::from(writer.has_records());
         // Mirror legacy reopen seeding: a reopened non-empty WAL is queued
         // and unflushed, so the first checkpoint flushes before making
@@ -393,7 +761,8 @@ impl Journal {
 
         let (control_tx, control_rx) = unbounded::<Control>();
         let shared = Arc::new(Shared {
-            ring: WalRing::with_capacity(RING_CAPACITY_BYTES),
+            ring: WalRing::with_capacity(ring_capacity),
+            record_lane: RecordLane::default(),
             writer: Mutex::new(writer),
             record_base,
             queued: AtomicU64::new(record_base),
@@ -401,6 +770,8 @@ impl Journal {
             flushed: AtomicU64::new(initial_flushed),
             checkpointed: AtomicU64::new(0),
             sync_target: AtomicU64::new(0),
+            oversized_records: AtomicU64::new(0),
+            max_record_bytes: AtomicUsize::new(max_record_bytes),
             appends: AtomicU64::new(0),
             batches: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
@@ -429,34 +800,135 @@ impl Journal {
         })
     }
 
-    /// Submit one fully encoded WAL record. The caller passes an owned buffer
-    /// (recycled here after the ring copies it). Sync appends return an ack.
-    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
-        if let Some(m) = self.shared.sticky_err() {
-            return Err(Error::Internal(m));
+    /// Admit one record before any tree mutation and allocate its encoding
+    /// buffer only after lane backpressure succeeds.
+    pub(crate) fn prepare_record(&self, admitted_upper_bound: usize) -> Result<PreparedRecord<'_>> {
+        if admitted_upper_bound == 0 {
+            return Err(Error::Internal(
+                "journal record admission requires a non-zero upper bound",
+            ));
         }
-        if bytes.is_empty() {
-            return Err(Error::Internal("journal record must not be empty"));
+        let max_bytes = self.shared.max_record_bytes.load(Ordering::Acquire);
+        if admitted_upper_bound > max_bytes {
+            return Err(Error::AtomicRecordTooLarge {
+                encoded_bytes: admitted_upper_bound,
+                max_bytes,
+            });
         }
-        if bytes.len() as u64 > self.shared.ring.capacity() {
-            return Err(Error::Internal("journal record exceeds WAL ring capacity"));
+        if let Some(failure) = self.shared.sticky_err() {
+            return Err(Error::Internal(failure.context));
         }
-        // Reserve → backpressure wait → memcpy → publish. Backpressure parks on
-        // the flusher advancing `flush_cursor`, so a full ring does not spin.
-        let ticket = self.shared.ring.reserve(bytes.len() as u64);
-        if !self.shared.ring.reserve_space_ready(&ticket) {
-            self.shared.wait_for_ring_space(&ticket)?;
-        }
-        self.shared.ring.fill(&ticket, &bytes);
-        self.shared.ring.publish(&ticket);
-        self.shared.recycle(bytes);
 
-        let n = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
+        let permit = if admitted_upper_bound as u64 <= self.shared.ring.capacity() {
+            self.shared.record_lane.enter_small()
+        } else {
+            self.shared.record_lane.enter_oversized()
+        };
+        // A failure may race admission while this caller waits behind an
+        // oversized writer. It is still a definite rejection: no caller is
+        // allowed to mutate until this method returns a PreparedRecord.
+        if let Some(failure) = self.shared.sticky_err() {
+            drop(permit);
+            return Err(Error::Internal(failure.context));
+        }
+
+        let bytes = self.shared.record_buffer(admitted_upper_bound)?;
+        Ok(PreparedRecord {
+            shared: &self.shared,
+            bytes: Some(bytes),
+            admitted_upper_bound,
+            permit,
+        })
+    }
+
+    /// Submit one record whose size and lane were admitted before mutation.
+    /// Sync appends return an ack whose wait is the fsync boundary.
+    pub(crate) fn submit(
+        &self,
+        mut record: PreparedRecord<'_>,
+        sync: bool,
+    ) -> Result<Option<JournalAck>> {
+        let append_unknown = |context| Error::CommitOutcomeUnknown {
+            phase: CommitPhase::WalAppend,
+            context,
+        };
+        if !std::ptr::eq(record.shared, self.shared.as_ref()) {
+            return Err(append_unknown(
+                "prepared WAL record belongs to another journal",
+            ));
+        }
+        if let Some(failure) = self.shared.sticky_err() {
+            return Err(append_unknown(failure.context));
+        }
+        let actual_len = record.len();
+        if actual_len == 0 {
+            return Err(append_unknown("journal record must not be empty"));
+        }
+        if actual_len > record.admitted_upper_bound {
+            return Err(append_unknown(
+                "encoded WAL record exceeded its admitted upper bound",
+            ));
+        }
+
+        let n = match record.lane_kind() {
+            RecordLaneKind::Small => {
+                debug_assert!(actual_len as u64 <= self.shared.ring.capacity());
+                // Reserve → backpressure wait → memcpy → publish.
+                // The flusher's cursor provides bounded ring backpressure.
+                let ticket = self.shared.ring.reserve(actual_len as u64);
+                if !self.shared.ring.reserve_space_ready(&ticket) {
+                    self.shared
+                        .wait_for_ring_space(&ticket)
+                        .map_err(|failure| append_unknown(failure.context))?;
+                }
+                self.shared.ring.fill(&ticket, &record);
+                self.shared.ring.publish(&ticket);
+                let bytes = record.take_bytes();
+                self.shared.recycle(bytes);
+                self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1
+            }
+            RecordLaneKind::Oversized => {
+                let bytes = record.take_bytes();
+                let target = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
+                let (ack, rx) = crossbeam_channel::bounded(1);
+                if self
+                    .shared
+                    .control_tx
+                    .send(Control::AppendOversized {
+                        record: bytes,
+                        target,
+                        ack,
+                    })
+                    .is_err()
+                {
+                    let failure = JournalFailure {
+                        phase: CommitPhase::WalAppend,
+                        context: "journal flusher stopped before oversized append",
+                    };
+                    self.shared.set_err(failure);
+                    return Err(failure.unknown());
+                }
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => return Err(append_unknown(failure.context)),
+                    Err(_) => {
+                        let failure = JournalFailure {
+                            phase: CommitPhase::WalAppend,
+                            context: "journal flusher dropped oversized append acknowledgement",
+                        };
+                        self.shared.set_err(failure);
+                        return Err(failure.unknown());
+                    }
+                }
+                target
+            }
+        };
+
         self.shared.appends.fetch_add(1, Ordering::Relaxed);
-        // No per-op flusher wake: the flusher's FLUSH_POLL drains async
-        // records within the poll window (the async RAM→page-cache budget).
-        // Sync appends + checkpoint barriers wake it explicitly via flush_to.
-
+        // Small async records retain the existing fast acknowledgement: the
+        // flusher polls promptly, but submit does not wait for page-cache I/O.
+        // Oversized records wait above because their bounded Vec and exclusive
+        // ordering permit cannot be released before the direct append.
         if sync {
             Ok(Some(JournalAck {
                 shared: Arc::clone(&self.shared),
@@ -467,16 +939,44 @@ impl Journal {
         }
     }
 
-    pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
-        self.shared.record_buffer(min_capacity)
-    }
-
     pub(crate) fn queued_work(&self) -> u64 {
         self.shared.queued.load(Ordering::Acquire)
     }
 
     pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
-        self.shared.flush_to(observed)
+        self.shared
+            .flush_to(observed)
+            .map_err(|failure| Error::Internal(failure.context))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_record_bytes_for_test(&self, max_record_bytes: usize) {
+        self.shared
+            .max_record_bytes
+            .store(max_record_bytes, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_for_test(&self) {
+        self.shared.writer.lock().unwrap().fail_next_append();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync_for_test(&self) {
+        self.shared.writer.lock().unwrap().fail_next_sync();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_worker_for_test(&self) {
+        self.shared.control_tx.send(Control::Stop).unwrap();
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            handle.join().unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn oversized_waiting_for_test(&self) -> bool {
+        self.shared.record_lane.oversized_waiting()
     }
 
     pub(crate) fn truncate(&self) -> Result<()> {
@@ -576,6 +1076,19 @@ fn run_flusher(
                 let result = do_truncate(&shared);
                 let _ = ack.send(result);
             }
+            Ok(Control::AppendOversized {
+                record,
+                target,
+                ack,
+            }) => {
+                // The exclusive record-lane permit proves every preceding
+                // small publisher has finished and blocks every successor.
+                // Re-drain because some of that prefix may have published
+                // after the loop's first drain but before this control recv.
+                shared.drain_and_maybe_sync();
+                let result = shared.append_oversized(&record, target);
+                let _ = ack.send(result);
+            }
             Ok(Control::Stop) => {
                 shared.drain_and_maybe_sync();
                 shared.drain_writer_to_os();
@@ -591,8 +1104,8 @@ fn run_flusher(
 }
 
 fn do_truncate(shared: &Shared) -> Result<()> {
-    if let Some(m) = shared.sticky_err() {
-        return Err(Error::Internal(m));
+    if let Some(failure) = shared.sticky_err() {
+        return Err(Error::Internal(failure.context));
     }
     let mut w = shared.writer.lock().unwrap();
     w.truncate()?;
@@ -607,7 +1120,16 @@ fn do_truncate(shared: &Shared) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::codec::FILE_HEADER_SIZE;
+    use crate::journal::codec::{encode_insert_record, FILE_HEADER_SIZE};
+    use crate::journal::reader;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn prepared<'a>(journal: &'a Journal, bytes: &[u8]) -> PreparedRecord<'a> {
+        let mut record = journal.prepare_record(bytes.len()).unwrap();
+        record.extend_from_slice(bytes);
+        record
+    }
 
     // The 6 legacy contract tests, retargeted at the ring-backed Journal.
 
@@ -632,7 +1154,9 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        journal.submit(vec![1, 2, 3, 4], false).unwrap();
+        journal
+            .submit(prepared(&journal, &[1, 2, 3, 4]), false)
+            .unwrap();
         assert!(journal.needs_checkpoint());
         journal.flush_up_to(journal.queued_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
@@ -656,7 +1180,7 @@ mod tests {
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
         let ack = journal
-            .submit(vec![5, 6, 7, 8], true)
+            .submit(prepared(&journal, &[5, 6, 7, 8]), true)
             .unwrap()
             .expect("durable append returns an ack");
         ack.wait().unwrap();
@@ -677,7 +1201,9 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        let ack = journal.submit(vec![1, 3, 5, 7], false).unwrap();
+        let ack = journal
+            .submit(prepared(&journal, &[1, 3, 5, 7]), false)
+            .unwrap();
         assert!(ack.is_none());
 
         journal.flush_up_to(journal.queued_work()).unwrap();
@@ -693,12 +1219,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
-        assert!(journal.submit(Vec::new(), false).is_err());
-        assert!(journal
-            .submit(vec![0; RING_CAPACITY_BYTES + 1], false)
-            .is_err());
+        let empty = journal.prepare_record(1).unwrap();
+        assert!(matches!(
+            journal.submit(empty, false),
+            Err(Error::CommitOutcomeUnknown {
+                phase: CommitPhase::WalAppend,
+                ..
+            })
+        ));
+        assert!(matches!(
+            journal.prepare_record(MAX_ATOMIC_WAL_RECORD_BYTES + 1),
+            Err(Error::AtomicRecordTooLarge { .. })
+        ));
+        let mut encoder_drift = journal.prepare_record(4).unwrap();
+        encoder_drift.extend_from_slice(&[0; 5]);
+        assert!(matches!(
+            journal.submit(encoder_drift, false),
+            Err(Error::CommitOutcomeUnknown {
+                phase: CommitPhase::WalAppend,
+                ..
+            })
+        ));
 
-        journal.submit(vec![1, 2, 3, 4], false).unwrap();
+        journal
+            .submit(prepared(&journal, &[1, 2, 3, 4]), false)
+            .unwrap();
         journal.flush_up_to(journal.queued_work()).unwrap();
         assert_eq!(journal.stats().appends, 1);
     }
@@ -708,7 +1253,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
-        let mut record = journal.record_buffer(64);
+        let mut record = journal.prepare_record(64).unwrap();
         let capacity = record.capacity();
         assert!(capacity >= 64);
         record.extend_from_slice(&[1; 32]);
@@ -716,7 +1261,7 @@ mod tests {
         journal.submit(record, false).unwrap();
         journal.flush_up_to(journal.queued_work()).unwrap();
 
-        let reused = journal.record_buffer(16);
+        let reused = journal.prepare_record(16).unwrap();
         assert!(reused.capacity() >= capacity);
     }
 
@@ -726,7 +1271,9 @@ mod tests {
         let path = dir.path().join("journal.wal");
         {
             let journal = Journal::open_or_create(&path, 0).unwrap();
-            journal.submit(vec![9, 8, 7, 6], false).unwrap();
+            journal
+                .submit(prepared(&journal, &[9, 8, 7, 6]), false)
+                .unwrap();
             journal.flush_up_to(journal.queued_work()).unwrap();
             assert!(journal.needs_checkpoint());
         }
@@ -738,5 +1285,220 @@ mod tests {
         assert!(!journal.needs_flush());
         journal.truncate().unwrap();
         assert!(!journal.needs_checkpoint());
+    }
+
+    #[test]
+    fn oversized_direct_append_failure_is_unknown_and_replays_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = Journal::open_or_create_with_limits(&path, 0, 256, 4 * 1024).unwrap();
+            let mut bytes = Vec::new();
+            encode_insert_record(&mut bytes, 1, 0, b"large", &[0xA5; 512]);
+            assert!(bytes.len() > journal.shared.ring.capacity() as usize);
+
+            journal.fail_next_append_for_test();
+            let Err(error) = journal.submit(prepared(&journal, &bytes), false) else {
+                panic!("injected oversized append unexpectedly succeeded");
+            };
+            assert!(matches!(
+                error,
+                Error::CommitOutcomeUnknown {
+                    phase: CommitPhase::WalAppend,
+                    ..
+                }
+            ));
+            let stats = journal.stats();
+            assert_eq!(stats.queued_work, 1);
+            assert_eq!(stats.written_work, 0);
+            assert_eq!(stats.appends, 0);
+        }
+
+        let mut seqs = Vec::new();
+        reader::replay(&path, |_, seq, _| {
+            seqs.push(seq);
+            Ok(())
+        })
+        .unwrap();
+        assert!(seqs.is_empty());
+    }
+
+    #[test]
+    fn dropped_sync_ack_after_append_reports_wal_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = Journal::open_or_create(&path, 0).unwrap();
+        let mut bytes = Vec::new();
+        encode_insert_record(&mut bytes, 1, 0, b"key", b"value");
+        let ack = journal
+            .submit(prepared(&journal, &bytes), true)
+            .unwrap()
+            .expect("sync append returns an acknowledgement");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while journal.stats().written_work == 0 {
+            assert!(Instant::now() < deadline, "record never reached WAL writer");
+            thread::yield_now();
+        }
+        assert_eq!(journal.stats().flushed_work, 0);
+        journal.stop_worker_for_test();
+
+        assert!(matches!(
+            ack.wait(),
+            Err(Error::CommitOutcomeUnknown {
+                phase: CommitPhase::WalSync,
+                ..
+            })
+        ));
+        let mut seqs = Vec::new();
+        reader::replay(&path, |_, seq, _| {
+            seqs.push(seq);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seqs, vec![1]);
+    }
+
+    #[test]
+    fn oversized_waiter_has_priority_over_later_small_admissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open_or_create_with_limits(&dir.path().join("journal.wal"), 0, 256, 4 * 1024)
+                .unwrap(),
+        );
+
+        let first_small = journal.prepare_record(32).unwrap();
+        let oversized_journal = Arc::clone(&journal);
+        let (oversized_acquired_tx, oversized_acquired_rx) = mpsc::channel();
+        let (release_oversized_tx, release_oversized_rx) = mpsc::channel();
+        let oversized = thread::spawn(move || {
+            let record = oversized_journal.prepare_record(512).unwrap();
+            oversized_acquired_tx.send(()).unwrap();
+            release_oversized_rx.recv().unwrap();
+            drop(record);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !journal.oversized_waiting_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "oversized admission never waited"
+            );
+            thread::yield_now();
+        }
+
+        let later_small_journal = Arc::clone(&journal);
+        let (small_started_tx, small_started_rx) = mpsc::channel();
+        let (small_acquired_tx, small_acquired_rx) = mpsc::channel();
+        let later_small = thread::spawn(move || {
+            small_started_tx.send(()).unwrap();
+            let record = later_small_journal.prepare_record(32).unwrap();
+            small_acquired_tx.send(()).unwrap();
+            drop(record);
+        });
+        small_started_rx.recv().unwrap();
+        assert!(oversized_acquired_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        assert!(small_acquired_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        drop(first_small);
+        oversized_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(small_acquired_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        release_oversized_tx.send(()).unwrap();
+        oversized.join().unwrap();
+        small_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        later_small.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_lane_preserves_small_large_small_order_and_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal =
+            Arc::new(Journal::open_or_create_with_limits(&path, 0, 256, 4 * 1024).unwrap());
+
+        let mut first_bytes = Vec::new();
+        encode_insert_record(&mut first_bytes, 1, 0, b"first", b"small");
+        journal
+            .submit(prepared(&journal, &first_bytes), false)
+            .unwrap();
+
+        let mut large_bytes = Vec::new();
+        encode_insert_record(&mut large_bytes, 2, 0, b"large", &[0xA5; 512]);
+        assert!(large_bytes.len() > journal.shared.ring.capacity() as usize);
+        let mut large = journal.prepare_record(large_bytes.len()).unwrap();
+        large.extend_from_slice(&large_bytes);
+
+        let later_journal = Arc::clone(&journal);
+        let (later_started_tx, later_started_rx) = mpsc::channel();
+        let (later_done_tx, later_done_rx) = mpsc::channel();
+        let later = thread::spawn(move || {
+            later_started_tx.send(()).unwrap();
+            let mut bytes = Vec::new();
+            encode_insert_record(&mut bytes, 3, 0, b"later", b"small");
+            let result = later_journal.submit(prepared(&later_journal, &bytes), false);
+            later_done_tx.send(result.map(|_| ())).unwrap();
+        });
+        later_started_rx.recv().unwrap();
+        assert!(later_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        journal.submit(large, false).unwrap();
+        let after_async_large = journal.stats();
+        assert!(after_async_large.written_work >= 2);
+        assert_eq!(after_async_large.flushed_work, 0);
+        assert_eq!(after_async_large.syncs, 0);
+        later_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        later.join().unwrap();
+
+        journal.flush_up_to(journal.queued_work()).unwrap();
+        let stats = journal.stats();
+        assert_eq!(stats.queued_work, 3);
+        assert_eq!(stats.written_work, 3);
+        assert_eq!(stats.flushed_work, 3);
+        assert_eq!(stats.checkpointed_work, 0);
+
+        let mut seqs = Vec::new();
+        reader::replay(&path, |_, seq, _| {
+            seqs.push(seq);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seqs, vec![1, 2, 3]);
+
+        journal.truncate().unwrap();
+        let truncated = journal.stats();
+        assert_eq!(truncated.queued_work, 3);
+        assert_eq!(truncated.written_work, 3);
+        assert_eq!(truncated.flushed_work, 3);
+        assert_eq!(truncated.checkpointed_work, 3);
+        assert!(!journal.needs_checkpoint());
+
+        let mut after_bytes = Vec::new();
+        encode_insert_record(&mut after_bytes, 4, 0, b"after", b"truncate");
+        journal
+            .submit(prepared(&journal, &after_bytes), false)
+            .unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
+        let after = journal.stats();
+        assert_eq!(after.queued_work, 4);
+        assert_eq!(after.written_work, 4);
+        assert_eq!(after.flushed_work, 4);
+        assert_eq!(after.checkpointed_work, 3);
+        assert!(journal.needs_checkpoint());
     }
 }

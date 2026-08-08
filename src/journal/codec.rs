@@ -43,6 +43,13 @@ pub const RECORD_HEADER_SIZE: usize = 4 + 4 + 8 + 1;
 /// Fixed-size footer bytes: `crc32`.
 pub const RECORD_FOOTER_SIZE: usize = 4;
 
+/// Native ceiling for one encoded atomic WAL record.
+///
+/// The WAL body length field could address more, but Holt deliberately caps a
+/// single commit at 256 MiB so the on-demand oversized-record lane has a hard
+/// memory bound. The ordinary journal ring remains much smaller.
+pub const MAX_ATOMIC_WAL_RECORD_BYTES: usize = 256 * 1024 * 1024;
+
 // ---------- File header ----------
 
 /// Top-of-file magic — `"WALA"` little-endian. Sits at offset 0 of

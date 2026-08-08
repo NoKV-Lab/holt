@@ -158,7 +158,7 @@ pub use api::builder::TreeBuilder;
 pub use api::checkpoint::CheckpointImage;
 pub use api::config::{Durability, Storage, TreeConfig};
 pub use api::db::{DBAtomicBatch, DBView, DB};
-pub use api::errors::{Error, Result};
+pub use api::errors::{CommitPhase, Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::snapshot::Snapshot;
 pub use api::tree::{PutOutcome, Tree};

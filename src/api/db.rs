@@ -21,7 +21,7 @@ use super::tree::{ensure_durable_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
-use crate::journal::codec::BatchEncoder;
+use crate::journal::codec::{BatchEncoder, MAX_ATOMIC_WAL_RECORD_BYTES};
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::{BlobStore, FileBlobStore, FileStoreObjectIdentity};
@@ -158,6 +158,22 @@ impl std::fmt::Debug for DB {
 }
 
 impl DB {
+    /// Maximum encoded bytes Holt admits as one native atomic WAL record.
+    ///
+    /// Admission uses a proven upper bound before any tree mutation. Records
+    /// above the ordinary journal ring use an on-demand, strictly ordered lane;
+    /// Holt never splits one logical atomic batch across WAL records.
+    pub const MAX_ATOMIC_RECORD_BYTES: usize = MAX_ATOMIC_WAL_RECORD_BYTES;
+
+    /// Return Holt's native single-record atomic commit ceiling.
+    ///
+    /// Providers can publish this value during offer/admission negotiation
+    /// without opening a store. The same ceiling is enforced by the journal.
+    #[must_use]
+    pub const fn native_atomic_record_ceiling() -> usize {
+        Self::MAX_ATOMIC_RECORD_BYTES
+    }
+
     /// Return the kernel-object identity of this DB's held file store.
     ///
     /// File-backed databases return the `(device, inode)` pairs for the
@@ -428,6 +444,12 @@ impl DB {
     /// validates all guards for every touched tree before applying
     /// any mutation; if a guard fails, the method returns `Ok(false)`
     /// and emits no WAL record.
+    ///
+    /// File-backed DBs also admit a proven encoded-record upper bound before
+    /// mutation. Oversized batches return [`Error::AtomicRecordTooLarge`]. If
+    /// append or requested sync fails after mutation, Holt returns
+    /// [`Error::CommitOutcomeUnknown`]; callers must reconcile rather than
+    /// blindly submit the logical operation again.
     pub fn atomic<F>(&self, build: F) -> Result<bool>
     where
         F: FnOnce(&mut DBAtomicBatch),
@@ -1120,9 +1142,9 @@ impl DB {
         base_seq: u64,
         journal: &Arc<Journal>,
     ) -> Result<()> {
+        let mut record = journal.prepare_record(encoded_db_batch_record_len(groups))?;
         let ack = {
             let _commit = self.commit_gate.enter_writer();
-            let mut record = journal.record_buffer(encoded_db_batch_record_len(groups));
             let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
             let mut group_base = base_seq;
             for group in groups {
@@ -1353,21 +1375,30 @@ fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
     let mut len = crate::journal::codec::RECORD_HEADER_SIZE + 8 + 4;
     for group in groups {
         for op in &group.ops {
-            len += match op {
+            let op_len = match op {
                 BatchOp::Put { key, value }
                 | BatchOp::PutIfAbsent { key, value }
-                | BatchOp::CompareAndPut { key, value, .. } => {
-                    1 + 8 + 4 + key.len() + 4 + value.len()
-                }
+                | BatchOp::CompareAndPut { key, value, .. } => (1usize + 8 + 4)
+                    .saturating_add(key.len())
+                    .saturating_add(4)
+                    .saturating_add(value.len()),
                 BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
-                    1 + 8 + 4 + key.len()
+                    (1usize + 8 + 4).saturating_add(key.len())
                 }
-                BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
+                BatchOp::Rename { src, dst, .. } => (1usize + 8 + 4)
+                    .saturating_add(src.len())
+                    .saturating_add(4)
+                    .saturating_add(dst.len())
+                    .saturating_add(1),
                 BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
             };
+            // Insert run encodings only remove repeated framing/prefix bytes,
+            // so the per-op shape above is a proven upper bound for the final
+            // compact Batch record without running the walker twice.
+            len = len.saturating_add(op_len);
         }
     }
-    len + crate::journal::codec::RECORD_FOOTER_SIZE
+    len.saturating_add(crate::journal::codec::RECORD_FOOTER_SIZE)
 }
 
 fn count_wal_ops(groups: &[DBBatchGroup]) -> u64 {
@@ -1468,12 +1499,173 @@ mod tests {
     use super::*;
     use crate::journal::group_commit::JournalShutdownBarrier;
     use crate::store::blob_store::{AlignedBlobBuf, FileBlobStore, MemoryBlobStore};
+    use crate::CommitPhase;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    fn sync_wal_cfg(path: &std::path::Path) -> TreeConfig {
+        let mut cfg = TreeConfig::new(path);
+        cfg.durability = crate::Durability::Wal { sync: true };
+        cfg.checkpoint.enabled = false;
+        cfg.buffer_pool_size = 16;
+        cfg
+    }
+
+    #[test]
+    fn native_atomic_record_ceiling_covers_nokv_legal_envelope() {
+        // Frozen integration envelope, intentionally copied as a number so
+        // Holt's provider capability test does not depend on the NoKV crate.
+        const NOKV_MAX_ENCODED_COMMAND_BYTES: usize = 148_317_344;
+
+        assert_eq!(DB::native_atomic_record_ceiling(), 256 * 1024 * 1024);
+        assert_eq!(
+            DB::MAX_ATOMIC_RECORD_BYTES,
+            DB::native_atomic_record_ceiling()
+        );
+        const {
+            assert!(NOKV_MAX_ENCODED_COMMAND_BYTES < DB::MAX_ATOMIC_RECORD_BYTES);
+        }
+    }
+
+    #[test]
+    fn atomic_record_admission_rejects_before_any_tree_mutation() {
+        let dir = tempdir().unwrap();
+        let cfg = sync_wal_cfg(dir.path());
+        {
+            let db = DB::open(cfg.clone()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            db.checkpoint().unwrap();
+            let journal = db.journal.as_ref().unwrap();
+            let appends_before = journal.stats().appends;
+            journal.set_max_record_bytes_for_test(32);
+
+            let error = db
+                .atomic(|batch| batch.put("objects", b"key", b"value"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::AtomicRecordTooLarge {
+                    encoded_bytes,
+                    max_bytes: 32,
+                } if encoded_bytes > 32
+            ));
+            assert!(tree.get(b"key").unwrap().is_none());
+            assert_eq!(journal.stats().appends, appends_before);
+            assert_eq!(db.store.dirty_count(), 0);
+        }
+
+        let reopened = DB::open(cfg).unwrap();
+        assert!(reopened
+            .open_tree("objects")
+            .unwrap()
+            .get(b"key")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn append_failure_after_mutation_is_unknown_and_reopen_keeps_old_state() {
+        let dir = tempdir().unwrap();
+        let cfg = sync_wal_cfg(dir.path());
+        {
+            let db = DB::open(cfg.clone()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            db.checkpoint().unwrap();
+            db.journal.as_ref().unwrap().fail_next_append_for_test();
+
+            let error = db
+                .atomic(|batch| batch.put("objects", b"uncertain", b"new"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::CommitOutcomeUnknown {
+                    phase: CommitPhase::WalAppend,
+                    ..
+                }
+            ));
+            assert_eq!(
+                tree.get(b"uncertain").unwrap().as_deref(),
+                Some(&b"new"[..])
+            );
+        }
+
+        let reopened = DB::open(cfg).unwrap();
+        let tree = reopened.open_tree("objects").unwrap();
+        assert!(tree.get(b"uncertain").unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_failure_after_append_is_unknown_and_reopen_replays_new_state() {
+        let dir = tempdir().unwrap();
+        let cfg = sync_wal_cfg(dir.path());
+        {
+            let db = DB::open(cfg.clone()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            db.checkpoint().unwrap();
+            db.journal.as_ref().unwrap().fail_next_sync_for_test();
+
+            let error = db
+                .atomic(|batch| batch.put("objects", b"uncertain", b"new"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::CommitOutcomeUnknown {
+                    phase: CommitPhase::WalSync,
+                    ..
+                }
+            ));
+            assert_eq!(
+                tree.get(b"uncertain").unwrap().as_deref(),
+                Some(&b"new"[..])
+            );
+        }
+
+        let reopened = DB::open(cfg).unwrap();
+        let tree = reopened.open_tree("objects").unwrap();
+        assert_eq!(
+            tree.get(b"uncertain").unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+
+    #[test]
+    fn acknowledgement_channel_failure_is_unknown_and_reopen_keeps_old_state() {
+        let dir = tempdir().unwrap();
+        let cfg = sync_wal_cfg(dir.path());
+        {
+            let db = DB::open(cfg.clone()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            db.checkpoint().unwrap();
+            db.journal.as_ref().unwrap().stop_worker_for_test();
+
+            let error = db
+                .atomic(|batch| batch.put("objects", b"uncertain", b"new"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::CommitOutcomeUnknown {
+                    phase: CommitPhase::WalAppend,
+                    ..
+                }
+            ));
+            assert_eq!(
+                tree.get(b"uncertain").unwrap().as_deref(),
+                Some(&b"new"[..])
+            );
+        }
+
+        let reopened = DB::open(cfg).unwrap();
+        assert!(reopened
+            .open_tree("objects")
+            .unwrap()
+            .get(b"uncertain")
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn final_db_drop_holds_store_lock_through_wal_worker_exit() {

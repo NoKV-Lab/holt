@@ -327,18 +327,25 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
     let mut i = 0usize;
     while i < ops.len() {
         if let Some(plan) = insert_run_plan(ops, i) {
-            len += plan.encoded_len(&ops[i..i + plan.len]);
+            len = len.saturating_add(plan.encoded_len(&ops[i..i + plan.len]));
             i += plan.len;
             continue;
         }
-        len += match &ops[i] {
-            BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => 1 + 8 + 4 + key.len(),
-            BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
+        let op_len = match &ops[i] {
+            BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
+                (1usize + 8 + 4).saturating_add(key.len())
+            }
+            BatchOp::Rename { src, dst, .. } => (1usize + 8 + 4)
+                .saturating_add(src.len())
+                .saturating_add(4)
+                .saturating_add(dst.len())
+                .saturating_add(1),
             BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
             BatchOp::Put { .. } | BatchOp::PutIfAbsent { .. } | BatchOp::CompareAndPut { .. } => {
                 unreachable!("insert-like ops handled above")
             }
         };
+        len = len.saturating_add(op_len);
         i += 1;
     }
     len
@@ -364,16 +371,24 @@ impl InsertRunPlan {
         match self.encoding {
             InsertRunEncoding::Fixed { key_len, value_len } => {
                 if self.len == 1 {
-                    1 + 8 + 4 + key_len + 4 + value_len
+                    (1usize + 8 + 4)
+                        .saturating_add(key_len)
+                        .saturating_add(4)
+                        .saturating_add(value_len)
                 } else {
-                    1 + 8 + 4 + 4 + 4 + self.len * (key_len + value_len)
+                    (1usize + 8 + 4 + 4 + 4)
+                        .saturating_add(self.len.saturating_mul(key_len.saturating_add(value_len)))
                 }
             }
             InsertRunEncoding::Prefix { prefix_len } => {
-                let mut len = 1 + 8 + 4 + 4 + prefix_len;
+                let mut len = (1usize + 8 + 4 + 4).saturating_add(prefix_len);
                 for op in ops {
                     let (key, value) = batch_insert_parts(op).expect("prefix run insert op");
-                    len += 4 + (key.len() - prefix_len) + 4 + value.len();
+                    len = len
+                        .saturating_add(4)
+                        .saturating_add(key.len() - prefix_len)
+                        .saturating_add(4)
+                        .saturating_add(value.len());
                 }
                 len
             }
@@ -451,8 +466,12 @@ fn insert_run_plan(ops: &[BatchOp], start: usize) -> Option<InsertRunPlan> {
     let individual_len = ops[start..start + prefix.len]
         .iter()
         .map(|op| batch_insert_parts(op).expect("prefix run insert op"))
-        .map(|(key, value)| 1 + 8 + 4 + key.len() + 4 + value.len())
-        .sum::<usize>();
+        .fold(0usize, |len, (key, value)| {
+            len.saturating_add(1 + 8 + 4)
+                .saturating_add(key.len())
+                .saturating_add(4)
+                .saturating_add(value.len())
+        });
     if prefix_plan.encoded_len(&ops[start..start + prefix.len]) < individual_len {
         Some(prefix_plan)
     } else {
@@ -944,10 +963,10 @@ impl Tree {
                 .journal
                 .as_ref()
                 .expect("can_stage_deferred_write requires journal");
-            let _commit = self.commit_gate.enter_writer();
             let mut record =
-                journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
+                journal.prepare_record(encoded_insert_record_len(key.len(), value.len()))?;
             encode_insert_record(&mut record, seq, self.tree_id, key, value);
+            let _commit = self.commit_gate.enter_writer();
             let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
             self.store.stage_write_delta_put(
                 self.tree_id,
@@ -972,6 +991,7 @@ impl Tree {
         value: &[u8],
         condition: engine::InsertCondition,
     ) -> Result<engine::InsertOutcome> {
+        Self::validate_insert_shape(key, value)?;
         let search = engine::SearchKey::user(key);
 
         let (outcome, journal_ack) = {
@@ -982,6 +1002,9 @@ impl Tree {
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
+                let mut record =
+                    journal.prepare_record(encoded_insert_record_len(key.len(), value.len()))?;
+                encode_insert_record(&mut record, seq, self.tree_id, key, value);
                 let _commit = self.commit_gate.enter_writer();
                 let outcome = engine::insert_multi_conditional(
                     &self.store,
@@ -997,9 +1020,6 @@ impl Tree {
                         self.store
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
-                    let mut record =
-                        journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
-                    encode_insert_record(&mut record, seq, self.tree_id, key, value);
                     let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
                     (outcome, ack)
                 } else {
@@ -1087,9 +1107,9 @@ impl Tree {
                 .journal
                 .as_ref()
                 .expect("can_stage_deferred_write requires journal");
-            let _commit = self.commit_gate.enter_writer();
-            let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
+            let mut record = journal.prepare_record(encoded_erase_record_len(key.len()))?;
             encode_erase_record(&mut record, seq, self.tree_id, key);
+            let _commit = self.commit_gate.enter_writer();
             let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
             self.store
                 .stage_write_delta_delete(self.tree_id, self.root_guid, key, seq);
@@ -1131,6 +1151,8 @@ impl Tree {
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
+                let mut record = journal.prepare_record(encoded_erase_record_len(key.len()))?;
+                encode_erase_record(&mut record, seq, self.tree_id, key);
                 let _commit = self.commit_gate.enter_writer();
                 let outcome = engine::erase_multi_conditional(
                     &self.store,
@@ -1148,8 +1170,6 @@ impl Tree {
                         self.store
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
-                    let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
-                    encode_erase_record(&mut record, seq, self.tree_id, key);
                     let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
                     (outcome, ack)
                 } else {
@@ -1242,12 +1262,16 @@ impl Tree {
             {
                 return Err(Error::DstExists);
             }
+            Self::validate_insert_shape(dst, &value)?;
 
             // W2D-strict protocol: walker + mark_dirty + journal
             // submission all happen under `commit_gate`. Sharing one
             // `seq` across both erase + insert phases keeps the rename
             // atomic from the dirty-tracking perspective.
             if let Some(journal) = &self.journal {
+                let mut record = journal
+                    .prepare_record(encoded_rename_object_record_len(src.len(), dst.len()))?;
+                encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
                 let _commit = self.commit_gate.enter_writer();
                 let erase_out = engine::erase_multi(
                     &self.store,
@@ -1268,9 +1292,6 @@ impl Tree {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
-                let mut record =
-                    journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
-                encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
                 journal.submit(record, self.cfg.durability.wal_sync())?
             } else {
                 let commit =
@@ -1335,7 +1356,9 @@ impl Tree {
     ///
     /// Returns `Ok(true)` when the batch committed, `Ok(false)` when
     /// a conditional guard failed, and `Err` for hard errors such as
-    /// a missing rename source or store/journal failure.
+    /// a missing rename source or a definite pre-mutation admission failure.
+    /// A WAL append/sync failure after mutation is reported as
+    /// [`Error::CommitOutcomeUnknown`] and must not be blindly retried.
     ///
     /// ## Example
     ///
@@ -1392,9 +1415,9 @@ impl Tree {
         // `mark_dirty` calls, plus the single envelope WAL submit, happen
         // under `commit_gate` — see `Tree::put_inner_conditional`.
         if let Some(journal) = &self.journal {
+            let mut record = journal.prepare_record(encoded_batch_record_len(pending))?;
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
-                let mut record = journal.record_buffer(encoded_batch_record_len(pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
                 self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
@@ -3234,6 +3257,7 @@ where
 mod tests {
     use crate::concurrency::CommitGate;
     use crate::engine::{RouteHit, SearchKey};
+    use crate::journal::codec::encoded_insert_record_len;
     use crate::journal::Journal;
     use crate::layout::BlobGuid;
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
@@ -3246,6 +3270,41 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn standalone_atomic_record_admission_precedes_tree_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        let tree = Tree::open(cfg).unwrap();
+        let journal = tree.journal.as_ref().unwrap();
+        let appends_before = journal.stats().appends;
+        journal.set_max_record_bytes_for_test(32);
+
+        let error = tree.put(b"one", b"value").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes: 32,
+            } if encoded_bytes == encoded_insert_record_len(3, 5)
+        ));
+        assert!(tree.get(b"one").unwrap().is_none());
+
+        let error = tree
+            .atomic(|batch| batch.put(b"key", b"value"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AtomicRecordTooLarge {
+                encoded_bytes,
+                max_bytes: 32,
+            } if encoded_bytes > 32
+        ));
+        assert!(tree.get(b"key").unwrap().is_none());
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(tree.store.dirty_count(), 0);
+    }
 
     #[test]
     fn standalone_reopens_exhausted_epoch_without_leaking_failed_snapshot_root() {
@@ -3975,7 +4034,9 @@ mod tests {
         let journal_dir = tempfile::tempdir().unwrap();
         let journal =
             Arc::new(Journal::open_or_create(&journal_dir.path().join("wal.log"), 0).unwrap());
-        journal.submit(vec![1, 2, 3, 4], false).unwrap();
+        let mut record = journal.prepare_record(4).unwrap();
+        record.extend_from_slice(&[1, 2, 3, 4]);
+        journal.submit(record, false).unwrap();
         assert!(journal.needs_checkpoint());
 
         let commit_gate = Arc::new(CommitGate::new());
