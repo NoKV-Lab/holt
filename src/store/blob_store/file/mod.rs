@@ -4167,17 +4167,28 @@ mod tests {
             "journal worker did not reach the deterministic pre-drain gate"
         );
 
-        let mut record = journal.prepare_record(32).unwrap();
-        record.resize(32, 0xA5);
+        // Use a real v4 frame so a pre-poison record that reaches the OS page
+        // cache can be replayed as an outcome-unknown commit after restart.
+        // The health boundary below must prevent fsync/ACK, not pretend bytes
+        // already published before poison can always be withdrawn.
+        let mut encoded = Vec::new();
+        crate::journal::codec::encode_insert_record(
+            &mut encoded,
+            1,
+            0,
+            b"pre-poison-key",
+            b"pre-poison-value",
+        );
+        let encoded_len = encoded.len();
+        let mut record = journal.prepare_record(encoded_len).unwrap();
+        record.extend_from_slice(&encoded);
         let ack = journal
             .submit(record, true)
             .unwrap()
             .expect("sync submit returns an acknowledgement");
         let target = journal.queued_work();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let waiter = std::thread::spawn(move || {
-            let _ = ack_tx.send(ack.wait());
-        });
+        let waiter = std::thread::spawn(move || ack_tx.send(ack.wait()).unwrap());
         let deadline = Instant::now() + Duration::from_secs(1);
         while journal.sync_target_for_test() < target {
             assert!(
@@ -4194,17 +4205,36 @@ mod tests {
         assert!(store.health.is_poisoned());
 
         barrier.release_before_drain();
+        let ack_result = ack_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("health-gated flusher did not wake the ack waiter");
         assert!(
-            ack_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("health-gated flusher did not wake the ack waiter")
-                .is_err(),
-            "an acknowledgement crossed the manifest poison boundary"
+            matches!(
+                ack_result,
+                Err(Error::CommitOutcomeUnknown {
+                    phase: crate::CommitPhase::WalSync,
+                    ..
+                })
+            ),
+            "a pre-poison publish must report unknown when poison blocks its fsync/ACK: {ack_result:?}"
         );
         waiter.join().unwrap();
 
+        let page_cache_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(
+            page_cache_len,
+            (crate::journal::codec::FILE_HEADER_SIZE + encoded_len) as u64,
+            "the pre-poison publish may drain to page cache to release ring backpressure"
+        );
+
         let queued = journal.queued_work();
-        assert!(journal.prepare_record(32).is_err());
+        let Err(rejection) = journal.prepare_record(encoded_len) else {
+            panic!("post-poison WAL admission unexpectedly succeeded");
+        };
+        assert!(
+            !matches!(rejection, Error::CommitOutcomeUnknown { .. }),
+            "post-poison admission is a definite pre-mutation rejection: {rejection:?}"
+        );
         assert_eq!(
             journal.queued_work(),
             queued,
@@ -4218,9 +4248,22 @@ mod tests {
         drop(journal);
         assert_eq!(
             std::fs::metadata(&wal_path).unwrap().len(),
-            crate::journal::codec::FILE_HEADER_SIZE as u64,
-            "poisoned Journal wrote or acknowledged the queued record"
+            page_cache_len,
+            "a definite post-poison rejection must not advance the WAL"
         );
+
+        // Page-cache append is not success evidence: the caller received an
+        // unknown outcome. If those complete bytes survive restart, WAL redo
+        // must expose the possible commit instead of silently discarding it.
+        let mut replayed = 0usize;
+        crate::journal::reader::replay(&wal_path, |op, seq, _| {
+            assert!(matches!(op, crate::journal::wal_op::WalOp::Insert { .. }));
+            assert_eq!(seq, 1);
+            replayed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, 1);
     }
 
     #[test]

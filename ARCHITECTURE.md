@@ -228,6 +228,15 @@ PCLMULQDQ on x86_64 + ARM-CRC32 on AArch64). The writer's pending
 buffer auto-drains to the OS page cache at 64 KB. `Journal::flush`
 and durable group-commit batches are the `sync_data` boundaries.
 
+For a file-backed store, journal publication and the sticky object-set health
+fence are separate boundaries. A record published before poison may still drain
+to the OS page cache so the bounded ring can make progress, but poison prevents
+its `sync_data` acknowledgement and the caller receives a typed unknown outcome.
+A post-poison admission is rejected before tree mutation and cannot advance the
+WAL. If a complete unacknowledged record survives restart, normal redo exposes
+that possible commit; object-set authority is validated before replay and an
+invalid authority set fails closed.
+
 WAL format v4 repeats the body length in `LEN2`. The redundant footer lets
 recovery distinguish a genuinely torn final write from a corrupted header
 length that would otherwise swallow later acknowledged records. The v4 rename
