@@ -105,6 +105,72 @@ struct Shared {
 
     control_tx: Sender<Control>,
     record_pool: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    shutdown_barrier: Mutex<Option<Arc<JournalShutdownBarrier>>>,
+}
+
+/// Deterministic worker-shutdown probe for lifecycle regression tests.
+///
+/// The first gate parks the worker immediately before its next drain. The
+/// second parks it after the final shutdown drain but before the worker-held
+/// resource guard is released. Channels provide bounded waits to the test
+/// thread, unlike a process-wide sleep or timing-only assertion.
+#[cfg(test)]
+pub(crate) struct JournalShutdownBarrier {
+    before_drain_entered_tx: Sender<()>,
+    before_drain_entered_rx: Receiver<()>,
+    before_drain_release_tx: Sender<()>,
+    before_drain_release_rx: Receiver<()>,
+    before_exit_entered_tx: Sender<()>,
+    before_exit_entered_rx: Receiver<()>,
+    before_exit_release_tx: Sender<()>,
+    before_exit_release_rx: Receiver<()>,
+}
+
+#[cfg(test)]
+impl JournalShutdownBarrier {
+    pub(crate) fn new() -> Self {
+        let (before_drain_entered_tx, before_drain_entered_rx) = crossbeam_channel::bounded(1);
+        let (before_drain_release_tx, before_drain_release_rx) = crossbeam_channel::bounded(1);
+        let (before_exit_entered_tx, before_exit_entered_rx) = crossbeam_channel::bounded(1);
+        let (before_exit_release_tx, before_exit_release_rx) = crossbeam_channel::bounded(1);
+        Self {
+            before_drain_entered_tx,
+            before_drain_entered_rx,
+            before_drain_release_tx,
+            before_drain_release_rx,
+            before_exit_entered_tx,
+            before_exit_entered_rx,
+            before_exit_release_tx,
+            before_exit_release_rx,
+        }
+    }
+
+    fn pause_before_drain(&self) {
+        let _ = self.before_drain_entered_tx.send(());
+        let _ = self.before_drain_release_rx.recv();
+    }
+
+    fn pause_before_exit(&self) {
+        let _ = self.before_exit_entered_tx.send(());
+        let _ = self.before_exit_release_rx.recv();
+    }
+
+    pub(crate) fn wait_before_drain(&self, timeout: Duration) -> bool {
+        self.before_drain_entered_rx.recv_timeout(timeout).is_ok()
+    }
+
+    pub(crate) fn release_before_drain(&self) {
+        let _ = self.before_drain_release_tx.send(());
+    }
+
+    pub(crate) fn wait_before_exit(&self, timeout: Duration) -> bool {
+        self.before_exit_entered_rx.recv_timeout(timeout).is_ok()
+    }
+
+    pub(crate) fn release_before_exit(&self) {
+        let _ = self.before_exit_release_tx.send(());
+    }
 }
 
 impl Shared {
@@ -250,6 +316,24 @@ impl Shared {
             }
         }
     }
+
+    /// Finish a graceful async shutdown by handing the writer's sub-threshold
+    /// buffer to the OS. This intentionally does not call `sync_data`: a
+    /// `wal_sync = false` shutdown must preserve normal reopen semantics
+    /// without silently changing its power-loss durability contract.
+    fn drain_writer_to_os(&self) {
+        if self.sticky_err().is_some() {
+            return;
+        }
+        if self.writer.lock().unwrap().drain_to_os().is_err() {
+            self.set_err("journal flusher final drain failed");
+        }
+    }
+
+    #[cfg(test)]
+    fn take_shutdown_barrier(&self) -> Option<Arc<JournalShutdownBarrier>> {
+        self.shutdown_barrier.lock().unwrap().take()
+    }
 }
 
 /// Completion handle for one acknowledged journal append. Async appends
@@ -269,21 +353,38 @@ impl JournalAck {
 pub(crate) struct Journal {
     shared: Arc<Shared>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// Opaque owner of any resources whose exclusion lifetime must cover the
+    /// worker's final drain and join. `Drop` releases this explicitly after
+    /// join; the worker receives its own clone so neither side depends on
+    /// struct-field destruction order.
+    resource_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Journal {
     #[cfg(test)]
     pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
         let writer = WalWriter::open_or_create(path, tree_id)?;
-        Self::from_writer(writer)
+        Self::from_writer(writer, None)
     }
 
-    pub(crate) fn open_or_create_file(file: File, tree_id: u64) -> Result<Self> {
+    /// Open a descriptor-backed WAL whose worker keeps `resource_guard` live.
+    ///
+    /// The guard is deliberately type-erased: the journal may retain the
+    /// file-store object set for the worker lifetime without depending on the
+    /// storage layer's concrete type or exposing any descriptor.
+    pub(crate) fn open_or_create_file(
+        file: File,
+        tree_id: u64,
+        resource_guard: Arc<dyn Send + Sync>,
+    ) -> Result<Self> {
         let writer = WalWriter::open_or_create_file(file, tree_id)?;
-        Self::from_writer(writer)
+        Self::from_writer(writer, Some(resource_guard))
     }
 
-    fn from_writer(writer: WalWriter) -> Result<Self> {
+    fn from_writer(
+        writer: WalWriter,
+        resource_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Self> {
         let record_base = u64::from(writer.has_records());
         // Mirror legacy reopen seeding: a reopened non-empty WAL is queued
         // and unflushed, so the first checkpoint flushes before making
@@ -310,17 +411,21 @@ impl Journal {
             space_cv: Condvar::new(),
             control_tx,
             record_pool: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            shutdown_barrier: Mutex::new(None),
         });
 
         let worker_shared = Arc::clone(&shared);
+        let worker_resource_guard = resource_guard.clone();
         let handle = thread::Builder::new()
             .name("holt-journal-ring".to_owned())
-            .spawn(move || run_flusher(worker_shared, control_rx))
+            .spawn(move || run_flusher(worker_shared, control_rx, worker_resource_guard))
             .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal-ring"))?;
 
         Ok(Self {
             shared,
             handle: Mutex::new(Some(handle)),
+            resource_guard,
         })
     }
 
@@ -419,6 +524,16 @@ impl Journal {
             checkpoint_debt: queued_work.saturating_sub(checkpointed_work),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_shutdown_barrier(&self, barrier: Arc<JournalShutdownBarrier>) {
+        let mut slot = self.shared.shutdown_barrier.lock().unwrap();
+        assert!(slot.replace(barrier).is_none());
+        drop(slot);
+        // Wake the worker so it observes the newly-installed barrier without
+        // relying on the idle poll deadline.
+        let _ = self.shared.control_tx.send(Control::Flush);
+    }
 }
 
 impl Drop for Journal {
@@ -427,11 +542,27 @@ impl Drop for Journal {
         if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
         }
+        // Release file-store exclusion only after the worker has completed
+        // its final WAL drain and the join has observed thread exit.
+        drop(self.resource_guard.take());
     }
 }
 
-fn run_flusher(shared: Arc<Shared>, control_rx: Receiver<Control>) {
+fn run_flusher(
+    shared: Arc<Shared>,
+    control_rx: Receiver<Control>,
+    _resource_guard: Option<Arc<dyn Send + Sync>>,
+) {
+    #[cfg(test)]
+    let mut shutdown_barrier = None;
     loop {
+        #[cfg(test)]
+        if shutdown_barrier.is_none() {
+            shutdown_barrier = shared.take_shutdown_barrier();
+            if let Some(barrier) = &shutdown_barrier {
+                barrier.pause_before_drain();
+            }
+        }
         shared.drain_and_maybe_sync();
         match control_rx.recv_timeout(FLUSH_POLL) {
             // Flush wake and idle-poll timeout both just re-loop to drain +
@@ -447,10 +578,15 @@ fn run_flusher(shared: Arc<Shared>, control_rx: Receiver<Control>) {
             }
             Ok(Control::Stop) => {
                 shared.drain_and_maybe_sync();
+                shared.drain_writer_to_os();
                 break;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    #[cfg(test)]
+    if let Some(barrier) = shutdown_barrier {
+        barrier.pause_before_exit();
     }
 }
 

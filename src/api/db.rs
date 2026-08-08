@@ -212,7 +212,7 @@ impl DB {
                 } else {
                     1
                 };
-                let journal = Journal::open_or_create_file(wal, 0)?;
+                let journal = Journal::open_or_create_file(wal, 0, file_store)?;
                 (Some(Arc::new(journal)), next_seq)
             }
             _ => (None, 1),
@@ -1454,13 +1454,116 @@ fn next_allocated_tree_id(tree_id: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::blob_store::{AlignedBlobBuf, MemoryBlobStore};
+    use crate::journal::group_commit::JournalShutdownBarrier;
+    use crate::store::blob_store::{AlignedBlobBuf, FileBlobStore, MemoryBlobStore};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn final_db_drop_holds_store_lock_through_wal_worker_exit() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.buffer_pool_size = 16;
+
+        let db = DB::open(cfg.clone()).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+        let shutdown = Arc::new(JournalShutdownBarrier::new());
+        db.journal
+            .as_ref()
+            .expect("file DB has a journal")
+            .install_shutdown_barrier(Arc::clone(&shutdown));
+        assert!(
+            shutdown.wait_before_drain(Duration::from_secs(5)),
+            "journal worker did not reach the pre-drain gate"
+        );
+
+        // The worker is parked before its next ring drain, so this async WAL
+        // record is provably pending when the last DB/Tree handles start
+        // dropping. Its small size also exercises WalWriter's sub-64-KiB
+        // shutdown drain rather than the automatic threshold path.
+        tree.put(b"tail", b"complete").unwrap();
+        let journal_stats = db.journal.as_ref().unwrap().stats();
+        assert!(
+            journal_stats.queued_work > journal_stats.written_work,
+            "test requires a WAL record still pending in the ring"
+        );
+
+        let (dropping_tx, dropping_rx) = mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(tree);
+            dropping_tx.send(()).unwrap();
+            drop(db);
+            dropped_tx.send(()).unwrap();
+        });
+        dropping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (opener_started_tx, opener_started_rx) = mpsc::sync_channel(1);
+        let (lock_contention_tx, lock_contention_rx) = crossbeam_channel::bounded(1);
+        let (opened_tx, opened_rx) = crossbeam_channel::bounded(1);
+        let opener = thread::spawn(move || {
+            FileBlobStore::set_lock_contention_notifier_for_current_thread(lock_contention_tx);
+            opener_started_tx.send(()).unwrap();
+            let result = (|| -> Result<Option<Vec<u8>>> {
+                let reopened = DB::open(cfg)?;
+                reopened.open_tree("objects")?.get(b"tail")
+            })();
+            opened_tx.send(result).unwrap();
+        });
+        opener_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        crossbeam_channel::select! {
+            recv(lock_contention_rx) -> signal => signal.unwrap(),
+            recv(opened_rx) -> _ => {
+                panic!("second opener acquired the store while the old WAL worker was parked")
+            }
+            default(Duration::from_secs(5)) => {
+                panic!("second opener did not attempt the held store lock")
+            }
+        }
+        assert!(
+            dropped_rx.try_recv().is_err(),
+            "last DB drop returned before the WAL worker was released"
+        );
+
+        shutdown.release_before_drain();
+        assert!(
+            shutdown.wait_before_exit(Duration::from_secs(5)),
+            "journal worker did not complete its final drain"
+        );
+        while lock_contention_rx.try_recv().is_ok() {}
+        crossbeam_channel::select! {
+            recv(lock_contention_rx) -> signal => signal.unwrap(),
+            recv(opened_rx) -> _ => {
+                panic!("second opener acquired the store before the old WAL worker exited")
+            }
+            default(Duration::from_secs(5)) => {
+                panic!("second opener stopped retrying while the old WAL worker was live")
+            }
+        }
+        assert!(
+            dropped_rx.try_recv().is_err(),
+            "last DB drop returned before joining the old WAL worker"
+        );
+
+        shutdown.release_before_exit();
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let replayed = opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.as_deref(), Some(&b"complete"[..]));
+
+        dropper.join().unwrap();
+        opener.join().unwrap();
+    }
 
     struct FailFlushOnceStore {
         inner: MemoryBlobStore,

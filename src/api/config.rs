@@ -132,9 +132,13 @@ impl TreeConfig {
         matches!(self.storage, Storage::Memory)
     }
 
-    /// Path of the WAL file for this configuration, if any.
-    /// File-backed trees keep their log next to the data file at
-    /// `<dir>/journal.wal`; memory trees have no WAL.
+    /// Lexical WAL pathname derived from this configuration, if any.
+    ///
+    /// File-backed trees configure their log as `<dir>/journal.wal`; memory
+    /// trees have no WAL. This is not the identity of a live store: after
+    /// open, the configured directory may be renamed or replaced while Holt
+    /// continues using its held directory and WAL descriptors. Use
+    /// [`crate::DB::file_store_object_identity`] when fencing a live DB.
     #[must_use]
     pub fn wal_path(&self) -> Option<PathBuf> {
         match &self.storage {

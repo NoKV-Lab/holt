@@ -80,6 +80,14 @@
 //! `BlobStore::flush` semantics (`sync_data` + manifest persist).
 //! Switching between them is an internal performance toggle; no
 //! caller-visible behaviour changes.
+//!
+//! ## Path trust boundary
+//!
+//! Holt treats the configured path's ancestor directories as trusted
+//! deployment input. Open rejects a symlink as the final `data_dir`
+//! component and rejects symlinks for store entries; after open, all store
+//! I/O stays relative to the held directory descriptor. It does not walk and
+//! independently pin every ancestor component.
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod uring;
@@ -475,6 +483,7 @@ fn acquire_flock(file: &File, path: &Path, timeout: Duration, object: &str) -> R
         match err.kind() {
             io::ErrorKind::Interrupted => {}
             io::ErrorKind::WouldBlock => {
+                notify_lock_contention();
                 if Instant::now() >= deadline {
                     return Err(Error::BlobStoreIo(io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -611,6 +620,33 @@ fn object_identity(directory: &StoreDirectory, lock: &File) -> Result<FileStoreO
         lock_device: lock.dev(),
         lock_inode: lock.ino(),
     })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LOCK_CONTENTION_NOTIFIER: std::cell::RefCell<Option<crossbeam_channel::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn notify_lock_contention() {
+    LOCK_CONTENTION_NOTIFIER.with(|slot| {
+        if let Some(notifier) = slot.borrow().as_ref() {
+            let _ = notifier.try_send(());
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn notify_lock_contention() {}
+
+#[cfg(test)]
+impl FileBlobStore {
+    pub(crate) fn set_lock_contention_notifier_for_current_thread(
+        notifier: crossbeam_channel::Sender<()>,
+    ) {
+        LOCK_CONTENTION_NOTIFIER.with(|slot| *slot.borrow_mut() = Some(notifier));
+    }
 }
 
 #[cfg(test)]

@@ -641,7 +641,8 @@ impl Tree {
                     } else {
                         1
                     };
-                    let journal = Journal::open_or_create_file(wal, /*tree_id=*/ 0)?;
+                    let journal =
+                        Journal::open_or_create_file(wal, /*tree_id=*/ 0, file_store)?;
                     (Some(Arc::new(journal)), next_seq)
                 }
             }

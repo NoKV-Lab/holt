@@ -4,10 +4,9 @@
 //! - Persistent put/delete/rename round-trip through reopen with
 //!   `wal_sync = true` (verifies WAL replay reconstructs
 //!   the logical state on a crash-without-checkpoint).
-//! - "Async WAL without background checkpoint loses unflushed" —
-//!   with manual checkpointing and no durable per-op journal wait, a
-//!   drop without `checkpoint()` leaves the disk WAL empty and reopen
-//!   sees the pre-mutation state.
+//! - Async WAL drains its user-space tail on graceful shutdown, so a normal
+//!   drop + reopen recovers acknowledged writes even without a checkpoint.
+//!   An abrupt process or power failure may still lose non-fsynced records.
 //! - `checkpoint()` flushes everything and truncates the WAL.
 
 use std::fs;
@@ -561,11 +560,12 @@ fn conditional_writes_replay_through_wal() {
 }
 
 #[test]
-fn enqueue_mode_loses_writes_without_checkpoint_or_fsync() {
+fn enqueue_mode_drains_writes_on_graceful_drop() {
     // Under `wal_sync = false` with background checkpointing
-    // disabled, the journal worker can still hold records in process
-    // memory. A short workload + drop-without-checkpoint = nothing
-    // durable — exactly the high-throughput trade-off.
+    // disabled, normal drop stops and joins the journal worker. Its final
+    // drain must hand even a sub-threshold tail to the OS before the store
+    // lock is released. This is a graceful-reopen guarantee, not an fsync or
+    // power-loss guarantee.
     let dir = tempdir().unwrap();
     let cfg = manual_checkpoint_cfg(dir.path());
 
@@ -578,25 +578,26 @@ fn enqueue_mode_loses_writes_without_checkpoint_or_fsync() {
             )
             .unwrap();
         }
-        // Drop without `checkpoint()`. 50 records × ~80 B is
-        // well below the 64 KB auto-flush threshold, so the WAL
-        // file on disk is still header-only.
+        // Drop without `checkpoint()`. 50 records × ~80 B is well below the
+        // 64 KB auto-flush threshold, so shutdown's final drain is required.
     }
     let wal_size = fs::metadata(wal_path(dir.path())).unwrap().len();
-    assert_eq!(wal_size, 32);
+    assert!(wal_size > 32, "graceful drop must drain the WAL tail");
 
     let tree = Tree::open(cfg).unwrap();
     for i in 0..50u32 {
         assert_eq!(
-            tree.get(format!("transient{i}").as_bytes()).unwrap(),
-            None,
-            "transient{i} should have been lost",
+            tree.get(format!("transient{i}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "transient{i} should replay after graceful drop",
         );
     }
 }
 
 #[test]
-fn batched_mode_loses_writes_without_checkpoint() {
+fn batched_mode_replays_writes_after_graceful_drop() {
     let dir = tempdir().unwrap();
     let mut cfg = manual_checkpoint_cfg(dir.path());
     cfg.memory_flush_on_write = false;
@@ -610,18 +611,19 @@ fn batched_mode_loses_writes_without_checkpoint() {
             )
             .unwrap();
         }
-        // Drop without `checkpoint()`. Nothing was flushed:
-        // - WAL records buffered in memory → lost
-        // - BM root blob mutated in memory → lost
+        // Drop without `checkpoint()`. Blob frames remain behind, but the
+        // graceful WAL-worker drain makes the logical records replayable.
     }
 
-    // Reopen — empty WAL, empty blob, no keys readable.
+    // Reopen reconstructs every acknowledged write from the drained WAL.
     let tree = Tree::open(cfg).unwrap();
     for i in 0..10u32 {
         assert_eq!(
-            tree.get(format!("transient{i}").as_bytes()).unwrap(),
-            None,
-            "transient{i} should have been lost",
+            tree.get(format!("transient{i}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "transient{i} should replay after graceful drop",
         );
     }
 }
@@ -1009,10 +1011,10 @@ fn failed_atomic_guard_does_not_append_wal_or_publish() {
 }
 
 #[test]
-fn batch_crash_before_flush_loses_whole_batch() {
-    // `wal_sync = false` with background checkpointing disabled:
-    // if we drop without checkpoint, the OS may not have flushed the
-    // batch record yet, so the whole batch is rolled back on reopen.
+fn batch_graceful_drop_replays_whole_batch() {
+    // `wal_sync = false` with background checkpointing disabled still drains
+    // the complete batch record during normal shutdown. Batch atomicity and
+    // replay do not require a blob checkpoint for a graceful reopen.
     let dir = tempdir().unwrap();
     let cfg = manual_checkpoint_cfg(dir.path()); // wal_sync = false
 
@@ -1021,23 +1023,19 @@ fn batch_crash_before_flush_loses_whole_batch() {
         tree.put(b"durable", b"D").unwrap();
         tree.checkpoint().unwrap();
 
-        // Batch goes through the BM cache but the WAL flush is
-        // deferred; without a checkpoint, the on-disk WAL stays
-        // empty for these ops.
+        // Batch goes through the BM cache while the WAL write is deferred.
         tree.atomic(|b| {
             b.put(b"vanish-a", b"VA");
             b.put(b"vanish-b", b"VB");
         })
         .unwrap();
-        // Note: we do NOT call tree.checkpoint() — the batch
-        // record sits in the WAL's in-memory buffer and dies
-        // with the process.
+        // No checkpoint: graceful Journal drop must drain the whole record.
     }
 
     let tree = Tree::open(cfg).unwrap();
     assert_eq!(tree.get(b"durable").unwrap().as_deref(), Some(&b"D"[..]));
-    assert!(tree.get(b"vanish-a").unwrap().is_none());
-    assert!(tree.get(b"vanish-b").unwrap().is_none());
+    assert_eq!(tree.get(b"vanish-a").unwrap().as_deref(), Some(&b"VA"[..]));
+    assert_eq!(tree.get(b"vanish-b").unwrap().as_deref(), Some(&b"VB"[..]));
 }
 
 #[test]
