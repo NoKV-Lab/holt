@@ -21,8 +21,12 @@
 //! checkpoint proves every WAL record is reflected in the durable
 //! blob image.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
+#[cfg(test)]
 use std::path::Path;
 
 use crate::api::errors::{Error, Result};
@@ -54,6 +58,7 @@ pub struct WalWriter {
     /// (durable + in-flight). Useful for stats / tests.
     bytes_written: u64,
     /// File-header info recovered on open.
+    #[cfg(test)]
     header: FileHeader,
 }
 
@@ -62,6 +67,7 @@ impl WalWriter {
     ///
     /// Returns an error if `path` already exists — use
     /// [`WalWriter::open_existing`] to append to an existing log.
+    #[cfg(test)]
     pub fn create(path: &Path, tree_id: u64) -> Result<Self> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let header = FileHeader::now(tree_id);
@@ -76,6 +82,7 @@ impl WalWriter {
             file,
             pending: Vec::with_capacity(4096),
             bytes_written: FILE_HEADER_SIZE as u64,
+            #[cfg(test)]
             header,
         })
     }
@@ -83,6 +90,7 @@ impl WalWriter {
     /// Open an existing WAL file for append. Validates the file
     /// header and returns the parsed `FileHeader` via
     /// [`WalWriter::header`].
+    #[cfg(test)]
     pub fn open_existing(path: &Path) -> Result<Self> {
         let mut header_bytes = [0u8; FILE_HEADER_SIZE];
         {
@@ -97,6 +105,7 @@ impl WalWriter {
             file,
             pending: Vec::with_capacity(4096),
             bytes_written,
+            #[cfg(test)]
             header,
         })
     }
@@ -105,6 +114,7 @@ impl WalWriter {
     /// `tree_id` is **not** rewritten when opening — pass the
     /// expected `tree_id` so a mismatch (a wrong tree's WAL) can
     /// surface as an error.
+    #[cfg(test)]
     pub fn open_or_create(path: &Path, tree_id: u64) -> Result<Self> {
         if path.exists() {
             let w = Self::open_existing(path)?;
@@ -118,6 +128,42 @@ impl WalWriter {
         } else {
             Self::create(path, tree_id)
         }
+    }
+
+    /// Open or initialize a WAL through an already-held file descriptor.
+    pub(crate) fn open_or_create_file(mut file: File, tree_id: u64) -> Result<Self> {
+        let len = file.metadata()?.len();
+        if len == 0 {
+            let header = FileHeader::now(tree_id);
+            let mut buf = Vec::with_capacity(FILE_HEADER_SIZE);
+            encode_file_header(&header, &mut buf);
+            file.write_all(&buf)?;
+            file.sync_data()?;
+            return Ok(Self {
+                file,
+                pending: Vec::with_capacity(4096),
+                bytes_written: FILE_HEADER_SIZE as u64,
+                #[cfg(test)]
+                header,
+            });
+        }
+
+        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+        file.read_exact_at(&mut header_bytes, 0)?;
+        let header = decode_file_header(&header_bytes)?;
+        if header.tree_id != tree_id {
+            return Err(Error::ReplaySanityFailed {
+                context: "WAL file tree_id mismatch on open",
+                record_offset: 0,
+            });
+        }
+        Ok(Self {
+            file,
+            pending: Vec::with_capacity(4096),
+            bytes_written: len,
+            #[cfg(test)]
+            header,
+        })
     }
 
     /// Header recovered on open, including the embedded tree id.

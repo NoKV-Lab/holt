@@ -24,7 +24,7 @@ use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
-use crate::store::blob_store::BlobStore;
+use crate::store::blob_store::{BlobStore, FileBlobStore, FileStoreObjectIdentity};
 use crate::store::BufferManager;
 
 const DB_ROOT_TAG: u8 = 0xDB;
@@ -158,6 +158,16 @@ impl std::fmt::Debug for DB {
 }
 
 impl DB {
+    /// Return the kernel-object identity of this DB's held file store.
+    ///
+    /// File-backed databases return the `(device, inode)` pairs for the
+    /// directory and `store.lock` descriptors actually held by the live
+    /// store. Memory and custom stores return `None`.
+    #[must_use]
+    pub fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        self.store.file_store_object_identity()
+    }
+
     /// Open a multi-tree database using the supplied configuration.
     pub fn open(mut cfg: TreeConfig) -> Result<Self> {
         // The background merge queue is keyed only by blob GUID. In a
@@ -168,37 +178,41 @@ impl DB {
         // drains dirty bytes and pending deletes.
         cfg.checkpoint.auto_merge = false;
 
-        let bm = Tree::open_buffer_manager(&cfg)?;
-        Self::open_with_buffer_manager(cfg, bm)
+        let opened = Tree::open_buffer_manager(&cfg)?;
+        Self::open_with_buffer_manager(cfg, opened.manager, opened.file_store)
     }
 
     #[cfg(test)]
     fn open_with_blob_store(mut cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
         cfg.checkpoint.auto_merge = false;
         let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
-        Self::open_with_buffer_manager(cfg, bm)
+        Self::open_with_buffer_manager(cfg, bm, None)
     }
 
-    fn open_with_buffer_manager(cfg: TreeConfig, bm: Arc<BufferManager>) -> Result<Self> {
+    fn open_with_buffer_manager(
+        cfg: TreeConfig,
+        bm: Arc<BufferManager>,
+        file_store: Option<Arc<FileBlobStore>>,
+    ) -> Result<Self> {
         let mut open_stats = OpenStats::default();
 
-        let (journal, next_seq) = match cfg.wal_path() {
-            Some(path) => {
-                let next_seq = if path.exists() {
+        let (journal, next_seq) = match file_store {
+            Some(file_store) => {
+                let wal = file_store.open_wal_file()?;
+                let wal_len = wal.metadata()?.len();
+                let next_seq = if wal_len != 0 {
                     let start = std::time::Instant::now();
                     let (next_seq, replay_stats) =
-                        replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                        replay_wal(&wal, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        open_stats.wal_replay_bytes = meta.len();
-                    }
+                    open_stats.wal_replay_bytes = wal_len;
                     next_seq
                 } else {
                     1
                 };
-                let journal = Journal::open_or_create(&path, 0)?;
+                let journal = Journal::open_or_create_file(wal, 0)?;
                 (Some(Arc::new(journal)), next_seq)
             }
             _ => (None, 1),

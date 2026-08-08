@@ -85,14 +85,16 @@
 mod uring;
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,7 +105,7 @@ use crate::layout::{BlobGuid, PAGE_SIZE};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
-use super::{AlignedBlobBuf, BlobStore};
+use super::{AlignedBlobBuf, BlobStore, FileStoreObjectIdentity};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use self::uring::UringContext;
@@ -113,6 +115,9 @@ const DATA_FILENAME: &str = "blobs.dat";
 /// Advisory lock file inside `data_dir`, flock'd exclusively for
 /// the lifetime of an open instance.
 const LOCK_FILENAME: &str = "store.lock";
+/// Logical WAL file opened by `Tree` / `DB` through this store's pinned
+/// directory object.
+const WAL_FILENAME: &str = "journal.wal";
 /// How long `open` waits for a previous instance to release the
 /// directory lock before failing. Covers the handover pattern where
 /// a caller opens a new instance while the previous one is still
@@ -192,6 +197,11 @@ const VALUE_SEGMENT_SLOT_BYTES: usize = PAGE_SIZE as usize;
 #[derive(Debug)]
 pub struct FileBlobStore {
     data_dir: PathBuf,
+    /// Pinned directory object used for every file open, rename, and
+    /// directory durability sync after startup. The lexical `data_dir` is
+    /// retained only for diagnostics.
+    directory: Arc<StoreDirectory>,
+    object_identity: FileStoreObjectIdentity,
     /// Exclusive advisory lock on `data_dir`, held for the lifetime
     /// of this instance. Two live instances on one directory would
     /// each replay `manifest.log` into the same `next_slot`, assign
@@ -199,7 +209,7 @@ pub struct FileBlobStore {
     /// set deltas — permanently corrupting the manifest. The kernel
     /// releases the lock when this handle closes, so a crashed
     /// holder never leaves a stale lock behind.
-    _dir_lock: File,
+    _store_lock: File,
     data_file: File,
     read_index_file: File,
     value_segment_file: File,
@@ -261,10 +271,6 @@ struct Manifest {
     /// reusing them earlier could overwrite a slot still referenced by the
     /// last durable manifest.
     pending_free_slots: Vec<u64>,
-    /// Path to the manifest file (for tmp+rename writes).
-    path: PathBuf,
-    /// Path to the append-only manifest delta log.
-    log_path: PathBuf,
     /// Bytes currently in `manifest.log`, used to decide when a
     /// full snapshot compaction is worth paying for.
     log_bytes: u64,
@@ -303,26 +309,167 @@ impl FreeSlotRange {
     }
 }
 
-/// Acquire the exclusive advisory lock on `data_dir`, waiting up to
-/// `timeout` for a previous instance to release it.
-///
-/// `flock(2)` locks are per open-file-description, so this also
-/// rejects a second instance inside the same process — the scenario
-/// `fcntl` record locks would silently allow. The polling wait lets
-/// an open racing a previous instance's drop (the common handover
-/// pattern `store = reopen(path)`) serialize instead of failing.
-fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
-    let lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(data_dir.join(LOCK_FILENAME))?;
+#[derive(Debug)]
+pub(crate) struct StoreDirectory {
+    file: File,
+}
+
+impl StoreDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store path is not a directory",
+            )));
+        }
+        // Lock the directory object as well as store.lock. This makes a
+        // same-directory unlink/replacement of store.lock unable to admit a
+        // second compliant opener; a rename of the directory itself yields a
+        // distinct object identity and all I/O below remains pinned here.
+        acquire_flock(&file, path, DIR_LOCK_ACQUIRE_TIMEOUT, "store directory")?;
+        pause_after_directory_open();
+        Ok(Self { file })
+    }
+
+    fn open_at(&self, name: &str, flags: libc::c_int, mode: libc::mode_t) -> Result<File> {
+        let name = CString::new(name).map_err(|_| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store filename contains NUL",
+            ))
+        })?;
+        let fd = loop {
+            // SAFETY: `self.file` is a live directory descriptor, `name` is a
+            // NUL-terminated relative filename, and successful ownership of
+            // the returned descriptor is transferred exactly once to `File`.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    flags,
+                    libc::c_uint::from(mode),
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(Error::BlobStoreIo(error));
+            }
+        };
+        // SAFETY: `openat` returned a new owned descriptor above.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file-store entry {name:?} is not a regular file"),
+            )));
+        }
+        Ok(file)
+    }
+
+    fn open_existing_at(&self, name: &str, flags: libc::c_int) -> Result<Option<File>> {
+        match self.open_at(name, flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) {
+            Ok(file) => Ok(Some(file)),
+            Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_or_create_at(&self, name: &str, flags: libc::c_int) -> Result<File> {
+        self.open_at(
+            name,
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT,
+            0o600,
+        )
+    }
+
+    fn entry_metadata(&self, name: &str) -> Result<Option<libc::stat>> {
+        let name = CString::new(name).map_err(|_| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-store filename contains NUL",
+            ))
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        loop {
+            // SAFETY: the directory and relative C string are live; `stat`
+            // points to writable storage initialized on success.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                // SAFETY: successful `fstatat` initialized the structure.
+                return Ok(Some(unsafe { stat.assume_init() }));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(Error::BlobStoreIo(error));
+        }
+    }
+
+    fn rename_at(&self, from: &str, to: &str) -> Result<()> {
+        let from = CString::new(from).expect("static filename has no NUL");
+        let to = CString::new(to).expect("static filename has no NUL");
+        loop {
+            // SAFETY: both names are relative C strings and both directory
+            // descriptors remain live for the call.
+            let rc = unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    from.as_ptr(),
+                    self.file.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(Error::BlobStoreIo(error));
+            }
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn open_wal(&self) -> Result<File> {
+        let file = self.open_or_create_at(WAL_FILENAME, libc::O_RDWR | libc::O_APPEND)?;
+        // Startup is the only creation point. Syncing the held directory is
+        // cheap here and makes a newly-created WAL name durable without ever
+        // reopening the configured pathname.
+        self.sync()?;
+        Ok(file)
+    }
+}
+
+fn acquire_flock(file: &File, path: &Path, timeout: Duration, object: &str) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        // SAFETY: `file` owns a live descriptor for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return Ok(lock_file);
+            return Ok(());
         }
         let err = io::Error::last_os_error();
         match err.kind() {
@@ -332,10 +479,10 @@ fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
                     return Err(Error::BlobStoreIo(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         format!(
-                            "blob store at {} is locked by another live instance \
+                            "blob store {object} at {} is locked by another live instance \
                              (waited {timeout:?}); a second opener would corrupt \
                              the manifest",
-                            data_dir.display()
+                            path.display()
                         ),
                     )));
                 }
@@ -345,6 +492,165 @@ fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct LockFileMetadata {
+    mode: u32,
+    uid: u32,
+    links: u64,
+    size: u64,
+}
+
+impl LockFileMetadata {
+    fn from_file(file: &File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            links: metadata.nlink(),
+            size: metadata.len(),
+        })
+    }
+}
+
+fn validate_lock_file(file: &File) -> Result<()> {
+    let metadata = LockFileMetadata::from_file(file)?;
+    let expected_uid = unsafe { libc::geteuid() };
+    validate_lock_metadata(metadata, expected_uid)
+}
+
+fn validate_lock_metadata(metadata: LockFileMetadata, expected_uid: u32) -> Result<()> {
+    if metadata.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
+        || metadata.uid != expected_uid
+        || metadata.links != 1
+        || metadata.mode & 0o7777 != 0o600
+        || metadata.size != 0
+    {
+        return Err(Error::BlobStoreIo(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "store.lock must be a zero-byte, single-link, mode-0600 regular file owned by the effective user",
+        )));
+    }
+    Ok(())
+}
+
+fn lock_metadata_can_be_hardened(metadata: LockFileMetadata, expected_uid: u32) -> bool {
+    metadata.mode & u32::from(libc::S_IFMT) == u32::from(libc::S_IFREG)
+        && metadata.uid == expected_uid
+        && metadata.links == 1
+        && metadata.size == 0
+}
+
+fn acquire_store_lock(directory: &StoreDirectory, path: &Path) -> Result<File> {
+    let (lock, created) = match directory.open_at(
+        LOCK_FILENAME,
+        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
+        Ok(lock) => (lock, true),
+        Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::AlreadyExists => (
+            directory
+                .open_existing_at(LOCK_FILENAME, libc::O_RDWR)?
+                .ok_or_else(|| {
+                    Error::BlobStoreIo(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "store.lock disappeared while opening",
+                    ))
+                })?,
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    if created {
+        // `openat`'s mode is filtered through umask. Normalize only a file we
+        // created ourselves; pre-existing permissive lock files are rejected
+        // below rather than silently repaired.
+        lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        directory.sync()?;
+    } else {
+        let metadata = LockFileMetadata::from_file(&lock)?;
+        let expected_uid = unsafe { libc::geteuid() };
+        if lock_metadata_can_be_hardened(metadata, expected_uid) && metadata.mode & 0o7777 != 0o600
+        {
+            // Older Holt versions created store.lock with the process umask,
+            // commonly leaving mode 0644. Tightening an owned, zero-byte,
+            // single-link regular file is a safe one-way upgrade; every other
+            // malformed shape still fails closed below.
+            lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            lock.sync_all()?;
+            directory.sync()?;
+        }
+    }
+    validate_lock_file(&lock)?;
+    acquire_flock(&lock, path, DIR_LOCK_ACQUIRE_TIMEOUT, LOCK_FILENAME)?;
+    validate_lock_file(&lock)?;
+    let held = lock.metadata()?;
+    let linked = directory.entry_metadata(LOCK_FILENAME)?.ok_or_else(|| {
+        Error::BlobStoreIo(io::Error::new(
+            io::ErrorKind::NotFound,
+            "store.lock was unlinked while opening",
+        ))
+    })?;
+    let linked_device = u64::try_from(linked.st_dev)
+        .map_err(|_| Error::BlobStoreIo(io::Error::other("negative store.lock device id")))?;
+    let linked_inode = linked.st_ino;
+    if held.dev() != linked_device || held.ino() != linked_inode {
+        return Err(Error::BlobStoreIo(io::Error::other(
+            "store.lock was replaced while opening",
+        )));
+    }
+    Ok(lock)
+}
+
+fn object_identity(directory: &StoreDirectory, lock: &File) -> Result<FileStoreObjectIdentity> {
+    let directory = directory.file.metadata()?;
+    let lock = lock.metadata()?;
+    Ok(FileStoreObjectIdentity {
+        directory_device: directory.dev(),
+        directory_inode: directory.ino(),
+        lock_device: lock.dev(),
+        lock_inode: lock.ino(),
+    })
+}
+
+#[cfg(test)]
+struct OpenDirectoryBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl OpenDirectoryBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OPEN_DIRECTORY_BARRIER: std::cell::RefCell<Option<Arc<OpenDirectoryBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_open_directory_barrier(barrier: Arc<OpenDirectoryBarrier>) {
+    OPEN_DIRECTORY_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_after_directory_open() {
+    let barrier = OPEN_DIRECTORY_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_directory_open() {}
 
 fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -381,17 +687,12 @@ impl FileBlobStore {
         registered_buffer_slots: usize,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
-        // Take the lock before touching any store file: manifest
-        // replay (including torn-tail truncation) must not run
-        // while another instance can still append deltas.
-        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
-
-        let data_path = data_dir.join(DATA_FILENAME);
-        let read_index_path = data_dir.join(READ_INDEX_FILENAME);
-        let value_segment_path = data_dir.join(VALUE_SEGMENT_FILENAME);
-        let manifest_path = data_dir.join(MANIFEST_FILENAME);
-        let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
+        let directory = Arc::new(StoreDirectory::open(&data_dir)?);
+        // Take the named lock before touching any store file: manifest replay
+        // (including torn-tail truncation) must not run while another
+        // instance can still append deltas.
+        let store_lock = acquire_store_lock(&directory, &data_dir)?;
+        let object_identity = object_identity(&directory, &store_lock)?;
 
         let data_flags = {
             #[cfg(target_os = "linux")]
@@ -404,24 +705,12 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(data_flags)
-            .open(&data_path)?;
-        let read_index_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&read_index_path)?;
-        let value_segment_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&value_segment_path)?;
+        let data_file = directory.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
+        let read_index_file =
+            directory.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
+        let value_segment_file =
+            directory.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
+        directory.sync()?;
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -431,7 +720,7 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest = Manifest::load_or_create(&directory)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -449,7 +738,9 @@ impl FileBlobStore {
 
         Ok(Self {
             data_dir,
-            _dir_lock: dir_lock,
+            directory,
+            object_identity,
+            _store_lock: store_lock,
             data_file,
             read_index_file,
             value_segment_file,
@@ -473,17 +764,12 @@ impl FileBlobStore {
         _registered_buffer_slots: usize,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
-        // Take the lock before touching any store file: manifest
-        // replay (including torn-tail truncation) must not run
-        // while another instance can still append deltas.
-        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
-
-        let data_path = data_dir.join(DATA_FILENAME);
-        let read_index_path = data_dir.join(READ_INDEX_FILENAME);
-        let value_segment_path = data_dir.join(VALUE_SEGMENT_FILENAME);
-        let manifest_path = data_dir.join(MANIFEST_FILENAME);
-        let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
+        let directory = Arc::new(StoreDirectory::open(&data_dir)?);
+        // Take the named lock before touching any store file: manifest replay
+        // (including torn-tail truncation) must not run while another
+        // instance can still append deltas.
+        let store_lock = acquire_store_lock(&directory, &data_dir)?;
+        let object_identity = object_identity(&directory, &store_lock)?;
 
         let data_flags = {
             #[cfg(target_os = "linux")]
@@ -496,37 +782,27 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(data_flags)
-            .open(&data_path)?;
-        let read_index_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&read_index_path)?;
-        let value_segment_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&value_segment_path)?;
+        let data_file = directory.open_or_create_at(DATA_FILENAME, data_flags | libc::O_RDWR)?;
+        let read_index_file =
+            directory.open_or_create_at(READ_INDEX_FILENAME, index_flags | libc::O_RDWR)?;
+        let value_segment_file =
+            directory.open_or_create_at(VALUE_SEGMENT_FILENAME, index_flags | libc::O_RDWR)?;
+        directory.sync()?;
 
         #[cfg(target_os = "macos")]
         unsafe {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest = Manifest::load_or_create(&directory)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
         Ok(Self {
             data_dir,
-            _dir_lock: dir_lock,
+            directory,
+            object_identity,
+            _store_lock: store_lock,
             data_file,
             read_index_file,
             value_segment_file,
@@ -540,10 +816,24 @@ impl FileBlobStore {
         })
     }
 
-    /// Directory holding `blobs.dat` and `manifest.bin`.
+    /// Configured pathname used to open this store.
+    ///
+    /// The path may be renamed or replaced after open. It is retained for
+    /// diagnostics only; all I/O uses the held directory object and callers
+    /// that need fencing material should use [`Self::object_identity`].
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Return the filesystem objects actually held by this store instance.
+    #[must_use]
+    pub fn object_identity(&self) -> FileStoreObjectIdentity {
+        self.object_identity
+    }
+
+    pub(crate) fn open_wal_file(&self) -> Result<File> {
+        self.directory.open_wal()
     }
 
     /// Number of blobs in the manifest.
@@ -891,7 +1181,7 @@ impl FileBlobStore {
         let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
             let mut m = self.manifest.write().unwrap();
-            if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
+            if let Err(e) = m.persist_pending_deltas(&self.directory) {
                 self.manifest_dirty.store(true, Ordering::Release);
                 return Err(e);
             }
@@ -1214,6 +1504,10 @@ impl FileBlobStore {
 }
 
 impl BlobStore for FileBlobStore {
+    fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        Some(self.object_identity)
+    }
+
     fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         if let Some(pool) = &self.registered_buffers {
@@ -1637,8 +1931,8 @@ impl BlobStore for FileBlobStore {
                 m.apply_relocation_plan(&plan)?
             };
             if slots_trimmed != 0 || !plan.is_empty() {
-                m.persist_snapshot(&self.data_dir)?;
-                m.truncate_log()?;
+                m.persist_snapshot(&self.directory)?;
+                m.truncate_log(&self.directory)?;
                 m.pending_log.clear();
                 self.manifest_dirty.store(false, Ordering::Release);
             }
@@ -1689,16 +1983,16 @@ struct SlotMove {
 }
 
 impl Manifest {
-    fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
-        let (mut entries, mut next_slot) = match File::open(path) {
-            Ok(mut f) => Self::parse_snapshot(&mut f)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
-            Err(e) => return Err(Error::BlobStoreIo(e)),
-        };
+    fn load_or_create(directory: &StoreDirectory) -> Result<Self> {
+        let (mut entries, mut next_slot) =
+            match directory.open_existing_at(MANIFEST_FILENAME, libc::O_RDONLY)? {
+                Some(mut file) => Self::parse_snapshot(&mut file)?,
+                None => (HashMap::new(), 0),
+            };
 
-        let replay = Self::replay_log(log_path, &mut entries, &mut next_slot)?;
+        let replay = Self::replay_log(directory, &mut entries, &mut next_slot)?;
         if replay.valid_bytes < replay.file_bytes {
-            truncate_manifest_log(log_path, replay.valid_bytes)?;
+            truncate_manifest_log(directory, replay.valid_bytes)?;
         }
         let used_slots: Vec<_> = entries.values().map(|entry| entry.slot).collect();
         let reusable_slots = ReusableSlots::reconstruct(next_slot, &used_slots)?;
@@ -1708,8 +2002,6 @@ impl Manifest {
             next_slot,
             reusable_slots,
             pending_free_slots: Vec::new(),
-            path: path.to_path_buf(),
-            log_path: log_path.to_path_buf(),
             log_bytes: replay.valid_bytes,
             pending_log: Vec::new(),
         })
@@ -1858,16 +2150,14 @@ impl Manifest {
         Ok(self.trim_trailing_free_slots())
     }
 
-    fn persist_pending_deltas(&mut self, data_dir: &Path) -> Result<()> {
+    fn persist_pending_deltas(&mut self, directory: &StoreDirectory) -> Result<()> {
         if self.pending_log.is_empty() {
             return Ok(());
         }
 
-        let log_created = !self.log_path.exists();
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let log_created = directory.entry_metadata(MANIFEST_LOG_FILENAME)?.is_none();
+        let mut f =
+            directory.open_or_create_at(MANIFEST_LOG_FILENAME, libc::O_WRONLY | libc::O_APPEND)?;
         let mut buf = Vec::with_capacity(self.pending_log.len() * 40);
         for delta in &self.pending_log {
             encode_manifest_delta(*delta, &mut buf)?;
@@ -1876,13 +2166,13 @@ impl Manifest {
         f.sync_data()?;
         drop(f);
         if log_created {
-            sync_dir(data_dir)?;
+            directory.sync()?;
         }
 
         self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
         if self.should_compact_log() {
-            self.persist_snapshot(data_dir)?;
-            self.truncate_log()?;
+            self.persist_snapshot(directory)?;
+            self.truncate_log(directory)?;
         }
         Ok(())
     }
@@ -1893,15 +2183,9 @@ impl Manifest {
             && self.log_bytes >= snapshot_bytes.saturating_mul(MANIFEST_LOG_COMPACT_RATIO)
     }
 
-    fn persist_snapshot(&self, data_dir: &Path) -> Result<()> {
-        let tmp_path = data_dir.join(MANIFEST_TMP_FILENAME);
-        let final_path = &self.path;
-
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+    fn persist_snapshot(&self, directory: &StoreDirectory) -> Result<()> {
+        let mut f =
+            directory.open_or_create_at(MANIFEST_TMP_FILENAME, libc::O_WRONLY | libc::O_TRUNC)?;
 
         let mut hdr = [0u8; 16];
         hdr[..8].copy_from_slice(&MANIFEST_MAGIC);
@@ -1922,46 +2206,32 @@ impl Manifest {
         f.sync_all()?;
         drop(f);
 
-        std::fs::rename(&tmp_path, final_path)?;
+        directory.rename_at(MANIFEST_TMP_FILENAME, MANIFEST_FILENAME)?;
         // Sync the parent directory so the rename itself is durable
         // (required by POSIX; ext4/xfs honour it).
-        sync_dir(data_dir)?;
+        directory.sync()?;
         Ok(())
     }
 
-    fn truncate_log(&mut self) -> Result<()> {
-        match OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.log_path)
-        {
-            Ok(f) => {
-                f.sync_data()?;
-                self.log_bytes = 0;
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.log_bytes = 0;
-                Ok(())
-            }
-            Err(e) => Err(Error::BlobStoreIo(e)),
+    fn truncate_log(&mut self, directory: &StoreDirectory) -> Result<()> {
+        if let Some(f) = directory.open_existing_at(MANIFEST_LOG_FILENAME, libc::O_WRONLY)? {
+            f.set_len(0)?;
+            f.sync_data()?;
         }
+        self.log_bytes = 0;
+        Ok(())
     }
 
     fn replay_log(
-        log_path: &Path,
+        directory: &StoreDirectory,
         entries: &mut HashMap<BlobGuid, ManifestEntry>,
         next_slot: &mut u64,
     ) -> Result<ManifestLogReplay> {
-        let mut f = match File::open(log_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(ManifestLogReplay {
-                    file_bytes: 0,
-                    valid_bytes: 0,
-                });
-            }
-            Err(e) => return Err(Error::BlobStoreIo(e)),
+        let Some(mut f) = directory.open_existing_at(MANIFEST_LOG_FILENAME, libc::O_RDONLY)? else {
+            return Ok(ManifestLogReplay {
+                file_bytes: 0,
+                valid_bytes: 0,
+            });
         };
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
@@ -2067,14 +2337,15 @@ fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> 
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
-    let dir = File::open(path)?;
-    dir.sync_all()?;
-    Ok(())
-}
-
-fn truncate_manifest_log(path: &Path, valid_bytes: u64) -> Result<()> {
-    let f = OpenOptions::new().write(true).open(path)?;
+fn truncate_manifest_log(directory: &StoreDirectory, valid_bytes: u64) -> Result<()> {
+    let f = directory
+        .open_existing_at(MANIFEST_LOG_FILENAME, libc::O_WRONLY)?
+        .ok_or_else(|| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manifest.log disappeared during recovery",
+            ))
+        })?;
     f.set_len(valid_bytes)?;
     f.sync_all()?;
     Ok(())
@@ -2340,13 +2611,23 @@ mod tests {
         // 0.5.x a second instance replays the same manifest into
         // the same next_slot and corrupts it with duplicate-slot
         // set deltas.
-        let second = acquire_dir_lock(dir.path(), Duration::from_millis(50));
+        let second_directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir.path())
+            .unwrap();
+        let second = acquire_flock(
+            &second_directory,
+            dir.path(),
+            Duration::from_millis(50),
+            "store directory",
+        );
         match second {
             Err(Error::BlobStoreIo(e)) => {
                 assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "unexpected error: {e}");
             }
             Err(e) => panic!("unexpected error variant: {e}"),
-            Ok(_) => panic!("second open acquired the lock while the store is live"),
+            Ok(()) => panic!("second open acquired the lock while the store is live"),
         }
 
         // The handover pattern: once the previous instance is fully
@@ -2356,6 +2637,208 @@ mod tests {
         let Some(_b2) = try_open(dir.path()) else {
             return;
         };
+    }
+
+    #[test]
+    fn object_identity_comes_from_held_directory_and_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        let identity = store.object_identity();
+        let directory = File::open(dir.path()).unwrap().metadata().unwrap();
+        let lock = File::open(dir.path().join(LOCK_FILENAME))
+            .unwrap()
+            .metadata()
+            .unwrap();
+
+        assert_eq!(identity.directory_device, directory.dev());
+        assert_eq!(identity.directory_inode, directory.ino());
+        assert_eq!(identity.lock_device, lock.dev());
+        assert_eq!(identity.lock_inode, lock.ino());
+        assert_eq!(
+            BlobStore::file_store_object_identity(&store),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn directory_and_lock_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let directory_link = parent.path().join("directory-link");
+        symlink(&target, &directory_link).unwrap();
+        assert!(FileBlobStore::open(&directory_link).is_err());
+
+        let lock_target = parent.path().join("lock-target");
+        File::create(&lock_target).unwrap();
+        symlink(&lock_target, target.join(LOCK_FILENAME)).unwrap();
+        assert!(FileBlobStore::open(&target).is_err());
+    }
+
+    #[test]
+    fn lock_metadata_rejects_mode_owner_links_and_size() {
+        let uid = unsafe { libc::geteuid() };
+        let valid = LockFileMetadata {
+            mode: u32::from(libc::S_IFREG) | 0o600,
+            uid,
+            links: 1,
+            size: 0,
+        };
+        assert!(validate_lock_metadata(valid, uid).is_ok());
+
+        let mut invalid = valid;
+        invalid.mode = u32::from(libc::S_IFREG) | 0o640;
+        assert!(validate_lock_metadata(invalid, uid).is_err());
+        invalid = valid;
+        invalid.uid = uid.wrapping_add(1);
+        assert!(validate_lock_metadata(invalid, uid).is_err());
+        invalid = valid;
+        invalid.links = 2;
+        assert!(validate_lock_metadata(invalid, uid).is_err());
+        invalid = valid;
+        invalid.size = 1;
+        assert!(validate_lock_metadata(invalid, uid).is_err());
+    }
+
+    #[test]
+    fn legacy_owned_lock_mode_is_hardened_before_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCK_FILENAME);
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o640)
+            .open(&lock_path)
+            .unwrap();
+
+        let Some(_store) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(std::fs::metadata(lock_path).unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn unsafe_on_disk_lock_metadata_is_rejected_before_store_files_open() {
+        for violation in ["links", "size"] {
+            let dir = tempfile::tempdir().unwrap();
+            let lock_path = dir.path().join(LOCK_FILENAME);
+            let mut lock = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&lock_path)
+                .unwrap();
+            match violation {
+                "links" => {
+                    std::fs::hard_link(&lock_path, dir.path().join("lock-alias")).unwrap();
+                }
+                "size" => {
+                    lock.write_all(b"x").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(lock);
+            assert!(
+                FileBlobStore::open(dir.path()).is_err(),
+                "accepted {violation} violation"
+            );
+            assert!(!dir.path().join(DATA_FILENAME).exists());
+        }
+    }
+
+    #[test]
+    fn replacing_unlinked_lock_cannot_bypass_held_directory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(store) = try_open(dir.path()) else {
+            return;
+        };
+        let original = store.object_identity();
+        std::fs::remove_file(dir.path().join(LOCK_FILENAME)).unwrap();
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(dir.path().join(LOCK_FILENAME))
+            .unwrap();
+        let replacement = File::open(dir.path().join(LOCK_FILENAME))
+            .unwrap()
+            .metadata()
+            .unwrap();
+        assert_ne!(original.lock_inode, replacement.ino());
+        let second_directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir.path())
+            .unwrap();
+        let second = acquire_flock(
+            &second_directory,
+            dir.path(),
+            Duration::from_millis(50),
+            "store directory",
+        );
+        assert!(matches!(
+            second,
+            Err(Error::BlobStoreIo(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+
+        drop(store);
+        let Some(reopened) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(reopened.object_identity().lock_inode, replacement.ino());
+    }
+
+    #[test]
+    fn db_open_stays_on_pinned_directory_across_path_swap() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("store");
+        let held_path = parent.path().join("held-store");
+        std::fs::create_dir(&path).unwrap();
+        let barrier = Arc::new(OpenDirectoryBarrier::new());
+        let opener_barrier = Arc::clone(&barrier);
+        let opener_path = path.clone();
+        let opener = thread::spawn(move || {
+            set_open_directory_barrier(opener_barrier);
+            let mut cfg = crate::TreeConfig::new(opener_path);
+            cfg.checkpoint.enabled = false;
+            crate::DB::open(cfg)
+        });
+
+        barrier.entered.wait();
+        std::fs::rename(&path, &held_path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        barrier.release.wait();
+        let db = match opener.join().unwrap() {
+            Ok(db) => db,
+            Err(Error::BlobStoreIo(error)) if error.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("skipping: O_DIRECT not supported on this fs");
+                return;
+            }
+            Err(error) => panic!("unexpected DB open error: {error}"),
+        };
+
+        let held = File::open(&held_path).unwrap().metadata().unwrap();
+        let identity = db.file_store_object_identity().unwrap();
+        assert_eq!(identity.directory_device, held.dev());
+        assert_eq!(identity.directory_inode, held.ino());
+        for filename in [
+            LOCK_FILENAME,
+            DATA_FILENAME,
+            READ_INDEX_FILENAME,
+            VALUE_SEGMENT_FILENAME,
+            MANIFEST_LOG_FILENAME,
+            WAL_FILENAME,
+        ] {
+            assert!(held_path.join(filename).exists(), "missing {filename}");
+            assert!(
+                !path.join(filename).exists(),
+                "mixed {filename} into replacement"
+            );
+        }
     }
 
     #[test]
@@ -3145,7 +3628,7 @@ mod tests {
             b.manifest
                 .read()
                 .unwrap()
-                .persist_snapshot(dir.path())
+                .persist_snapshot(&b.directory)
                 .unwrap();
         }
 

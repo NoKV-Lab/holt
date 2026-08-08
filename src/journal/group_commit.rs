@@ -30,6 +30,7 @@
 //! fsync happens only when a sync target is outstanding (sync write or
 //! checkpoint barrier), exactly like legacy group commit.
 
+use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -271,8 +272,18 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
         let writer = WalWriter::open_or_create(path, tree_id)?;
+        Self::from_writer(writer)
+    }
+
+    pub(crate) fn open_or_create_file(file: File, tree_id: u64) -> Result<Self> {
+        let writer = WalWriter::open_or_create_file(file, tree_id)?;
+        Self::from_writer(writer)
+    }
+
+    fn from_writer(writer: WalWriter) -> Result<Self> {
         let record_base = u64::from(writer.has_records());
         // Mirror legacy reopen seeding: a reopened non-empty WAL is queued
         // and unflushed, so the first checkpoint flushes before making

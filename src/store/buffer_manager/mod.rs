@@ -146,7 +146,7 @@ use crate::engine;
 use crate::layout::{BlobGuid, HEADER_SIZE, PAGE_SIZE};
 use crate::store::{BlobFrameRef, PAGE_4K};
 
-use super::blob_store::{AlignedBlobBuf, BlobStore};
+use super::blob_store::{AlignedBlobBuf, BlobStore, FileStoreObjectIdentity};
 use super::read_index::{ReadIndex, ReadIndexCache, ReadIndexStamp, ReadPageCache};
 
 use admission::TinyLFU;
@@ -1218,6 +1218,10 @@ impl BufferManager {
 
     pub(crate) fn vacuum_storage(&self) -> Result<VacuumStats> {
         self.store.vacuum()
+    }
+
+    pub(crate) fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        self.store.file_store_object_identity()
     }
 }
 
@@ -3290,6 +3294,10 @@ impl BufferManager {
 }
 
 impl BlobStore for BufferManager {
+    fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        self.store.file_store_object_identity()
+    }
+
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         // `pin` is the authoritative full-frame read path: a cold load is
         // published only under a stable physical-GC generation, and the

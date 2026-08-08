@@ -14,7 +14,8 @@
 //! and should not continue replay.
 
 use std::fs::File;
-use std::io::Read;
+use std::os::unix::fs::FileExt;
+#[cfg(test)]
 use std::path::Path;
 
 use crate::api::errors::{Error, Result};
@@ -47,13 +48,27 @@ pub struct ReplayStats {
 /// The callback may return an error to abort replay — the function
 /// then propagates that error verbatim with the current file
 /// offset patched onto any sanity-failure variant it carries.
-pub fn replay<F>(path: &Path, mut callback: F) -> Result<(FileHeader, ReplayStats)>
+#[cfg(test)]
+pub fn replay<F>(path: &Path, callback: F) -> Result<(FileHeader, ReplayStats)>
 where
     F: FnMut(&WalOp, u64, u64) -> Result<()>,
 {
-    let mut file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let file = File::open(path)?;
+    replay_file(&file, callback)
+}
+
+/// Replay from an already-open file object without reopening its pathname.
+pub(crate) fn replay_file<F>(file: &File, mut callback: F) -> Result<(FileHeader, ReplayStats)>
+where
+    F: FnMut(&WalOp, u64, u64) -> Result<()>,
+{
+    let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+        Error::BlobStoreIo(std::io::Error::other(
+            "WAL length exceeds addressable memory",
+        ))
+    })?;
+    let mut bytes = vec![0; len];
+    file.read_exact_at(&mut bytes, 0)?;
     replay_bytes(&bytes, &mut callback)
 }
 

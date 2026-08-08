@@ -12,6 +12,7 @@
 //!
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ use crate::journal::codec::{
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
     BatchEncoder, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE,
 };
-use crate::journal::reader::replay;
+use crate::journal::reader::replay_file;
 use crate::journal::wal_op::WalOp;
 use crate::journal::Journal;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
@@ -305,6 +306,11 @@ pub struct Tree {
     open_stats: OpenStats,
 }
 
+pub(crate) struct OpenedBufferManager {
+    pub(crate) manager: Arc<BufferManager>,
+    pub(crate) file_store: Option<Arc<FileBlobStore>>,
+}
+
 impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tree")
@@ -499,8 +505,13 @@ impl Tree {
     /// Windows fails at compile time (see the platform stance in
     /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
-        let bm = Self::open_buffer_manager(&cfg)?;
-        Self::open_inner(cfg, bm, /*attach_journal=*/ true)
+        let opened = Self::open_buffer_manager(&cfg)?;
+        Self::open_inner(
+            cfg,
+            opened.manager,
+            /*attach_journal=*/ true,
+            opened.file_store,
+        )
     }
 
     /// Open a tree with a caller-supplied [`BlobStore`].
@@ -524,14 +535,17 @@ impl Tree {
     /// returning.
     pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
         let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
-        Self::open_inner(cfg, bm, /*attach_journal=*/ false)
+        Self::open_inner(cfg, bm, /*attach_journal=*/ false, None)
     }
 
-    pub(crate) fn open_buffer_manager(cfg: &TreeConfig) -> Result<Arc<BufferManager>> {
-        let bm = match &cfg.storage {
+    pub(crate) fn open_buffer_manager(cfg: &TreeConfig) -> Result<OpenedBufferManager> {
+        let opened = match &cfg.storage {
             Storage::Memory => {
                 let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
-                Arc::new(BufferManager::new(store, cfg.buffer_pool_size))
+                OpenedBufferManager {
+                    manager: Arc::new(BufferManager::new(store, cfg.buffer_pool_size)),
+                    file_store: None,
+                }
             }
             Storage::File { dir } => {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -542,31 +556,47 @@ impl Tree {
                     )?);
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     let alloc_store = Arc::clone(&store);
-                    Arc::new(BufferManager::new_file(
-                        store_dyn,
-                        cfg.buffer_pool_size,
-                        move || {
-                            // SAFETY: BufferManager initializes every
-                            // returned buffer before reading it.
-                            unsafe { alloc_store.alloc_blob_buf_uninit() }
-                        },
-                    ))
+                    OpenedBufferManager {
+                        manager: Arc::new(BufferManager::new_file(
+                            store_dyn,
+                            cfg.buffer_pool_size,
+                            move || {
+                                // SAFETY: BufferManager initializes every
+                                // returned buffer before reading it.
+                                unsafe { alloc_store.alloc_blob_buf_uninit() }
+                            },
+                        )),
+                        file_store: Some(store),
+                    }
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
-                    Arc::new(BufferManager::new_file(store, cfg.buffer_pool_size, || {
-                        // SAFETY: BufferManager initializes every
-                        // returned buffer before reading it.
-                        unsafe { AlignedBlobBuf::uninit() }
-                    }))
+                    let store = Arc::new(FileBlobStore::open(dir)?);
+                    let store_dyn: Arc<dyn BlobStore> = store.clone();
+                    OpenedBufferManager {
+                        manager: Arc::new(BufferManager::new_file(
+                            store_dyn,
+                            cfg.buffer_pool_size,
+                            || {
+                                // SAFETY: BufferManager initializes every
+                                // returned buffer before reading it.
+                                unsafe { AlignedBlobBuf::uninit() }
+                            },
+                        )),
+                        file_store: Some(store),
+                    }
                 }
             }
         };
-        Ok(bm)
+        Ok(opened)
     }
 
-    fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_journal: bool) -> Result<Self> {
+    fn open_inner(
+        cfg: TreeConfig,
+        bm: Arc<BufferManager>,
+        attach_journal: bool,
+        file_store: Option<Arc<FileBlobStore>>,
+    ) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
         ensure_durable_root_blob(&bm, root_guid)?;
 
@@ -586,12 +616,14 @@ impl Tree {
         // BM-cached blob image: the on-disk blob lags the WAL between
         // the last `Tree::checkpoint` and now.
         let (journal, next_seq) = if attach_journal {
-            match cfg.wal_path() {
+            match file_store {
                 None => (None, 1u64),
-                Some(path) => {
-                    let next_seq = if path.exists() {
+                Some(file_store) => {
+                    let wal = file_store.open_wal_file()?;
+                    let wal_len = wal.metadata()?.len();
+                    let next_seq = if wal_len != 0 {
                         let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
+                        let (next_seq, replay_stats) = replay_wal(&wal, &bm, |tree_id| {
                             if tree_id == 0 {
                                 Ok(root_guid)
                             } else {
@@ -604,14 +636,12 @@ impl Tree {
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            open_stats.wal_replay_bytes = meta.len();
-                        }
+                        open_stats.wal_replay_bytes = wal_len;
                         next_seq
                     } else {
                         1
                     };
-                    let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
+                    let journal = Journal::open_or_create_file(wal, /*tree_id=*/ 0)?;
                     (Some(Arc::new(journal)), next_seq)
                 }
             }
@@ -3073,7 +3103,7 @@ pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobG
 /// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
 pub(crate) fn replay_wal<F>(
-    path: &std::path::Path,
+    file: &File,
     bm: &Arc<BufferManager>,
     mut root_for_tree_id: F,
 ) -> Result<(u64, crate::journal::reader::ReplayStats)>
@@ -3081,7 +3111,7 @@ where
     F: FnMut(u64) -> Result<BlobGuid>,
 {
     let mut root_pins: HashMap<u64, (BlobGuid, Arc<CachedBlob>)> = HashMap::new();
-    let (_header, stats) = replay(path, |op, seq, _off| {
+    let (_header, stats) = replay_file(file, |op, seq, _off| {
         let tree_id = op.tree_id().unwrap_or(0);
         let (root_guid, root_pin) = match root_pins.entry(tree_id) {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -3170,10 +3200,7 @@ where
     // crash hit mid-write, before its fdatasync), so truncating it to the
     // last complete record loses nothing durable — standard WAL recovery.
     if let Some(off) = stats.torn_tail_at {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .set_len(off)?;
+        file.set_len(off)?;
     }
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything

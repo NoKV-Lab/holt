@@ -38,6 +38,24 @@ use crate::api::errors::Result;
 use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::BlobGuid;
 
+/// Stable filesystem identity of one open file-backed store.
+///
+/// These numbers come from `fstat(2)` on the directory and lock-file
+/// descriptors that the store actually holds. They therefore describe the
+/// kernel objects backing this live instance, not a pathname that may later be
+/// renamed or replaced. Raw file descriptors are intentionally not exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileStoreObjectIdentity {
+    /// Device containing the held store directory.
+    pub directory_device: u64,
+    /// Inode of the held store directory.
+    pub directory_inode: u64,
+    /// Device containing the held `store.lock` file.
+    pub lock_device: u64,
+    /// Inode of the held `store.lock` file.
+    pub lock_inode: u64,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexedBlobLookup {
@@ -71,6 +89,15 @@ pub enum IndexedBlobLookup {
 /// - `flush` blocks until **every** write that returned before the
 ///   call is durable on the underlying medium.
 pub trait BlobStore: Send + Sync {
+    /// Return the actual held filesystem objects for a file-backed store.
+    ///
+    /// Custom and memory stores return `None`. The identity is diagnostic and
+    /// fencing material; it does not grant access to the underlying file
+    /// descriptors.
+    fn file_store_object_identity(&self) -> Option<FileStoreObjectIdentity> {
+        None
+    }
+
     /// Allocate a zero-filled blob buffer suitable for this store.
     ///
     /// The default is a heap-backed 4 KB-aligned frame. Linux
