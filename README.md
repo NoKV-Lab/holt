@@ -5,6 +5,7 @@
 # holt
 
 [![Crates.io](https://img.shields.io/crates/v/holt.svg)](https://crates.io/crates/holt)
+[![npm](https://img.shields.io/npm/v/%40nokv-lab%2Fholt.svg)](https://www.npmjs.com/package/@nokv-lab/holt)
 [![Docs.rs](https://docs.rs/holt/badge.svg)](https://docs.rs/holt)
 [![CI](https://github.com/NoKV-Lab/holt/actions/workflows/ci.yml/badge.svg)](https://github.com/feichai0017/holt/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.82-blue.svg)](https://github.com/feichai0017/holt/blob/main/Cargo.toml)
