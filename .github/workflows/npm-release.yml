@@ -1,0 +1,312 @@
+name: Node package
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "node-v*.*.*"
+    paths:
+      - ".github/workflows/npm-release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "crates/holt-node/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/npm-release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "crates/holt-node/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  MACOSX_DEPLOYMENT_TARGET: "10.15"
+
+jobs:
+  release-tests:
+    name: Release test suite
+    if: startsWith(github.ref, 'refs/tags/node-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/holt-node/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: crates/holt-node
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Rust release tests
+        run: cargo test --workspace --lib --tests --examples --locked
+
+      - name: Audit Node dependencies
+        run: npm audit --audit-level=high
+        working-directory: crates/holt-node
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            build_args: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build_args: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            build_args: "--use-napi-cross"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            build_args: "--use-napi-cross"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/holt-node/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-${{ matrix.target }}
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: crates/holt-node
+
+      - name: Build native binding
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.build_args }}
+        working-directory: crates/holt-node
+
+      - name: Upload native binding
+        uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/holt-node/index.*.node
+          if-no-files-found: error
+          retention-days: 3
+
+  test:
+    name: Test ${{ matrix.target }} on Node ${{ matrix.node }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            architecture: x64
+            node: 18
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            architecture: x64
+            node: 24
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            architecture: arm64
+            node: 18
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            architecture: arm64
+            node: 24
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            architecture: x64
+            node: 18
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            architecture: x64
+            node: 24
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            architecture: arm64
+            node: 18
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            architecture: arm64
+            node: 24
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.architecture }}
+          cache: npm
+          cache-dependency-path: crates/holt-node/package-lock.json
+
+      - name: Install runtime dependencies
+        run: npm ci --omit=dev --ignore-scripts
+        working-directory: crates/holt-node
+
+      - name: Download native binding
+        uses: actions/download-artifact@v8
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/holt-node
+
+      - name: Run Node tests
+        run: npm test
+        working-directory: crates/holt-node
+
+  publish:
+    name: Publish npm packages
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/node-v')
+    needs: [release-tests, build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release version
+        shell: bash
+        working-directory: crates/holt-node
+        run: |
+          tag_version="${GITHUB_REF_NAME#node-v}"
+          package_version="$(node -p "require('./package.json').version")"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => { input += chunk });
+            process.stdin.on("end", () => {
+              const metadata = JSON.parse(input);
+              process.stdout.write(metadata.packages.find((pkg) => pkg.name === "holt-node").version);
+            });
+          ')"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          test "$tag_version" = "$package_version"
+          test "$tag_version" = "$cargo_version"
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: crates/holt-node
+
+      - name: Create platform packages
+        run: npm run create:npm-dirs
+        working-directory: crates/holt-node
+
+      - name: Download all native bindings
+        uses: actions/download-artifact@v8
+        with:
+          path: crates/holt-node/artifacts
+
+      - name: Collect native bindings
+        run: npm run artifacts -- --output-dir artifacts --npm-dir npm
+        working-directory: crates/holt-node
+
+      - name: Prepare and verify package metadata
+        working-directory: crates/holt-node
+        run: |
+          npm run release:prepare
+          npm run release:verify
+
+      - name: Inspect package tarballs
+        shell: bash
+        working-directory: crates/holt-node
+        run: |
+          npm pack --dry-run --ignore-scripts
+          for target in darwin-x64 darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
+            npm pack --dry-run --ignore-scripts "./npm/$target"
+          done
+
+      - name: Test an installed package
+        shell: bash
+        working-directory: crates/holt-node
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_dir="$(mktemp -d)"
+          install_dir="$(mktemp -d)"
+          root_tarball="$(npm pack --ignore-scripts --pack-destination "$package_dir" --json | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => { input += chunk });
+            process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename));
+          ')"
+          platform_tarball="$(npm pack ./npm/linux-x64-gnu --ignore-scripts --pack-destination "$package_dir" --json | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => { input += chunk });
+            process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename));
+          ')"
+          cd "$install_dir"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$package_dir/$root_tarball" "$package_dir/$platform_tarball"
+          PACKAGE_NAME="$package_name" node -e '
+            const { Tree } = require(process.env.PACKAGE_NAME);
+            (async () => {
+              const tree = await Tree.openMemory();
+              await tree.put(Buffer.from("release/check"), Buffer.from("ok"));
+              const value = await tree.get(Buffer.from("release/check"));
+              if (value?.toString() !== "ok") throw new Error("installed package returned the wrong value");
+              await tree.close();
+            })().catch((error) => { console.error(error); process.exit(1); });
+          '
+
+      - name: Publish packages
+        shell: bash
+        working-directory: crates/holt-node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          npm_tag="latest"
+          if [[ "$version" == *-* ]]; then
+            npm_tag="next"
+          fi
+
+          publish_package() {
+            package_dir="$1"
+            package_name="$(node -p "require('./${package_dir#./}/package.json').name")"
+            if npm view "$package_name@$version" version >/dev/null 2>&1; then
+              echo "$package_name@$version already exists; skipping"
+              return
+            fi
+            npm publish "$package_dir" --ignore-scripts --access public --provenance --tag "$npm_tag"
+          }
+
+          for target in darwin-x64 darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
+            publish_package "./npm/$target"
+          done
+          publish_package "."

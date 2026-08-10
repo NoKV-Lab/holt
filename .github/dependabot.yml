@@ -20,6 +20,20 @@ updates:
       dev-deps:
         dependency-type: "development"
 
+  # Node binding build dependencies.
+  - package-ecosystem: "npm"
+    directory: "/crates/holt-node"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "node"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
   # GitHub Actions workflow dependencies (uses: actions/*@vX, etc).
   - package-ecosystem: "github-actions"
     directory: "/"
