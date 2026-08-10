@@ -7,6 +7,33 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.8.3] — 2026-08-10
+
+### Fixed
+
+- **File-store blob rewrites are now crash-safe.** 0.8.2 rewrote a
+  same-GUID blob in place over the slot the durable manifest still
+  referenced. A 512 KiB frame `pwrite` is not power-loss atomic, so a
+  crash mid-rewrite could tear the only complete copy of a checkpoint
+  base frame — the image the sync WAL needs for redo — losing or
+  corrupting acknowledged writes. Every rewrite now shadow-writes to a
+  fresh slot and publishes the remap first; the superseded slot
+  becomes reusable only after the manifest delta is durable and
+  in-flight readers have drained. Sizing note: a store whose every
+  live blob is rewritten between two flushes now peaks at roughly
+  twice its steady-state slot count; explicit `vacuum` reclaims the
+  tail.
+- Failed writes roll back only their own reserved slots. Slots
+  superseded by earlier writes in the same round stay pending until
+  the durability fence passes, instead of becoming reusable early on
+  the rollback path.
+
+### Added
+
+- napi-rs Node.js bindings under `crates/holt-node`, including the
+  multi-tree database API, with storage operations kept off the
+  event loop.
+
 ## [0.8.2] — 2026-07-16
 
 ### Added
