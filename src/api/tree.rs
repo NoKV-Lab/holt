@@ -328,7 +328,9 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
         len += match &ops[i] {
             BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => 1 + 8 + 4 + key.len(),
             BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
-            BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
+            BatchOp::AssertVersion { .. }
+            | BatchOp::AssertAbsent { .. }
+            | BatchOp::AssertPrefixEmpty { .. } => 0,
             BatchOp::Put { .. } | BatchOp::PutIfAbsent { .. } | BatchOp::CompareAndPut { .. } => {
                 unreachable!("insert-like ops handled above")
             }
@@ -383,6 +385,7 @@ fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
         BatchOp::Delete { .. }
         | BatchOp::DeleteIfVersion { .. }
         | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertAbsent { .. }
         | BatchOp::AssertPrefixEmpty { .. }
         | BatchOp::Rename { .. } => None,
     }
@@ -398,6 +401,7 @@ fn batch_insert_condition(op: &BatchOp) -> Option<engine::InsertCondition> {
         BatchOp::Delete { .. }
         | BatchOp::DeleteIfVersion { .. }
         | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertAbsent { .. }
         | BatchOp::AssertPrefixEmpty { .. }
         | BatchOp::Rename { .. } => None,
     }
@@ -1310,11 +1314,16 @@ impl Tree {
     }
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
+        if count != 0 {
+            if let Some(journal) = &self.journal {
+                journal.preflight_submit(encoded_batch_record_len(&pending))?;
+            }
+        }
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
-        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
         // storing per-inner seqs in the body. Non-mutating prefix
@@ -1432,6 +1441,11 @@ impl Tree {
                 match self.projected_record(overlay, key)? {
                     Some(record) if record.version == *expected => {}
                     _ => return Ok(false),
+                }
+            }
+            BatchOp::AssertAbsent { key } => {
+                if self.projected_record(overlay, key)?.is_some() {
+                    return Ok(false);
                 }
             }
             BatchOp::AssertPrefixEmpty { prefix } => {
@@ -1660,7 +1674,9 @@ impl Tree {
                         enc.push_erase(self.tree_id, key);
                     }
                 }
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
+                BatchOp::AssertVersion { .. }
+                | BatchOp::AssertAbsent { .. }
+                | BatchOp::AssertPrefixEmpty { .. } => {}
                 BatchOp::Rename { src, dst, force } => {
                     self.apply_batch_rename_walker(src, dst, *force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {

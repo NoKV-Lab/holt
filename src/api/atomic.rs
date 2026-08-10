@@ -89,6 +89,9 @@ pub(crate) enum BatchOp {
         key: Vec<u8>,
         expected: RecordVersion,
     },
+    AssertAbsent {
+        key: Vec<u8>,
+    },
     AssertPrefixEmpty {
         prefix: Vec<u8>,
     },
@@ -103,7 +106,7 @@ impl BatchOp {
     pub(crate) const fn emits_wal(&self) -> bool {
         !matches!(
             self,
-            Self::AssertVersion { .. } | Self::AssertPrefixEmpty { .. }
+            Self::AssertVersion { .. } | Self::AssertAbsent { .. } | Self::AssertPrefixEmpty { .. }
         )
     }
 }
@@ -166,6 +169,16 @@ impl AtomicBatch {
             key: key.to_vec(),
             expected,
         });
+    }
+
+    /// Require that `key` is absent when the batch commits. If the key exists,
+    /// the whole atomic batch returns `Ok(false)` and publishes no mutations.
+    ///
+    /// This guard does not write a marker, append a WAL operation, or consume a
+    /// record version.
+    pub fn assert_absent(&mut self, key: &[u8]) {
+        self.pending
+            .push(BatchOp::AssertAbsent { key: key.to_vec() });
     }
 
     /// Require that no live key starts with `prefix` when the batch
