@@ -313,18 +313,25 @@ impl Journal {
         })
     }
 
-    /// Submit one fully encoded WAL record. The caller passes an owned buffer
-    /// (recycled here after the ring copies it). Sync appends return an ack.
-    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
+    /// Validate that one encoded record can be accepted without reserving ring
+    /// space or changing journal counters.
+    pub(crate) fn preflight_submit(&self, record_len: usize) -> Result<()> {
         if let Some(m) = self.shared.sticky_err() {
             return Err(Error::Internal(m));
         }
-        if bytes.is_empty() {
+        if record_len == 0 {
             return Err(Error::Internal("journal record must not be empty"));
         }
-        if bytes.len() as u64 > self.shared.ring.capacity() {
+        if record_len as u64 > self.shared.ring.capacity() {
             return Err(Error::Internal("journal record exceeds WAL ring capacity"));
         }
+        Ok(())
+    }
+
+    /// Submit one fully encoded WAL record. The caller passes an owned buffer
+    /// (recycled here after the ring copies it). Sync appends return an ack.
+    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
+        self.preflight_submit(bytes.len())?;
         // Reserve → backpressure wait → memcpy → publish. Backpressure parks on
         // the flusher advancing `flush_cursor`, so a full ring does not spin.
         let ticket = self.shared.ring.reserve(bytes.len() as u64);

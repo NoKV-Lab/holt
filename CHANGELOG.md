@@ -16,6 +16,12 @@ fine-grained per-commit history is in `git log`.
   operation, and consumes no record version. A failed guard aborts the
   complete batch without publishing its mutations.
 
+### Fixed
+
+- `Tree::atomic` and `DB::atomic` now reject oversized WAL records before
+  they reserve record versions or apply walker mutations. A capacity error
+  leaves the WAL, visible keys, and dirty state unchanged.
+
 ## [0.8.3] — 2026-08-10
 
 ### Fixed

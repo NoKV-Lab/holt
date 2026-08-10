@@ -1314,11 +1314,16 @@ impl Tree {
     }
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
+        if count != 0 {
+            if let Some(journal) = &self.journal {
+                journal.preflight_submit(encoded_batch_record_len(&pending))?;
+            }
+        }
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
-        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
         // storing per-inner seqs in the body. Non-mutating prefix
