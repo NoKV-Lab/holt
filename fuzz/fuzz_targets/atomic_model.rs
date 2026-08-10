@@ -37,6 +37,7 @@ enum AtomicOp {
     Put { key: u8, value: u8 },
     Delete { key: u8 },
     PutIfAbsent { key: u8, value: u8 },
+    AssertAbsent { key: u8 },
     CompareAndPutCurrent { key: u8, value: u8 },
     DeleteIfCurrent { key: u8 },
     AssertCurrent { key: u8 },
@@ -105,7 +106,7 @@ impl<'a> Arbitrary<'a> for Op {
 
 impl<'a> Arbitrary<'a> for AtomicOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        Ok(match u.int_in_range(0..=8u8)? {
+        Ok(match u.int_in_range(0..=9u8)? {
             0 => Self::Put {
                 key: key_id(u)?,
                 value: value_id(u)?,
@@ -115,14 +116,15 @@ impl<'a> Arbitrary<'a> for AtomicOp {
                 key: key_id(u)?,
                 value: value_id(u)?,
             },
-            3 => Self::CompareAndPutCurrent {
+            3 => Self::AssertAbsent { key: key_id(u)? },
+            4 => Self::CompareAndPutCurrent {
                 key: key_id(u)?,
                 value: value_id(u)?,
             },
-            4 => Self::DeleteIfCurrent { key: key_id(u)? },
-            5 => Self::AssertCurrent { key: key_id(u)? },
-            6 => Self::AssertStale { key: key_id(u)? },
-            7 => Self::AssertPrefixEmpty { dir: dir_id(u)? },
+            5 => Self::DeleteIfCurrent { key: key_id(u)? },
+            6 => Self::AssertCurrent { key: key_id(u)? },
+            7 => Self::AssertStale { key: key_id(u)? },
+            8 => Self::AssertPrefixEmpty { dir: dir_id(u)? },
             _ => Self::Rename {
                 src: key_id(u)?,
                 dst: key_id(u)?,
@@ -208,6 +210,11 @@ fn model_atomic(
                 staged.insert(key.clone(), value(v));
                 touched.insert(key);
             }
+            AtomicOp::AssertAbsent { key: id } => {
+                if staged.contains_key(&key(id)) {
+                    return Err(ModelErr::GuardFailed);
+                }
+            }
             AtomicOp::CompareAndPutCurrent { key: id, value: v } => {
                 let key = key(id);
                 if !model.contains_key(&key) || touched.contains(&key) {
@@ -268,6 +275,7 @@ fn apply_atomic(tree: &Tree, ops: &[AtomicOp]) -> Result<bool, holt::Error> {
                 AtomicOp::PutIfAbsent { key: id, value: v } => {
                     batch.put_if_absent(&key(id), &value(v));
                 }
+                AtomicOp::AssertAbsent { key: id } => batch.assert_absent(&key(id)),
                 AtomicOp::CompareAndPutCurrent { key: id, value: v } => {
                     let key = key(id);
                     batch.compare_and_put(&key, current_version(tree, &key), &value(v));

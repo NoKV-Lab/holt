@@ -38,6 +38,8 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
     cfg
 }
 
+const OVERSIZED_ATOMIC_OPS: u32 = 257;
+
 #[test]
 fn db_named_trees_replay_from_one_wal() {
     let dir = tempdir().unwrap();
@@ -953,6 +955,7 @@ fn atomic_assert_only_batch_does_not_append_wal_or_consume_seq() {
 
         assert!(tree
             .atomic(|b| {
+                b.assert_absent(b"missing");
                 b.assert_version(b"seed", seed.version);
                 b.assert_prefix_empty(b"empty/");
             })
@@ -972,6 +975,96 @@ fn atomic_assert_only_batch_does_not_append_wal_or_consume_seq() {
 
     let tree = Tree::open(cfg).unwrap();
     assert_eq!(tree.get(b"seed").unwrap().as_deref(), Some(&b"payload"[..]));
+}
+
+#[test]
+fn oversized_tree_atomic_record_fails_before_publish_or_seq_reservation() {
+    let dir = tempdir().unwrap();
+    let tree = Tree::open(durable_cfg(dir.path())).unwrap();
+    tree.put(b"seed", b"value").unwrap();
+    let seed_version = tree.get_version(b"seed").unwrap().unwrap();
+    let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
+    let stats_before = tree.stats().unwrap();
+    let journal_before = stats_before.journal.unwrap();
+    let value = vec![0xA5; u16::MAX as usize];
+
+    let err = tree
+        .atomic(|batch| {
+            for i in 0..OVERSIZED_ATOMIC_OPS {
+                let key = format!("oversized/tree/{i:03}");
+                batch.put(key.as_bytes(), &value);
+            }
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            holt::Error::Internal("journal record exceeds WAL ring capacity")
+        ),
+        "expected the WAL record limit, got {err:?}",
+    );
+    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), wal_len);
+    let stats_after = tree.stats().unwrap();
+    let journal_after = stats_after.journal.unwrap();
+    assert_eq!(journal_after.appends, journal_before.appends);
+    assert_eq!(journal_after.queued_work, journal_before.queued_work);
+    assert_eq!(stats_after.bm_dirty_count, stats_before.bm_dirty_count);
+    for i in 0..OVERSIZED_ATOMIC_OPS {
+        let key = format!("oversized/tree/{i:03}");
+        assert!(tree.get(key.as_bytes()).unwrap().is_none(), "visible {key}");
+    }
+
+    tree.put(b"after", b"value").unwrap();
+    let after_version = tree.get_version(b"after").unwrap().unwrap();
+    assert_eq!(after_version.as_u64(), seed_version.as_u64() + 1);
+}
+
+#[test]
+fn oversized_db_atomic_record_fails_before_publish_or_seq_reservation() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(durable_cfg(dir.path())).unwrap();
+    let left = db.create_tree("left").unwrap();
+    let right = db.create_tree("right").unwrap();
+    left.put(b"seed", b"value").unwrap();
+    let seed_version = left.get_version(b"seed").unwrap().unwrap();
+    let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
+    let stats_before = db.stats();
+    let journal_before = stats_before.journal.unwrap();
+    let value = vec![0x5A; u16::MAX as usize];
+
+    let err = db
+        .atomic(|batch| {
+            for i in 0..OVERSIZED_ATOMIC_OPS {
+                let tree = if i % 2 == 0 { "left" } else { "right" };
+                let key = format!("oversized/db/{i:03}");
+                batch.put(tree, key.as_bytes(), &value);
+            }
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            holt::Error::Internal("journal record exceeds WAL ring capacity")
+        ),
+        "expected the WAL record limit, got {err:?}",
+    );
+    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), wal_len);
+    let stats_after = db.stats();
+    let journal_after = stats_after.journal.unwrap();
+    assert_eq!(journal_after.appends, journal_before.appends);
+    assert_eq!(journal_after.queued_work, journal_before.queued_work);
+    assert_eq!(stats_after.bm_dirty_count, stats_before.bm_dirty_count);
+    for i in 0..OVERSIZED_ATOMIC_OPS {
+        let tree = if i % 2 == 0 { &left } else { &right };
+        let key = format!("oversized/db/{i:03}");
+        assert!(tree.get(key.as_bytes()).unwrap().is_none(), "visible {key}");
+    }
+
+    right.put(b"after", b"value").unwrap();
+    let after_version = right.get_version(b"after").unwrap().unwrap();
+    assert_eq!(after_version.as_u64(), seed_version.as_u64() + 1);
 }
 
 #[test]

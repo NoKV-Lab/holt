@@ -56,6 +56,10 @@ enum AtomicOp {
         key: u8,
         value: u8,
     },
+    AssertAbsent {
+        tree: u8,
+        key: u8,
+    },
     AssertPrefixEmpty {
         tree: u8,
         dir: u8,
@@ -74,6 +78,7 @@ impl AtomicOp {
             Self::Put { tree, .. }
             | Self::Delete { tree, .. }
             | Self::PutIfAbsent { tree, .. }
+            | Self::AssertAbsent { tree, .. }
             | Self::AssertPrefixEmpty { tree, .. }
             | Self::Rename { tree, .. } => tree,
         }
@@ -150,7 +155,7 @@ impl<'a> Arbitrary<'a> for Op {
 
 impl<'a> Arbitrary<'a> for AtomicOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        Ok(match u.int_in_range(0..=4u8)? {
+        Ok(match u.int_in_range(0..=5u8)? {
             0 => Self::Put {
                 tree: tree_id(u)?,
                 key: key_id(u)?,
@@ -165,7 +170,11 @@ impl<'a> Arbitrary<'a> for AtomicOp {
                 key: key_id(u)?,
                 value: value_id(u)?,
             },
-            3 => Self::AssertPrefixEmpty {
+            3 => Self::AssertAbsent {
+                tree: tree_id(u)?,
+                key: key_id(u)?,
+            },
+            4 => Self::AssertPrefixEmpty {
                 tree: tree_id(u)?,
                 dir: dir_id(u)?,
             },
@@ -261,6 +270,11 @@ fn model_atomic(model: &[TreeModel], ops: &[AtomicOp]) -> Result<Vec<TreeModel>,
                 }
                 tree.insert(key, value(v));
             }
+            AtomicOp::AssertAbsent { tree, key: id } => {
+                if live_tree(&staged, tree)?.contains_key(&key(id)) {
+                    return Err(ModelErr::GuardFailed);
+                }
+            }
             AtomicOp::AssertPrefixEmpty { tree, dir } => {
                 let prefix = prefix(dir);
                 if live_tree(&staged, tree)?
@@ -311,6 +325,9 @@ fn apply_db_atomic(db: &DB, ops: &[AtomicOp]) -> Result<bool, holt::Error> {
                     key: id,
                     value: v,
                 } => batch.put_if_absent(tree_name(tree), &key(id), &value(v)),
+                AtomicOp::AssertAbsent { tree, key: id } => {
+                    batch.assert_absent(tree_name(tree), &key(id));
+                }
                 AtomicOp::AssertPrefixEmpty { tree, dir } => {
                     batch.assert_prefix_empty(tree_name(tree), &prefix(dir));
                 }

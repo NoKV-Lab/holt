@@ -1018,6 +1018,12 @@ impl DB {
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let groups = self.group_batch_ops(pending)?;
+        let count = count_wal_ops(&groups);
+        if count != 0 {
+            if let Some(journal) = &self.journal {
+                journal.preflight_submit(encoded_db_batch_record_len(&groups))?;
+            }
+        }
         let mut gates = groups
             .iter()
             .map(|group| (group.tree_id, group.tree.mutation_gate()))
@@ -1034,7 +1040,6 @@ impl DB {
                 self.store.flush_write_deltas_for_tree(group.tree_id)?;
             }
         }
-        let count = count_wal_ops(&groups);
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
         if !Self::preflight_batch_groups(&groups, base_seq)? {
             return Ok(false);
@@ -1157,6 +1162,11 @@ impl DB {
             ops,
         }];
         let count = count_wal_ops(&groups);
+        if count != 0 {
+            if let Some(journal) = &self.journal {
+                journal.preflight_submit(encoded_db_batch_record_len(&groups))?;
+            }
+        }
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
         if !Self::preflight_batch_groups(&groups, base_seq)? {
             return Err(Error::Internal("system DB batch preflight failed"));
@@ -1288,6 +1298,11 @@ impl DBAtomicBatch {
         );
     }
 
+    /// Require that `key` is absent in `tree`.
+    pub fn assert_absent(&mut self, tree: &str, key: &[u8]) {
+        self.push(tree, BatchOp::AssertAbsent { key: key.to_vec() });
+    }
+
     /// Require that no live key starts with `prefix` in `tree`.
     pub fn assert_prefix_empty(&mut self, tree: &str, prefix: &[u8]) {
         self.push(
@@ -1342,7 +1357,9 @@ fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
                     1 + 8 + 4 + key.len()
                 }
                 BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
+                BatchOp::AssertVersion { .. }
+                | BatchOp::AssertAbsent { .. }
+                | BatchOp::AssertPrefixEmpty { .. } => 0,
             };
         }
     }
