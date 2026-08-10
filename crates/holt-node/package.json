@@ -1,31 +1,67 @@
 {
-  "name": "@holt/node",
+  "name": "@nokv-lab/holt",
   "version": "0.1.0",
   "description": "Node.js bindings for the Holt metadata engine",
+  "author": "the holt contributors",
   "license": "MIT",
+  "keywords": [
+    "holt",
+    "metadata",
+    "storage",
+    "database",
+    "napi-rs"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/EnderRomantice/holt.git",
+    "url": "git+https://github.com/NoKV-Lab/holt.git",
     "directory": "crates/holt-node"
+  },
+  "homepage": "https://github.com/NoKV-Lab/holt#readme",
+  "bugs": {
+    "url": "https://github.com/NoKV-Lab/holt/issues"
   },
   "main": "index.js",
   "types": "index.d.ts",
   "engines": {
     "node": ">=18"
   },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "files": [
     "index.js",
-    "index.d.ts",
-    "*.node",
-    "npm"
+    "index.d.ts"
   ],
+  "napi": {
+    "binaryName": "index",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
+    "artifacts": "napi artifacts",
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "create:npm-dirs": "napi create-npm-dirs && node scripts/copy-platform-license.mjs",
+    "release:prepare": "napi pre-publish -t npm --skip-optional-publish --no-gh-release",
+    "release:verify": "node scripts/verify-release.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.5.0"
+    "@napi-rs/cli": "^3.8.4"
   },
   "optionalDependencies": {}
 }
