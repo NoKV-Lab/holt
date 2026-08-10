@@ -17,7 +17,9 @@ use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::snapshot::Snapshot;
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
-use super::tree::{ensure_durable_root_blob, replay_wal, Tree, TreeRuntime};
+use super::tree::{
+    ensure_durable_root_blob, ensure_root_blob_for_open, replay_wal, Tree, TreeRuntime,
+};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
@@ -187,7 +189,9 @@ impl DB {
                 let next_seq = if path.exists() {
                     let start = std::time::Instant::now();
                     let (next_seq, replay_stats) =
-                        replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                        replay_wal(&path, &bm, !cfg.is_read_only(), |tree_id| {
+                            Ok(root_guid_for_tree_id(tree_id))
+                        })?;
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -198,8 +202,12 @@ impl DB {
                 } else {
                     1
                 };
-                let journal = Journal::open_or_create(&path, 0)?;
-                (Some(Arc::new(journal)), next_seq)
+                let journal = if cfg.is_read_only() {
+                    None
+                } else {
+                    Some(Arc::new(Journal::open_or_create(&path, 0)?))
+                };
+                (journal, next_seq)
             }
             _ => (None, 1),
         };
@@ -229,15 +237,27 @@ impl DB {
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         db.restore_dropping_runtime_fences()?;
-        db.checkpointer = crate::checkpoint::Checkpointer::spawn(
-            Arc::clone(&db.store),
-            db.journal.clone(),
-            Arc::clone(&db.maintenance_gate),
-            Arc::clone(&db.commit_gate),
-            db.cfg.checkpoint.clone(),
-        )
-        .map(Arc::new);
+        db.checkpointer = if db.cfg.is_read_only() {
+            None
+        } else {
+            crate::checkpoint::Checkpointer::spawn(
+                Arc::clone(&db.store),
+                db.journal.clone(),
+                Arc::clone(&db.maintenance_gate),
+                Arc::clone(&db.commit_gate),
+                db.cfg.checkpoint.clone(),
+            )
+            .map(Arc::new)
+        };
         Ok(db)
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.cfg.is_read_only() {
+            Err(Error::ReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a named tree inside this DB.
@@ -246,6 +266,7 @@ impl DB {
     /// handle is returned. Re-creating an existing name returns
     /// [`Error::TreeExists`].
     pub fn create_tree(&self, name: &str) -> Result<Tree> {
+        self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
         if self.catalog_entry(name_bytes)?.is_some() {
@@ -361,6 +382,7 @@ impl DB {
     /// Snapshot roots are protected independently and do not by themselves
     /// retain a `Dropping` family's live root.
     pub fn drop_tree(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
         let entry = match self.catalog_entry(name_bytes)? {
@@ -406,6 +428,7 @@ impl DB {
     where
         F: FnOnce(&mut DBAtomicBatch),
     {
+        self.ensure_writable()?;
         let mut batch = DBAtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
@@ -478,6 +501,7 @@ impl DB {
     /// idempotent. Concurrent create/drop operations serialize behind the
     /// same DB maintenance fence.
     pub fn gc(&self) -> Result<usize> {
+        self.ensure_writable()?;
         self.restore_dropping_runtime_fences()?;
         let (freed, cleanup_complete) = self.gc_reachability_pass(usize::MAX, true)?;
         if cleanup_complete && self.finalize_dropped_trees()? {
@@ -501,6 +525,7 @@ impl DB {
     /// hole-punch remaining reusable middle slots. GUID/key visibility is
     /// unchanged.
     pub fn vacuum(&self) -> Result<VacuumStats> {
+        self.ensure_writable()?;
         let unreachable = self.gc()?;
         let mut stats = self.store.vacuum_storage()?;
         stats.unreachable_blobs = unreachable;
@@ -573,6 +598,7 @@ impl DB {
     /// and the install retried — do not serve from a half-installed DB.
     /// Holt does not yet provide online replacement of a live DB image.
     pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<()> {
+        self.ensure_writable()?;
         let decoded = checkpoint::decode(image.as_bytes())?;
         for (name, kv) in &decoded.families {
             let name = std::str::from_utf8(name)
@@ -593,6 +619,7 @@ impl DB {
     /// catalog removals completed by that pass. It is not tied to any one
     /// named tree.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_writable()?;
         self.restore_dropping_runtime_fences()?;
         Tree::checkpoint_shared_store(
             &self.store,
@@ -618,6 +645,7 @@ impl DB {
     /// Run one online maintenance pass for the catalog and every
     /// named tree.
     pub fn compact(&self) -> Result<()> {
+        self.ensure_writable()?;
         self.catalog_tree()?.compact()?;
         for name in self.list_trees()? {
             self.open_tree(&name)?.compact()?;
@@ -733,6 +761,9 @@ impl DB {
     fn restore_epoch_high_water(&self) -> Result<()> {
         let catalog_root = root_guid_for_tree_id(DB_CATALOG_TREE_ID);
         if !self.store.has_blob(catalog_root)? {
+            if self.cfg.is_read_only() {
+                return ensure_root_blob_for_open(&self.store, catalog_root, false);
+            }
             let durable = self.store.store_blob_guids()?;
             let truly_fresh = durable.is_empty()
                 && self.store.cached_count() == 0
@@ -990,7 +1021,7 @@ impl DB {
             return Err(Error::TreeDropped);
         }
         let root_guid = root_guid_for_tree_id(tree_id);
-        ensure_durable_root_blob(&self.store, root_guid)?;
+        ensure_root_blob_for_open(&self.store, root_guid, !self.cfg.is_read_only())?;
         let open = OpenTree {
             root_guid,
             runtime: TreeRuntime::new(),

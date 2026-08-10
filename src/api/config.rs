@@ -14,6 +14,15 @@ use crate::checkpoint::CheckpointConfig;
 const DEFAULT_FILE_BUFFER_POOL_SIZE: usize = 256;
 const DEFAULT_MEMORY_BUFFER_POOL_SIZE: usize = 64;
 
+/// Access policy for a file-backed tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// Open or create the tree and allow mutations.
+    ReadWrite,
+    /// Open an existing tree without changing files on disk.
+    ReadOnly,
+}
+
 /// Where the tree's data lives.
 ///
 /// `File` is the production target. `Memory` is for tests,
@@ -68,6 +77,12 @@ impl Durability {
 pub struct TreeConfig {
     /// Where the tree's data lives.
     pub storage: Storage,
+    /// Whether a file-backed tree may change its on-disk state.
+    ///
+    /// Read-only opens require an existing tree, take a shared
+    /// file lock, replay the WAL into memory, and do not repair
+    /// torn log tails or start a checkpointer.
+    pub access_mode: AccessMode,
     /// Cache budget, expressed in 512 KB blob-frame units. File-backed
     /// trees split this single total budget between resident blob frames,
     /// the read-index directory cache, and a small 4 KB indexed-read page
@@ -104,6 +119,7 @@ impl TreeConfig {
     pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
         Self {
             storage: Storage::File { dir: dir.into() },
+            access_mode: AccessMode::ReadWrite,
             buffer_pool_size: DEFAULT_FILE_BUFFER_POOL_SIZE,
             durability: Durability::Wal { sync: false },
             memory_flush_on_write: false,
@@ -116,6 +132,7 @@ impl TreeConfig {
     pub fn memory() -> Self {
         Self {
             storage: Storage::Memory,
+            access_mode: AccessMode::ReadWrite,
             buffer_pool_size: DEFAULT_MEMORY_BUFFER_POOL_SIZE,
             durability: Durability::Wal { sync: false },
             memory_flush_on_write: true,
@@ -126,10 +143,24 @@ impl TreeConfig {
         }
     }
 
+    /// Require an existing file-backed tree and disable all writes.
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        self.access_mode = AccessMode::ReadOnly;
+        self.checkpoint.enabled = false;
+        self
+    }
+
     /// `true` iff [`Storage::Memory`].
     #[must_use]
     pub fn is_memory(&self) -> bool {
         matches!(self.storage, Storage::Memory)
+    }
+
+    /// `true` when the tree was configured for a non-mutating open.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.access_mode == AccessMode::ReadOnly
     }
 
     /// Path of the WAL file for this configuration, if any.
@@ -153,11 +184,19 @@ mod tests {
         let cfg = TreeConfig::new("/tmp/holt");
         assert_eq!(cfg.buffer_pool_size, 256);
         assert!(!cfg.memory_flush_on_write);
+        assert_eq!(cfg.access_mode, AccessMode::ReadWrite);
     }
 
     #[test]
     fn memory_default_buffer_pool_stays_small() {
         let cfg = TreeConfig::memory();
         assert_eq!(cfg.buffer_pool_size, 64);
+    }
+
+    #[test]
+    fn read_only_disables_background_checkpointing() {
+        let cfg = TreeConfig::new("/tmp/holt").read_only();
+        assert!(cfg.is_read_only());
+        assert!(!cfg.checkpoint.enabled);
     }
 }

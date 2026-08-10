@@ -30,8 +30,17 @@ checks the header-level ABI surface.
 Tree lifecycle:
 
 - `holt_tree_open_with_wal_sync(path, wal_sync, &tree)`
+- `holt_tree_open_read_only(path, &tree)`
 - `holt_tree_open_memory(&tree)`
 - `holt_tree_close(tree)`
+
+`holt_tree_open_read_only` requires an existing persistent tree. It
+replays durable WAL records into memory and holds a shared file lock.
+Multiple readers can share the store. A writer needs the exclusive
+file lock.
+
+Read-only handles do not create, repair, or checkpoint files.
+Mutation calls return `HOLT_ERR`.
 
 Point operations:
 
@@ -50,8 +59,8 @@ before it submits one `Tree::atomic` batch. Holt copies all key and
 value bytes during the call. Operations keep their array order, and
 delete operations require `value_len == 0`.
 
-An empty batch commits successfully. The function writes `committed`
-only when it returns `HOLT_OK`.
+On a writable handle, an empty batch commits successfully. The
+function writes `committed` only when it returns `HOLT_OK`.
 
 Range operations:
 

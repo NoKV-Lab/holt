@@ -156,7 +156,7 @@ pub mod metrics;
 // Core handle + configuration.
 pub use api::builder::TreeBuilder;
 pub use api::checkpoint::CheckpointImage;
-pub use api::config::{Durability, Storage, TreeConfig};
+pub use api::config::{AccessMode, Durability, Storage, TreeConfig};
 pub use api::db::{DBAtomicBatch, DBView, DB};
 pub use api::errors::{Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};

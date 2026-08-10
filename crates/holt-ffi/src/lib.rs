@@ -289,6 +289,31 @@ pub unsafe extern "C" fn holt_tree_open_with_wal_sync(
     })
 }
 
+/// Open an existing file-backed tree for reads only.
+///
+/// The handle replays durable WAL records into memory but does not
+/// change the store. Mutations and maintenance return `HOLT_ERR`.
+///
+/// # Safety
+///
+/// `path` must be a non-null NUL-terminated UTF-8 string. `out`
+/// must be a valid writable pointer. On success, the caller owns
+/// `*out` and must pass it to [`holt_tree_close`].
+#[no_mangle]
+pub unsafe extern "C" fn holt_tree_open_read_only(
+    path: *const c_char,
+    out: *mut *mut HoltTree,
+) -> i32 {
+    boundary(|| {
+        let path = unsafe { open_path(path) }?;
+        let tree = TreeBuilder::new(path)
+            .read_only()
+            .open()
+            .map_err(|err| err.to_string())?;
+        assign_tree(out, tree)
+    })
+}
+
 /// Open an in-memory tree.
 ///
 /// # Safety
@@ -1034,6 +1059,58 @@ mod tests {
             assert_eq!(bytes(&record.value), value);
             holt_record_free(&mut record);
             holt_tree_close(reopened);
+        }
+    }
+
+    #[test]
+    fn read_only_tree_replays_wal_and_rejects_writes() {
+        unsafe {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("ffi-read-only.holt");
+            let path = CString::new(path.to_str().unwrap()).unwrap();
+            let key = b"objects/a";
+            let value = b"etag-a";
+
+            let mut writer = ptr::null_mut();
+            assert_eq!(
+                holt_tree_open_with_wal_sync(path.as_ptr(), 1, &mut writer),
+                HOLT_OK
+            );
+            assert_eq!(
+                holt_tree_put(writer, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                HOLT_OK
+            );
+            holt_tree_close(writer);
+
+            let mut reader = ptr::null_mut();
+            assert_eq!(
+                holt_tree_open_read_only(path.as_ptr(), &mut reader),
+                HOLT_OK
+            );
+            let mut record = HoltRecord::default();
+            assert_eq!(
+                holt_tree_get(reader, key.as_ptr(), key.len(), &mut record),
+                HOLT_OK
+            );
+            assert_eq!(record.found, 1);
+            assert_eq!(bytes(&record.value), value);
+            holt_record_free(&mut record);
+
+            assert_eq!(
+                holt_tree_put(reader, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert_eq!(msg, "tree is read-only");
+            assert_eq!(holt_tree_checkpoint(reader), HOLT_ERR);
+
+            let mut second_reader = ptr::null_mut();
+            assert_eq!(
+                holt_tree_open_read_only(path.as_ptr(), &mut second_reader),
+                HOLT_OK
+            );
+            holt_tree_close(second_reader);
+            holt_tree_close(reader);
         }
     }
 

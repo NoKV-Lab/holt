@@ -57,6 +57,15 @@ impl TreeBuilder {
         self
     }
 
+    /// Open an existing persistent tree without changing its files.
+    ///
+    /// The handle replays durable WAL records into memory and rejects
+    /// mutations and maintenance operations.
+    pub fn read_only(mut self) -> Self {
+        self.cfg = self.cfg.read_only();
+        self
+    }
+
     /// Background checkpointer policy.
     ///
     /// Persistent trees enable it by default so the dirty set and WAL
