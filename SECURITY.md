@@ -12,8 +12,8 @@ minor release plus the previous minor.
 
 | Version | Supported |
 |---------|-----------|
-| `0.8.2` | Yes (current) |
-| `< 0.8.2` | No |
+| `0.8.4` | Yes (current) |
+| `< 0.8.4` | No |
 
 ## Reporting a vulnerability
 
