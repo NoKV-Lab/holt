@@ -328,7 +328,9 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
         len += match &ops[i] {
             BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => 1 + 8 + 4 + key.len(),
             BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
-            BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
+            BatchOp::AssertVersion { .. }
+            | BatchOp::AssertAbsent { .. }
+            | BatchOp::AssertPrefixEmpty { .. } => 0,
             BatchOp::Put { .. } | BatchOp::PutIfAbsent { .. } | BatchOp::CompareAndPut { .. } => {
                 unreachable!("insert-like ops handled above")
             }
@@ -383,6 +385,7 @@ fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
         BatchOp::Delete { .. }
         | BatchOp::DeleteIfVersion { .. }
         | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertAbsent { .. }
         | BatchOp::AssertPrefixEmpty { .. }
         | BatchOp::Rename { .. } => None,
     }
@@ -398,6 +401,7 @@ fn batch_insert_condition(op: &BatchOp) -> Option<engine::InsertCondition> {
         BatchOp::Delete { .. }
         | BatchOp::DeleteIfVersion { .. }
         | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertAbsent { .. }
         | BatchOp::AssertPrefixEmpty { .. }
         | BatchOp::Rename { .. } => None,
     }
@@ -1434,6 +1438,11 @@ impl Tree {
                     _ => return Ok(false),
                 }
             }
+            BatchOp::AssertAbsent { key } => {
+                if self.projected_record(overlay, key)?.is_some() {
+                    return Ok(false);
+                }
+            }
             BatchOp::AssertPrefixEmpty { prefix } => {
                 if !self.projected_prefix_empty(overlay, prefix)? {
                     return Ok(false);
@@ -1660,7 +1669,9 @@ impl Tree {
                         enc.push_erase(self.tree_id, key);
                     }
                 }
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
+                BatchOp::AssertVersion { .. }
+                | BatchOp::AssertAbsent { .. }
+                | BatchOp::AssertPrefixEmpty { .. } => {}
                 BatchOp::Rename { src, dst, force } => {
                     self.apply_batch_rename_walker(src, dst, *force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {

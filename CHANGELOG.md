@@ -7,6 +7,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [Unreleased]
+
+### Added
+
+- `AtomicBatch` and `DBAtomicBatch` now provide a read-only
+  `assert_absent` guard. The guard publishes no marker, appends no WAL
+  operation, and consumes no record version. A failed guard aborts the
+  complete batch without publishing its mutations.
+
 ## [0.8.3] — 2026-08-10
 
 ### Fixed

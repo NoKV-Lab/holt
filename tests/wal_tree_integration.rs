@@ -953,6 +953,7 @@ fn atomic_assert_only_batch_does_not_append_wal_or_consume_seq() {
 
         assert!(tree
             .atomic(|b| {
+                b.assert_absent(b"missing");
                 b.assert_version(b"seed", seed.version);
                 b.assert_prefix_empty(b"empty/");
             })

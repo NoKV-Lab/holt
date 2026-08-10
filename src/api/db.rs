@@ -1288,6 +1288,11 @@ impl DBAtomicBatch {
         );
     }
 
+    /// Require that `key` is absent in `tree`.
+    pub fn assert_absent(&mut self, tree: &str, key: &[u8]) {
+        self.push(tree, BatchOp::AssertAbsent { key: key.to_vec() });
+    }
+
     /// Require that no live key starts with `prefix` in `tree`.
     pub fn assert_prefix_empty(&mut self, tree: &str, prefix: &[u8]) {
         self.push(
@@ -1342,7 +1347,9 @@ fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
                     1 + 8 + 4 + key.len()
                 }
                 BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
+                BatchOp::AssertVersion { .. }
+                | BatchOp::AssertAbsent { .. }
+                | BatchOp::AssertPrefixEmpty { .. } => 0,
             };
         }
     }

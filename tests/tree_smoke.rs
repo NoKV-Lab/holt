@@ -141,6 +141,20 @@ fn db_atomic_commits_and_aborts_across_trees() {
         })
         .unwrap());
     assert!(lock.get(b"should-not-appear").unwrap().is_none());
+
+    assert!(db
+        .atomic(|batch| {
+            batch.assert_absent("mvcc/default", b"new-key");
+            batch.put("mvcc/lock", b"absence-guarded", b"x");
+        })
+        .unwrap());
+    assert!(!db
+        .atomic(|batch| {
+            batch.assert_absent("mvcc/default", b"user-key");
+            batch.put("mvcc/lock", b"must-not-appear", b"x");
+        })
+        .unwrap());
+    assert!(lock.get(b"must-not-appear").unwrap().is_none());
 }
 
 #[test]
@@ -1631,6 +1645,58 @@ fn atomic_assert_prefix_empty_failure_is_invisible() {
         tree.get(b"dir/child").unwrap().as_deref(),
         Some(&b"child"[..])
     );
+}
+
+#[test]
+fn atomic_assert_absent_is_read_only_and_fail_closed() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+
+    assert!(tree
+        .atomic(|batch| {
+            batch.assert_absent(b"guard");
+            batch.put(b"side", b"published");
+        })
+        .unwrap());
+    assert!(tree.get(b"guard").unwrap().is_none());
+    assert_eq!(
+        tree.get(b"side").unwrap().as_deref(),
+        Some(&b"published"[..])
+    );
+
+    tree.put(b"guard", b"present").unwrap();
+    let committed = tree
+        .atomic(|batch| {
+            batch.assert_absent(b"guard");
+            batch.put(b"side", b"must-not-replace");
+        })
+        .unwrap();
+    assert!(!committed);
+    assert_eq!(
+        tree.get(b"side").unwrap().as_deref(),
+        Some(&b"published"[..])
+    );
+}
+
+#[test]
+fn atomic_assert_absent_observes_staged_updates() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+
+    assert!(!tree
+        .atomic(|batch| {
+            batch.put(b"guard", b"staged");
+            batch.assert_absent(b"guard");
+        })
+        .unwrap());
+    assert!(tree.get(b"guard").unwrap().is_none());
+
+    tree.put(b"guard", b"present").unwrap();
+    assert!(tree
+        .atomic(|batch| {
+            batch.delete(b"guard");
+            batch.assert_absent(b"guard");
+        })
+        .unwrap());
+    assert!(tree.get(b"guard").unwrap().is_none());
 }
 
 #[test]
