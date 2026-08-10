@@ -540,10 +540,14 @@ impl Tree {
             Storage::File { dir } => {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
                 {
-                    let store = Arc::new(FileBlobStore::open_with_buffer_pool_hint(
-                        dir,
-                        cfg.buffer_pool_size,
-                    )?);
+                    let store = Arc::new(if cfg.is_read_only() {
+                        FileBlobStore::open_read_only_with_buffer_pool_hint(
+                            dir,
+                            cfg.buffer_pool_size,
+                        )?
+                    } else {
+                        FileBlobStore::open_with_buffer_pool_hint(dir, cfg.buffer_pool_size)?
+                    });
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     let alloc_store = Arc::clone(&store);
                     Arc::new(BufferManager::new_file(
@@ -558,7 +562,11 @@ impl Tree {
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
+                    let store: Arc<dyn BlobStore> = Arc::new(if cfg.is_read_only() {
+                        FileBlobStore::open_read_only(dir)?
+                    } else {
+                        FileBlobStore::open(dir)?
+                    });
                     Arc::new(BufferManager::new_file(store, cfg.buffer_pool_size, || {
                         // SAFETY: BufferManager initializes every
                         // returned buffer before reading it.
@@ -572,7 +580,7 @@ impl Tree {
 
     fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_journal: bool) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
-        ensure_durable_root_blob(&bm, root_guid)?;
+        ensure_root_blob_for_open(&bm, root_guid, !cfg.is_read_only())?;
 
         let mut open_stats = OpenStats::default();
         // Restore the CoW epoch above every persisted frame's
@@ -595,16 +603,17 @@ impl Tree {
                 Some(path) => {
                     let next_seq = if path.exists() {
                         let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
-                            if tree_id == 0 {
-                                Ok(root_guid)
-                            } else {
-                                Err(Error::ReplaySanityFailed {
-                                    context: "WAL record tree_id does not belong to this Tree",
-                                    record_offset: 0,
-                                })
-                            }
-                        })?;
+                        let (next_seq, replay_stats) =
+                            replay_wal(&path, &bm, !cfg.is_read_only(), |tree_id| {
+                                if tree_id == 0 {
+                                    Ok(root_guid)
+                                } else {
+                                    Err(Error::ReplaySanityFailed {
+                                        context: "WAL record tree_id does not belong to this Tree",
+                                        record_offset: 0,
+                                    })
+                                }
+                            })?;
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -615,8 +624,14 @@ impl Tree {
                     } else {
                         1
                     };
-                    let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
-                    (Some(Arc::new(journal)), next_seq)
+                    let journal = if cfg.is_read_only() {
+                        None
+                    } else {
+                        Some(Arc::new(Journal::open_or_create(
+                            &path, /*tree_id=*/ 0,
+                        )?))
+                    };
+                    (journal, next_seq)
                 }
             }
         } else {
@@ -631,14 +646,18 @@ impl Tree {
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
         // configs, so the `Option` chain stays clean.
-        let checkpointer = crate::checkpoint::Checkpointer::spawn(
-            Arc::clone(&bm),
-            journal.clone(),
-            Arc::clone(&maintenance_gate),
-            Arc::clone(&commit_gate),
-            cfg.checkpoint.clone(),
-        )
-        .map(Arc::new);
+        let checkpointer = if cfg.is_read_only() {
+            None
+        } else {
+            crate::checkpoint::Checkpointer::spawn(
+                Arc::clone(&bm),
+                journal.clone(),
+                Arc::clone(&maintenance_gate),
+                Arc::clone(&commit_gate),
+                cfg.checkpoint.clone(),
+            )
+            .map(Arc::new)
+        };
 
         Self::from_shared(
             cfg,
@@ -697,6 +716,15 @@ impl Tree {
     fn ensure_live(&self) -> Result<()> {
         if self.dropped.load(Ordering::Acquire) {
             Err(Error::TreeDropped)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        self.ensure_live()?;
+        if self.cfg.is_read_only() {
+            Err(Error::ReadOnly)
         } else {
             Ok(())
         }
@@ -785,6 +813,7 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         if self.can_stage_deferred_write() {
             self.put_deferred(key, value)
         } else {
@@ -799,6 +828,7 @@ impl Tree {
     /// when a live value already existed. The existence check and
     /// insert happen under the target blob's exclusive latch.
     pub fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.ensure_writable()?;
         self.flush_write_delta_for_tree()?;
         self.put_inner_conditional(key, value, engine::InsertCondition::IfAbsent)
             .map(|outcome| outcome.mutated)
@@ -815,6 +845,7 @@ impl Tree {
     /// keys within `entries` create once; later copies report
     /// `AlreadyExists`.
     pub fn put_many_if_absent(&self, entries: &[(&[u8], &[u8])]) -> Result<Vec<PutOutcome>> {
+        self.ensure_writable()?;
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
@@ -859,6 +890,7 @@ impl Tree {
         expected_version: RecordVersion,
         value: &[u8],
     ) -> Result<bool> {
+        self.ensure_writable()?;
         self.flush_write_delta_for_tree()?;
         self.put_inner_conditional(
             key,
@@ -887,7 +919,7 @@ impl Tree {
         Self::validate_insert_shape(key, value)?;
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let creates_key = self.get_version(key)?.is_none();
@@ -928,7 +960,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1002,6 +1034,7 @@ impl Tree {
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.ensure_writable()?;
         if self.can_stage_deferred_write() {
             self.delete_deferred(key)
         } else {
@@ -1017,6 +1050,7 @@ impl Tree {
     /// tombstoned, or has been updated since the caller obtained
     /// the version.
     pub fn delete_if_version(&self, key: &[u8], expected_version: RecordVersion) -> Result<bool> {
+        self.ensure_writable()?;
         self.flush_write_delta_for_tree()?;
         self.delete_inner_conditional(
             key,
@@ -1028,7 +1062,7 @@ impl Tree {
     fn delete_deferred(&self, key: &[u8]) -> Result<bool> {
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             if self.get_version(key)?.is_none() {
@@ -1077,7 +1111,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1153,13 +1187,14 @@ impl Tree {
     /// single `RenameObject` WAL record so its erase + insert phases
     /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
+        self.ensure_writable()?;
         self.flush_write_delta_for_tree()?;
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
 
         let journal_ack = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1305,6 +1340,7 @@ impl Tree {
     where
         F: FnOnce(&mut AtomicBatch),
     {
+        self.ensure_writable()?;
         let mut batch = AtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
@@ -1314,6 +1350,7 @@ impl Tree {
     }
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+        self.ensure_writable()?;
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         if count != 0 {
             if let Some(journal) = &self.journal {
@@ -1972,6 +2009,7 @@ impl Tree {
     /// share one buffer manager, so a safe sweep needs a DB-wide pass and
     /// this returns [`Error::GcRequiresStandaloneTree`].
     pub fn gc(&self) -> Result<usize> {
+        self.ensure_writable()?;
         if self.tree_id != 0 {
             return Err(Error::GcRequiresStandaloneTree);
         }
@@ -2307,6 +2345,7 @@ impl Tree {
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_writable()?;
         if self.tree_id != 0 {
             return Self::checkpoint_shared_store(
                 &self.store,
@@ -2890,7 +2929,7 @@ impl Tree {
     /// settled if you want to force a tree all the way down after a
     /// heavy churn phase.
     pub fn compact(&self) -> Result<()> {
-        self.ensure_live()?;
+        self.ensure_writable()?;
         if self.store.compaction_candidate_count() == 0 && self.store.merge_candidate_count() == 0 {
             self.seed_maintenance_candidates()?;
         }
@@ -3048,7 +3087,21 @@ impl Tree {
 /// Ensure a deterministic empty root exists beyond the store's durability
 /// frontier before any catalog or replay path publishes a reference to it.
 pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<()> {
+    ensure_root_blob_for_open(bm, root_guid, true)
+}
+
+pub(crate) fn ensure_root_blob_for_open(
+    bm: &Arc<BufferManager>,
+    root_guid: BlobGuid,
+    create_if_missing: bool,
+) -> Result<()> {
     if !bm.has_blob(root_guid)? {
+        if !create_if_missing {
+            return Err(Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "read-only tree root blob is missing",
+            )));
+        }
         let mut scratch = bm.alloc_blob_buf_zeroed();
         BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
         bm.write_blob(root_guid, &scratch)?;
@@ -3060,7 +3113,9 @@ pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobG
     // Always retry the durability barrier. Custom stores may have submitted
     // a prior root write before returning a flush error, and `has_blob` alone
     // does not imply that mapping survived a crash.
-    bm.flush()?;
+    if create_if_missing {
+        bm.flush()?;
+    }
     Ok(())
 }
 
@@ -3092,6 +3147,7 @@ pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobG
 pub(crate) fn replay_wal<F>(
     path: &std::path::Path,
     bm: &Arc<BufferManager>,
+    allow_recovery_writes: bool,
     mut root_for_tree_id: F,
 ) -> Result<(u64, crate::journal::reader::ReplayStats)>
 where
@@ -3107,7 +3163,7 @@ where
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let guid = root_for_tree_id(tree_id)?;
-                ensure_durable_root_blob(bm, guid)?;
+                ensure_root_blob_for_open(bm, guid, allow_recovery_writes)?;
                 let pin = bm.pin(guid)?;
                 let (guid, pin) = entry.insert((guid, pin));
                 (*guid, Arc::clone(pin))
@@ -3186,11 +3242,13 @@ where
     // acked record written after it. The torn record was never acked (the
     // crash hit mid-write, before its fdatasync), so truncating it to the
     // last complete record loses nothing durable — standard WAL recovery.
-    if let Some(off) = stats.torn_tail_at {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .set_len(off)?;
+    if allow_recovery_writes {
+        if let Some(off) = stats.torn_tail_at {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(off)?;
+        }
     }
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything

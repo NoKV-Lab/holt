@@ -24,10 +24,9 @@
 //!     value.seg      — optional packed read value payloads, one
 //!                      slot per blob slot; referenced only by
 //!                      `read.idx` entries and rebuildable
-//!     store.lock     — zero-byte advisory lock file; held
-//!                      exclusively (flock) for the lifetime of an
-//!                      open instance so a second opener cannot
-//!                      corrupt the manifest
+//!     store.lock     — zero-byte advisory lock file; readers hold a
+//!                      shared flock and writers hold an exclusive
+//!                      flock for the lifetime of an open instance
 //! ```
 //!
 //! Design rationale:
@@ -110,8 +109,8 @@ use self::uring::UringContext;
 
 /// Filename of the packed blob data file inside `data_dir`.
 const DATA_FILENAME: &str = "blobs.dat";
-/// Advisory lock file inside `data_dir`, flock'd exclusively for
-/// the lifetime of an open instance.
+/// Advisory lock file inside `data_dir`, flock'd for the lifetime of
+/// an open instance. Readers hold shared locks; writers hold exclusive locks.
 const LOCK_FILENAME: &str = "store.lock";
 /// How long `open` waits for a previous instance to release the
 /// directory lock before failing. Covers the handover pattern where
@@ -192,14 +191,10 @@ const VALUE_SEGMENT_SLOT_BYTES: usize = PAGE_SIZE as usize;
 #[derive(Debug)]
 pub struct FileBlobStore {
     data_dir: PathBuf,
-    /// Exclusive advisory lock on `data_dir`, held for the lifetime
-    /// of this instance. Two live instances on one directory would
-    /// each replay `manifest.log` into the same `next_slot`, assign
-    /// the same slot to different blob GUIDs, and append conflicting
-    /// set deltas — permanently corrupting the manifest. The kernel
-    /// releases the lock when this handle closes, so a crashed
-    /// holder never leaves a stale lock behind.
+    /// Shared read or exclusive write advisory lock on `data_dir`.
+    /// The kernel releases the lock when this handle closes.
     _dir_lock: File,
+    access: FileAccess,
     data_file: File,
     read_index_file: File,
     value_segment_file: File,
@@ -297,30 +292,47 @@ struct FreeSlotRange {
     end: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl FileAccess {
+    fn is_read_only(self) -> bool {
+        self == Self::ReadOnly
+    }
+}
+
 impl FreeSlotRange {
     fn slot_count(self) -> u64 {
         self.end.saturating_sub(self.next).saturating_add(1)
     }
 }
 
-/// Acquire the exclusive advisory lock on `data_dir`, waiting up to
-/// `timeout` for a previous instance to release it.
+/// Acquire the advisory lock for `access`, waiting up to `timeout`
+/// for an incompatible instance to release it.
 ///
 /// `flock(2)` locks are per open-file-description, so this also
-/// rejects a second instance inside the same process — the scenario
-/// `fcntl` record locks would silently allow. The polling wait lets
-/// an open racing a previous instance's drop (the common handover
-/// pattern `store = reopen(path)`) serialize instead of failing.
-fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
-    let lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(data_dir.join(LOCK_FILENAME))?;
+/// rejects incompatible instances inside the same process while
+/// allowing several read-only instances. The polling wait lets an
+/// open racing a previous instance's drop (the common handover pattern
+/// `store = reopen(path)`) serialize instead of failing.
+fn acquire_dir_lock(data_dir: &Path, access: FileAccess, timeout: Duration) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_CLOEXEC);
+    if !access.is_read_only() {
+        options.write(true).create(true);
+    }
+    let lock_file = options.open(data_dir.join(LOCK_FILENAME))?;
+    let operation = if access.is_read_only() {
+        libc::LOCK_SH | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
     let deadline = Instant::now() + timeout;
     loop {
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), operation) };
         if rc == 0 {
             return Ok(lock_file);
         }
@@ -332,9 +344,8 @@ fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
                     return Err(Error::BlobStoreIo(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         format!(
-                            "blob store at {} is locked by another live instance \
-                             (waited {timeout:?}); a second opener would corrupt \
-                             the manifest",
+                            "blob store at {} has an incompatible live access mode \
+                             (waited {timeout:?})",
                             data_dir.display()
                         ),
                     )));
@@ -351,6 +362,28 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
+fn open_store_file(path: &Path, custom_flags: i32, access: FileAccess) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(custom_flags);
+    if !access.is_read_only() {
+        options.write(true).create(true);
+    }
+    options.open(path)
+}
+
+fn open_read_accelerator_file(
+    path: &Path,
+    custom_flags: i32,
+    access: FileAccess,
+) -> io::Result<File> {
+    match open_store_file(path, custom_flags, access) {
+        Err(err) if access.is_read_only() && err.kind() == io::ErrorKind::NotFound => {
+            open_store_file(Path::new("/dev/null"), custom_flags, FileAccess::ReadOnly)
+        }
+        result => result,
+    }
+}
+
 impl FileBlobStore {
     /// Open or create a persistent store at `data_dir`.
     ///
@@ -359,7 +392,23 @@ impl FileBlobStore {
     /// with `O_CLOEXEC` only (macOS additionally sets `F_NOCACHE`).
     /// Loads the manifest if present; otherwise starts empty.
     pub fn open<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
-        Self::open_with_registered_buffer_capacity(data_dir, REGISTERED_BUFFER_MAX_SLOTS)
+        Self::open_with_registered_buffer_capacity(
+            data_dir,
+            REGISTERED_BUFFER_MAX_SLOTS,
+            FileAccess::ReadWrite,
+        )
+    }
+
+    /// Open an existing persistent store without changing its files.
+    ///
+    /// The returned handle holds a shared file lock. Store mutation
+    /// methods return [`Error::ReadOnly`].
+    pub fn open_read_only<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
+        Self::open_with_registered_buffer_capacity(
+            data_dir,
+            REGISTERED_BUFFER_MAX_SLOTS,
+            FileAccess::ReadOnly,
+        )
     }
 
     /// Open with a registered-buffer hot-pool hint derived from the
@@ -372,20 +421,32 @@ impl FileBlobStore {
         buffer_pool_size: usize,
     ) -> Result<Self> {
         let slots = registered_buffer_slots(buffer_pool_size);
-        Self::open_with_registered_buffer_capacity(data_dir, slots)
+        Self::open_with_registered_buffer_capacity(data_dir, slots, FileAccess::ReadWrite)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn open_read_only_with_buffer_pool_hint<P: Into<PathBuf>>(
+        data_dir: P,
+        buffer_pool_size: usize,
+    ) -> Result<Self> {
+        let slots = registered_buffer_slots(buffer_pool_size);
+        Self::open_with_registered_buffer_capacity(data_dir, slots, FileAccess::ReadOnly)
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
         data_dir: P,
         registered_buffer_slots: usize,
+        access: FileAccess,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
+        if !access.is_read_only() {
+            std::fs::create_dir_all(&data_dir)?;
+        }
         // Take the lock before touching any store file: manifest
         // replay (including torn-tail truncation) must not run
         // while another instance can still append deltas.
-        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
+        let dir_lock = acquire_dir_lock(&data_dir, access, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let read_index_path = data_dir.join(READ_INDEX_FILENAME);
@@ -404,24 +465,10 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(data_flags)
-            .open(&data_path)?;
-        let read_index_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&read_index_path)?;
-        let value_segment_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&value_segment_path)?;
+        let data_file = open_store_file(&data_path, data_flags, access)?;
+        let read_index_file = open_read_accelerator_file(&read_index_path, index_flags, access)?;
+        let value_segment_file =
+            open_read_accelerator_file(&value_segment_path, index_flags, access)?;
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -431,7 +478,8 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest =
+            Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -450,6 +498,7 @@ impl FileBlobStore {
         Ok(Self {
             data_dir,
             _dir_lock: dir_lock,
+            access,
             data_file,
             read_index_file,
             value_segment_file,
@@ -471,13 +520,16 @@ impl FileBlobStore {
     fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
         data_dir: P,
         _registered_buffer_slots: usize,
+        access: FileAccess,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
+        if !access.is_read_only() {
+            std::fs::create_dir_all(&data_dir)?;
+        }
         // Take the lock before touching any store file: manifest
         // replay (including torn-tail truncation) must not run
         // while another instance can still append deltas.
-        let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
+        let dir_lock = acquire_dir_lock(&data_dir, access, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let read_index_path = data_dir.join(READ_INDEX_FILENAME);
@@ -496,37 +548,25 @@ impl FileBlobStore {
             }
         };
         let index_flags = libc::O_CLOEXEC;
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(data_flags)
-            .open(&data_path)?;
-        let read_index_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&read_index_path)?;
-        let value_segment_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(index_flags)
-            .open(&value_segment_path)?;
+        let data_file = open_store_file(&data_path, data_flags, access)?;
+        let read_index_file = open_read_accelerator_file(&read_index_path, index_flags, access)?;
+        let value_segment_file =
+            open_read_accelerator_file(&value_segment_path, index_flags, access)?;
 
         #[cfg(target_os = "macos")]
         unsafe {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest =
+            Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
         Ok(Self {
             data_dir,
             _dir_lock: dir_lock,
+            access,
             data_file,
             read_index_file,
             value_segment_file,
@@ -558,6 +598,14 @@ impl FileBlobStore {
         self.manifest.read().unwrap().entries.is_empty()
     }
 
+    fn ensure_writable(&self) -> Result<()> {
+        if self.access.is_read_only() {
+            Err(Error::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
+
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
         Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
     }
@@ -585,6 +633,7 @@ impl FileBlobStore {
     }
 
     fn clear_read_accelerator_slots(&self, guid: BlobGuid) -> Result<()> {
+        self.ensure_writable()?;
         let Some(entry) = self.manifest.read().unwrap().entries.get(&guid).copied() else {
             return Ok(());
         };
@@ -1430,6 +1479,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let Some(base_offset) = self.read_index_offset_of(guid) else {
             return Ok(());
@@ -1469,10 +1519,12 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+        self.ensure_writable()?;
         self.clear_read_accelerator_slots(guid)
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let writes = [(guid, src)];
         let prepared = self.prepare_blob_writes(&writes)?;
@@ -1487,6 +1539,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let prepared = self.prepare_blob_writes(writes)?;
         if prepared.is_empty() {
@@ -1503,6 +1556,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        self.ensure_writable()?;
         if writes.is_empty() {
             return Ok(());
         }
@@ -1537,6 +1591,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
@@ -1610,15 +1665,18 @@ impl BlobStore for FileBlobStore {
     }
 
     fn flush(&self) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         self.flush_locked()
     }
 
     fn needs_flush(&self) -> bool {
-        self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
+        !self.access.is_read_only()
+            && (self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire))
     }
 
     fn vacuum(&self) -> Result<VacuumStats> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         self.flush_locked()?;
         let _slot = self.enter_slot_write();
@@ -1689,7 +1747,7 @@ struct SlotMove {
 }
 
 impl Manifest {
-    fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
+    fn load_or_create(path: &Path, log_path: &Path, repair_torn_tail: bool) -> Result<Self> {
         let (mut entries, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
@@ -1697,7 +1755,7 @@ impl Manifest {
         };
 
         let replay = Self::replay_log(log_path, &mut entries, &mut next_slot)?;
-        if replay.valid_bytes < replay.file_bytes {
+        if repair_torn_tail && replay.valid_bytes < replay.file_bytes {
             truncate_manifest_log(log_path, replay.valid_bytes)?;
         }
         let used_slots: Vec<_> = entries.values().map(|entry| entry.slot).collect();
@@ -2340,7 +2398,7 @@ mod tests {
         // 0.5.x a second instance replays the same manifest into
         // the same next_slot and corrupts it with duplicate-slot
         // set deltas.
-        let second = acquire_dir_lock(dir.path(), Duration::from_millis(50));
+        let second = acquire_dir_lock(dir.path(), FileAccess::ReadWrite, Duration::from_millis(50));
         match second {
             Err(Error::BlobStoreIo(e)) => {
                 assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "unexpected error: {e}");
