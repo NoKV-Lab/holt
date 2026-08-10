@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-08-10
+
 ### Added
 
 - `AtomicBatch` and `DBAtomicBatch` now provide a read-only
