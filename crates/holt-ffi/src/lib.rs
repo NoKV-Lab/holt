@@ -33,6 +33,11 @@ pub const HOLT_ENTRY_KEY: u32 = 1;
 /// `HoltEntry` is a delimiter common-prefix rollup.
 pub const HOLT_ENTRY_COMMON_PREFIX: u32 = 2;
 
+/// `HoltAtomicOp` inserts or replaces one key/value pair.
+pub const HOLT_ATOMIC_PUT: u32 = 1;
+/// `HoltAtomicOp` deletes one key.
+pub const HOLT_ATOMIC_DELETE: u32 = 2;
+
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").expect("empty CString"));
 }
@@ -100,6 +105,27 @@ pub struct HoltEntry {
     pub version: u64,
 }
 
+/// One operation passed to `holt_tree_atomic`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HoltAtomicOp {
+    /// `HOLT_ATOMIC_PUT` or `HOLT_ATOMIC_DELETE`.
+    pub kind: u32,
+    /// Key bytes.
+    pub key: *const u8,
+    /// Number of key bytes.
+    pub key_len: usize,
+    /// Value bytes for `HOLT_ATOMIC_PUT`.
+    pub value: *const u8,
+    /// Number of value bytes. Deletes require zero.
+    pub value_len: usize,
+}
+
+enum ParsedAtomicOp<'a> {
+    Put { key: &'a [u8], value: &'a [u8] },
+    Delete { key: &'a [u8] },
+}
+
 type FfiResult<T> = Result<T, String>;
 
 fn set_error(message: impl Into<String>) -> i32 {
@@ -147,6 +173,19 @@ unsafe fn bytes_arg<'a>(ptr: *const u8, len: usize, name: &str) -> FfiResult<&'a
         return Err(format!(
             "holt ffi: null {name} pointer with non-zero length"
         ));
+    }
+    Ok(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+unsafe fn atomic_ops_arg<'a>(
+    ptr: *const HoltAtomicOp,
+    len: usize,
+) -> FfiResult<&'a [HoltAtomicOp]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err("holt ffi: null atomic ops pointer with non-zero count".to_owned());
     }
     Ok(unsafe { slice::from_raw_parts(ptr, len) })
 }
@@ -358,6 +397,70 @@ pub unsafe extern "C" fn holt_tree_delete(
                 *existed_out = u8::from(existed);
             }
         }
+        Ok(HOLT_OK)
+    })
+}
+
+/// Apply puts and deletes through one Holt atomic batch.
+///
+/// # Safety
+///
+/// `tree` must be a live Holt handle. `ops` must point to
+/// `op_count` readable entries unless `op_count` is zero. Each key
+/// and put value must remain readable for the call. `committed_out`
+/// must be a valid writable pointer. The function writes it only on
+/// success.
+#[no_mangle]
+pub unsafe extern "C" fn holt_tree_atomic(
+    tree: *mut HoltTree,
+    ops: *const HoltAtomicOp,
+    op_count: usize,
+    committed_out: *mut u8,
+) -> i32 {
+    boundary(|| {
+        let tree = unsafe { tree_ref(tree) }?;
+        if committed_out.is_null() {
+            return Err("holt ffi: null committed output pointer".to_owned());
+        }
+        let ops = unsafe { atomic_ops_arg(ops, op_count) }?;
+        let mut parsed = Vec::with_capacity(ops.len());
+
+        for (index, op) in ops.iter().enumerate() {
+            let key_name = format!("atomic op {index} key");
+            let key = unsafe { bytes_arg(op.key, op.key_len, &key_name) }?;
+            match op.kind {
+                HOLT_ATOMIC_PUT => {
+                    let value_name = format!("atomic op {index} value");
+                    let value = unsafe { bytes_arg(op.value, op.value_len, &value_name) }?;
+                    parsed.push(ParsedAtomicOp::Put { key, value });
+                }
+                HOLT_ATOMIC_DELETE => {
+                    if op.value_len != 0 {
+                        return Err(format!("holt ffi: atomic delete op {index} has a value"));
+                    }
+                    parsed.push(ParsedAtomicOp::Delete { key });
+                }
+                kind => {
+                    return Err(format!(
+                        "holt ffi: atomic op {index} has unknown kind {kind}"
+                    ));
+                }
+            }
+        }
+
+        let committed = tree
+            .tree
+            .atomic(|batch| {
+                for op in parsed {
+                    match op {
+                        ParsedAtomicOp::Put { key, value } => batch.put(key, value),
+                        ParsedAtomicOp::Delete { key } => batch.delete(key),
+                    }
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        let committed_out = unsafe { out_mut(committed_out, "committed") }?;
+        *committed_out = u8::from(committed);
         Ok(HOLT_OK)
     })
 }
@@ -624,6 +727,146 @@ mod tests {
             );
             assert_eq!(record.found, 0);
 
+            holt_tree_close(tree);
+        }
+    }
+
+    #[test]
+    fn atomic_batch_applies_puts_and_deletes() {
+        unsafe {
+            let mut tree = ptr::null_mut();
+            assert_eq!(holt_tree_open_memory(&mut tree), HOLT_OK);
+
+            let old_key = b"old";
+            assert_eq!(
+                holt_tree_put(tree, old_key.as_ptr(), old_key.len(), b"x".as_ptr(), 1),
+                HOLT_OK
+            );
+
+            let key_a = b"a";
+            let value_a = b"one";
+            let key_b = b"b";
+            let value_b = b"two";
+            let ops = [
+                HoltAtomicOp {
+                    kind: HOLT_ATOMIC_PUT,
+                    key: key_a.as_ptr(),
+                    key_len: key_a.len(),
+                    value: value_a.as_ptr(),
+                    value_len: value_a.len(),
+                },
+                HoltAtomicOp {
+                    kind: HOLT_ATOMIC_PUT,
+                    key: key_b.as_ptr(),
+                    key_len: key_b.len(),
+                    value: value_b.as_ptr(),
+                    value_len: value_b.len(),
+                },
+                HoltAtomicOp {
+                    kind: HOLT_ATOMIC_DELETE,
+                    key: old_key.as_ptr(),
+                    key_len: old_key.len(),
+                    value: ptr::null(),
+                    value_len: 0,
+                },
+            ];
+
+            let mut committed = 0;
+            assert_eq!(
+                holt_tree_atomic(tree, ops.as_ptr(), ops.len(), &mut committed),
+                HOLT_OK
+            );
+            assert_eq!(committed, 1);
+
+            for (key, value) in [(&key_a[..], &value_a[..]), (&key_b[..], &value_b[..])] {
+                let mut record = HoltRecord::default();
+                assert_eq!(
+                    holt_tree_get(tree, key.as_ptr(), key.len(), &mut record),
+                    HOLT_OK
+                );
+                assert_eq!(record.found, 1);
+                assert_eq!(bytes(&record.value), value);
+                holt_record_free(&mut record);
+            }
+
+            let mut record = HoltRecord::default();
+            assert_eq!(
+                holt_tree_get(tree, old_key.as_ptr(), old_key.len(), &mut record),
+                HOLT_OK
+            );
+            assert_eq!(record.found, 0);
+
+            committed = 0;
+            assert_eq!(
+                holt_tree_atomic(tree, ptr::null(), 0, &mut committed),
+                HOLT_OK
+            );
+            assert_eq!(committed, 1);
+            holt_tree_close(tree);
+        }
+    }
+
+    #[test]
+    fn atomic_batch_rejects_all_ops_before_mutation() {
+        unsafe {
+            let mut tree = ptr::null_mut();
+            assert_eq!(holt_tree_open_memory(&mut tree), HOLT_OK);
+
+            let key = b"must-not-exist";
+            let value = b"value";
+            let ops = [
+                HoltAtomicOp {
+                    kind: HOLT_ATOMIC_PUT,
+                    key: key.as_ptr(),
+                    key_len: key.len(),
+                    value: value.as_ptr(),
+                    value_len: value.len(),
+                },
+                HoltAtomicOp {
+                    kind: 99,
+                    key: key.as_ptr(),
+                    key_len: key.len(),
+                    value: ptr::null(),
+                    value_len: 0,
+                },
+            ];
+
+            let mut committed = 9;
+            assert_eq!(
+                holt_tree_atomic(tree, ops.as_ptr(), ops.len(), &mut committed),
+                HOLT_ERR
+            );
+            assert_eq!(committed, 9);
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("atomic op 1 has unknown kind 99"));
+
+            let mut record = HoltRecord::default();
+            assert_eq!(
+                holt_tree_get(tree, key.as_ptr(), key.len(), &mut record),
+                HOLT_OK
+            );
+            assert_eq!(record.found, 0);
+
+            assert_eq!(
+                holt_tree_atomic(tree, ptr::null(), 1, &mut committed),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("atomic ops"));
+
+            let delete_with_value = HoltAtomicOp {
+                kind: HOLT_ATOMIC_DELETE,
+                key: key.as_ptr(),
+                key_len: key.len(),
+                value: value.as_ptr(),
+                value_len: value.len(),
+            };
+            assert_eq!(
+                holt_tree_atomic(tree, &delete_with_value, 1, &mut committed),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("atomic delete op 0 has a value"));
             holt_tree_close(tree);
         }
     }

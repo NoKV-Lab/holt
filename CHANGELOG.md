@@ -492,6 +492,11 @@ state-machine mode. It contains breaking API and on-disk changes — see
 - Kept pending-delete cleanup from reclaiming cache and route-resident
   state until the delete has been applied to the inner blob store.
 
+### Added
+
+- Exposed put and delete batches through `holt_tree_atomic` in the C ABI.
+  The wrapper validates every operation before it calls `Tree::atomic`.
+
 ## [0.4.1] — 2026-05-27
 
 ### Added

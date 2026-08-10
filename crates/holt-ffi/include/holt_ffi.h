@@ -22,6 +22,11 @@ enum {
   HOLT_ENTRY_COMMON_PREFIX = 2
 };
 
+enum {
+  HOLT_ATOMIC_PUT = 1,
+  HOLT_ATOMIC_DELETE = 2
+};
+
 typedef struct HoltBytes {
   uint8_t *ptr;
   size_t len;
@@ -40,6 +45,14 @@ typedef struct HoltEntry {
   uint64_t version;
 } HoltEntry;
 
+typedef struct HoltAtomicOp {
+  uint32_t kind;
+  const uint8_t *key;
+  size_t key_len;
+  const uint8_t *value;
+  size_t value_len;
+} HoltAtomicOp;
+
 const char *holt_last_error_message(void);
 
 int32_t holt_tree_open_with_wal_sync(const char *path, uint8_t wal_sync, HoltTree **out);
@@ -52,6 +65,8 @@ int32_t holt_tree_get(HoltTree *tree, const uint8_t *key, size_t key_len,
                       HoltRecord *out);
 int32_t holt_tree_delete(HoltTree *tree, const uint8_t *key, size_t key_len,
                          uint8_t *existed_out);
+int32_t holt_tree_atomic(HoltTree *tree, const HoltAtomicOp *ops, size_t op_count,
+                         uint8_t *committed_out);
 int32_t holt_tree_checkpoint(HoltTree *tree);
 
 int32_t holt_tree_scan_keys(HoltTree *tree, const uint8_t *prefix, size_t prefix_len,

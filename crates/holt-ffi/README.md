@@ -40,6 +40,19 @@ Point operations:
 - `holt_tree_delete(tree, key, key_len, &existed)`
 - `holt_tree_checkpoint(tree)`
 
+Atomic mutations:
+
+- `holt_tree_atomic(tree, ops, op_count, &committed)`
+
+`HoltAtomicOp` supports `HOLT_ATOMIC_PUT` and
+`HOLT_ATOMIC_DELETE`. The function validates the full input array
+before it submits one `Tree::atomic` batch. Holt copies all key and
+value bytes during the call. Operations keep their array order, and
+delete operations require `value_len == 0`.
+
+An empty batch commits successfully. The function writes `committed`
+only when it returns `HOLT_OK`.
+
 Range operations:
 
 - `holt_tree_scan_keys(...)`
@@ -66,10 +79,10 @@ last error.
 
 The ABI exposes the same semantics as Holt's Rust iterators:
 
-- key-only scans use `Tree::scan_keys`;
-- record scans use `Tree::scan`;
-- delimiter values below zero mean "no delimiter";
-- delimiter values `0..=255` enable common-prefix rollup;
+- key-only scans use `Tree::scan_keys`.
+- record scans use `Tree::scan`.
+- delimiter values below zero mean "no delimiter".
+- delimiter values `0..=255` enable common-prefix rollup.
 - `start_after == NULL && start_after_len == 0` means "no marker".
 
 These iterators are restart-on-conflict cursors, not MVCC snapshots.
