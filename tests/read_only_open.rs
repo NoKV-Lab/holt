@@ -122,7 +122,13 @@ fn read_only_database_replays_named_trees_and_rejects_mutations() {
     assert!(matches!(objects.put(b"b", b"etag-b"), Err(Error::ReadOnly)));
     assert!(matches!(db.create_tree("new"), Err(Error::ReadOnly)));
     assert!(matches!(db.drop_tree("objects"), Err(Error::ReadOnly)));
-    assert!(matches!(db.atomic(|_| {}), Err(Error::ReadOnly)));
+    assert!(matches!(
+        db.atomic(|_| {}),
+        Err(Error::Atomic {
+            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+            source,
+        }) if matches!(source.as_ref(), Error::ReadOnly)
+    ));
     assert!(matches!(
         db.install_checkpoint(&image),
         Err(Error::ReadOnly)

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use super::atomic::{BatchOp, RecordVersion};
 use super::checkpoint::{self, CheckpointImage};
 use super::config::TreeConfig;
-use super::errors::{Error, Result};
+use super::errors::{AtomicErrorKind, Error, Result};
 use super::snapshot::Snapshot;
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
 use super::tree::{
@@ -40,6 +40,20 @@ const CATALOG_STATE_DROPPING: u8 = 2;
 const CATALOG_VALUE_LEN: usize = 17;
 const CATALOG_NEXT_ID_LEN: usize = 16;
 const AUTO_GC_BATCH_SIZE: usize = 256;
+
+fn atomic_definitely_not_applied(source: Error) -> Error {
+    Error::Atomic {
+        kind: AtomicErrorKind::DefinitelyNotApplied,
+        source: Box::new(source),
+    }
+}
+
+fn atomic_outcome_unknown(source: Error) -> Error {
+    Error::Atomic {
+        kind: AtomicErrorKind::OutcomeUnknown,
+        source: Box::new(source),
+    }
+}
 
 #[cfg(test)]
 struct OpenTreeCatalogBarrier {
@@ -424,11 +438,20 @@ impl DB {
     /// validates all guards for every touched tree before applying
     /// any mutation; if a guard fails, the method returns `Ok(false)`
     /// and emits no WAL record.
+    ///
+    /// Every error is returned as [`Error::Atomic`].
+    /// [`AtomicErrorKind::DefinitelyNotApplied`] means none of this batch's
+    /// mutations ran, so callers may retry after normal guard revalidation.
+    /// [`AtomicErrorKind::OutcomeUnknown`] means Holt entered the apply path;
+    /// callers must reconcile state instead of retrying blindly. The
+    /// classification applies only to this batch: Holt may flush writes
+    /// acknowledged by earlier calls before it starts the batch.
     pub fn atomic<F>(&self, build: F) -> Result<bool>
     where
         F: FnOnce(&mut DBAtomicBatch),
     {
-        self.ensure_writable()?;
+        self.ensure_writable()
+            .map_err(atomic_definitely_not_applied)?;
         let mut batch = DBAtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
@@ -1048,11 +1071,15 @@ impl DB {
 
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let groups = self.group_batch_ops(pending)?;
+        let groups = self
+            .group_batch_ops(pending)
+            .map_err(atomic_definitely_not_applied)?;
         let count = count_wal_ops(&groups);
         if count != 0 {
             if let Some(journal) = &self.journal {
-                journal.preflight_submit(encoded_db_batch_record_len(&groups))?;
+                journal
+                    .preflight_submit(encoded_db_batch_record_len(&groups))
+                    .map_err(atomic_definitely_not_applied)?;
             }
         }
         let mut gates = groups
@@ -1068,22 +1095,27 @@ impl DB {
         {
             let _commit = self.commit_gate.enter_writer();
             for group in &groups {
-                self.store.flush_write_deltas_for_tree(group.tree_id)?;
+                self.store
+                    .flush_write_deltas_for_tree(group.tree_id)
+                    .map_err(atomic_definitely_not_applied)?;
             }
         }
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
-        if !Self::preflight_batch_groups(&groups, base_seq)? {
+        if !Self::preflight_batch_groups(&groups, base_seq)
+            .map_err(atomic_definitely_not_applied)?
+        {
             return Ok(false);
         }
         if count == 0 {
             return Ok(true);
         }
 
-        if let Some(journal) = &self.journal {
-            self.apply_batch_groups_with_journal(&groups, base_seq, journal)?;
+        let apply = if let Some(journal) = &self.journal {
+            self.apply_batch_groups_with_journal(&groups, base_seq, journal)
         } else {
-            self.apply_batch_groups_in_memory(&groups, base_seq)?;
-        }
+            self.apply_batch_groups_in_memory(&groups, base_seq)
+        };
+        apply.map_err(atomic_outcome_unknown)?;
         Ok(true)
     }
 
@@ -1494,29 +1526,52 @@ fn next_allocated_tree_id(tree_id: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::store::blob_store::{AlignedBlobBuf, MemoryBlobStore};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
-    struct FailFlushOnceStore {
+    struct FailIoStore {
         inner: MemoryBlobStore,
+        fail_read_guids: Mutex<HashSet<BlobGuid>>,
+        last_failed_read: Mutex<Option<BlobGuid>>,
         fail_next_flush: AtomicBool,
     }
 
-    impl FailFlushOnceStore {
+    impl FailIoStore {
         fn new() -> Self {
             Self {
                 inner: MemoryBlobStore::new(),
+                fail_read_guids: Mutex::new(HashSet::new()),
+                last_failed_read: Mutex::new(None),
                 fail_next_flush: AtomicBool::new(false),
             }
         }
+
+        fn arm_read_failures(&self, guids: impl IntoIterator<Item = BlobGuid>) {
+            self.fail_read_guids.lock().unwrap().extend(guids);
+            *self.last_failed_read.lock().unwrap() = None;
+        }
+
+        fn clear_read_failures(&self) {
+            self.fail_read_guids.lock().unwrap().clear();
+        }
+
+        fn take_last_failed_read(&self) -> Option<BlobGuid> {
+            self.last_failed_read.lock().unwrap().take()
+        }
     }
 
-    impl BlobStore for FailFlushOnceStore {
+    impl BlobStore for FailIoStore {
         fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            if self.fail_read_guids.lock().unwrap().contains(&guid) {
+                *self.last_failed_read.lock().unwrap() = Some(guid);
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected blob read failure",
+                )));
+            }
             self.inner.read_blob(guid, dst)
         }
 
@@ -1552,7 +1607,7 @@ mod tests {
 
     #[test]
     fn create_tree_durably_publishes_root_before_live_catalog() {
-        let store = Arc::new(FailFlushOnceStore::new());
+        let store = Arc::new(FailIoStore::new());
         let mut cfg = TreeConfig::memory();
         cfg.checkpoint.enabled = false;
         cfg.memory_flush_on_write = true;
@@ -1589,6 +1644,190 @@ mod tests {
         let final_db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
         let empty = final_db.open_tree("empty").unwrap();
         assert!(empty.get(b"missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn atomic_catalog_error_is_not_applied_and_can_be_retried() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let present = db.create_tree("present").unwrap();
+
+        let error = db
+            .atomic(|batch| {
+                batch.put("present", b"key", b"present-value");
+                batch.put("missing", b"key", b"missing-value");
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            } if matches!(source.as_ref(), Error::TreeNotFound { .. })
+        ));
+        assert!(present.get(b"key").unwrap().is_none());
+
+        let missing = db.create_tree("missing").unwrap();
+        assert!(db
+            .atomic(|batch| {
+                batch.put("present", b"key", b"present-value");
+                batch.put("missing", b"key", b"missing-value");
+            })
+            .unwrap());
+        assert_eq!(
+            present.get(b"key").unwrap().as_deref(),
+            Some(&b"present-value"[..])
+        );
+        assert_eq!(
+            missing.get(b"key").unwrap().as_deref(),
+            Some(&b"missing-value"[..])
+        );
+    }
+
+    #[test]
+    fn atomic_preflight_error_is_not_applied_and_can_be_retried() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+
+        let error = db
+            .atomic(|batch| {
+                batch.put("objects", b"side", b"value");
+                batch.rename("objects", b"source", b"destination", false);
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            } if matches!(source.as_ref(), Error::NotFound)
+        ));
+        assert!(tree.get(b"side").unwrap().is_none());
+        assert!(tree.get(b"destination").unwrap().is_none());
+
+        tree.put(b"source", b"payload").unwrap();
+        assert!(db
+            .atomic(|batch| {
+                batch.put("objects", b"side", b"value");
+                batch.rename("objects", b"source", b"destination", false);
+            })
+            .unwrap());
+        assert_eq!(tree.get(b"side").unwrap().as_deref(), Some(&b"value"[..]));
+        assert_eq!(
+            tree.get(b"destination").unwrap().as_deref(),
+            Some(&b"payload"[..])
+        );
+        assert!(tree.get(b"source").unwrap().is_none());
+    }
+
+    #[test]
+    fn atomic_delta_flush_read_error_is_not_applied_and_can_be_retried() {
+        let store = Arc::new(FailIoStore::new());
+        let mut cfg = TreeConfig::memory();
+        cfg.buffer_pool_size = 32;
+        cfg.checkpoint.enabled = false;
+        cfg.memory_flush_on_write = false;
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+        let old = vec![0x3A; 1024];
+        let keys = (0..1200u32)
+            .map(|i| format!("deferred/{i:08}").into_bytes())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            tree.put(key, &old).unwrap();
+        }
+        db.checkpoint().unwrap();
+
+        let tree_id = db
+            .catalog_lookup_live(b"objects")
+            .unwrap()
+            .expect("created tree id");
+        let root_guid = root_guid_for_tree_id(tree_id);
+        let child_guids = crate::engine::collect_blob_topology_silent(&db.store, root_guid)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| (entry.depth > 0).then_some(entry.guid))
+            .collect::<Vec<_>>();
+        assert!(!child_guids.is_empty(), "test requires a spilled tree");
+        // DB grouping pins the already-resident root. Keeping only its
+        // children cold makes the injected read exclusive to delta flush.
+        for &guid in &child_guids {
+            assert!(
+                db.store.evict_from_cache_for_test(guid),
+                "test child remained pinned"
+            );
+        }
+
+        store.arm_read_failures(child_guids.iter().copied());
+        let target = keys
+            .iter()
+            .find_map(|key| match tree.get(key) {
+                Err(Error::BlobStoreIo(_)) => Some(key.clone()),
+                Ok(Some(_)) => None,
+                other => panic!("unexpected target probe result: {other:?}"),
+            })
+            .expect("no key traversed a cold child");
+        let failed_guid = store
+            .take_last_failed_read()
+            .expect("failed probe did not record its child");
+        store.clear_read_failures();
+        assert!(child_guids.contains(&failed_guid));
+        let seq = db.next_seq.fetch_add(1, Ordering::Relaxed);
+        db.store
+            .stage_write_delta_put(tree_id, root_guid, &target, b"deferred-value", seq, false);
+
+        store.arm_read_failures([failed_guid]);
+        let error = db
+            .atomic(|batch| batch.put("objects", b"atomic-current", b"current-value"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            } if matches!(source.as_ref(), Error::BlobStoreIo(_))
+        ));
+        assert_eq!(store.take_last_failed_read(), Some(failed_guid));
+        store.clear_read_failures();
+        assert!(tree.get(b"atomic-current").unwrap().is_none());
+        assert!(db.store.lookup_write_delta(tree_id, &target).is_some());
+
+        assert!(db
+            .atomic(|batch| batch.put("objects", b"atomic-current", b"current-value"))
+            .unwrap());
+        assert!(db.store.lookup_write_delta(tree_id, &target).is_none());
+        assert_eq!(
+            tree.get(&target).unwrap().as_deref(),
+            Some(&b"deferred-value"[..])
+        );
+        assert_eq!(
+            tree.get(b"atomic-current").unwrap().as_deref(),
+            Some(&b"current-value"[..])
+        );
+    }
+
+    #[test]
+    fn atomic_post_apply_failure_has_unknown_outcome() {
+        let store = Arc::new(FailIoStore::new());
+        let mut cfg = TreeConfig::memory();
+        cfg.checkpoint.enabled = false;
+        cfg.memory_flush_on_write = true;
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+
+        store.fail_next_flush.store(true, AtomicOrdering::Release);
+        let error = db
+            .atomic(|batch| batch.put("objects", b"key", b"value"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::OutcomeUnknown,
+                source,
+            } if matches!(source.as_ref(), Error::BlobStoreIo(_))
+        ));
+        assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
     }
 
     #[test]

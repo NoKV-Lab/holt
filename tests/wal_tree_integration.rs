@@ -1046,7 +1046,13 @@ fn oversized_db_atomic_record_fails_before_publish_or_seq_reservation() {
     assert!(
         matches!(
             err,
-            holt::Error::Internal("journal record exceeds WAL ring capacity")
+            holt::Error::Atomic {
+                kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+                ref source,
+            } if matches!(
+                source.as_ref(),
+                holt::Error::Internal("journal record exceeds WAL ring capacity")
+            )
         ),
         "expected the WAL record limit, got {err:?}",
     );

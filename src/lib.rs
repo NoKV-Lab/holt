@@ -40,9 +40,9 @@
 //! ## Module map
 //!
 //! The supported import surface is the flat crate root:
-//! [`Tree`], [`DB`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
-//! [`RecordVersion`], [`View`], [`Snapshot`], [`KeyPathBuf`], [`KeyPrefixBuf`],
-//! range iterator types, stats snapshots, and the optional
+//! [`Tree`], [`DB`], [`TreeBuilder`], [`AtomicBatch`], [`AtomicErrorKind`],
+//! [`Record`], [`RecordVersion`], [`View`], [`Snapshot`], [`KeyPathBuf`],
+//! [`KeyPrefixBuf`], range iterator types, stats snapshots, and the optional
 //! `metrics` renderer.
 //!
 //! All implementation modules are crate-private. This keeps the
@@ -158,7 +158,7 @@ pub use api::builder::TreeBuilder;
 pub use api::checkpoint::CheckpointImage;
 pub use api::config::{AccessMode, Durability, Storage, TreeConfig};
 pub use api::db::{DBAtomicBatch, DBView, DB};
-pub use api::errors::{Error, Result};
+pub use api::errors::{AtomicErrorKind, Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::snapshot::Snapshot;
 pub use api::tree::{PutOutcome, Tree};
