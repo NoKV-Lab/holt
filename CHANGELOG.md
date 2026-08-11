@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-08-11
+
 ### Added
 
 - `DB::atomic` now wraps failures in `Error::Atomic` with an
