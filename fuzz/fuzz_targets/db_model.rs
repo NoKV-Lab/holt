@@ -767,9 +767,27 @@ fuzz_target!(|ops: Ops| {
                 match (got, expected) {
                     (Ok(true), Ok(staged)) => model = staged,
                     (Ok(false), Err(ModelErr::GuardFailed)) => {}
-                    (Err(holt::Error::TreeNotFound { .. }), Err(ModelErr::TreeNotFound)) => {}
-                    (Err(holt::Error::NotFound), Err(ModelErr::NotFound)) => {}
-                    (Err(holt::Error::DstExists), Err(ModelErr::DstExists)) => {}
+                    (
+                        Err(holt::Error::Atomic {
+                            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+                            source,
+                        }),
+                        Err(ModelErr::TreeNotFound),
+                    ) if matches!(source.as_ref(), holt::Error::TreeNotFound { .. }) => {}
+                    (
+                        Err(holt::Error::Atomic {
+                            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+                            source,
+                        }),
+                        Err(ModelErr::NotFound),
+                    ) if matches!(source.as_ref(), holt::Error::NotFound) => {}
+                    (
+                        Err(holt::Error::Atomic {
+                            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+                            source,
+                        }),
+                        Err(ModelErr::DstExists),
+                    ) if matches!(source.as_ref(), holt::Error::DstExists) => {}
                     (got, expected) => panic!(
                         "atomic result mismatch: db={got:?}, model={expected:?}, batch={batch:?}",
                     ),

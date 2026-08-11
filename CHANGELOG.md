@@ -11,6 +11,10 @@ fine-grained per-commit history is in `git log`.
 
 ### Added
 
+- `DB::atomic` now wraps failures in `Error::Atomic` with an
+  `AtomicErrorKind` of `DefinitelyNotApplied` before its first batch mutation
+  or `OutcomeUnknown` after apply begins. The method keeps its existing
+  signature.
 - Exposed put and delete batches through `holt_tree_atomic` in the C ABI.
   The wrapper validates every operation before it calls `Tree::atomic`.
 - Added existing-only read-only opens through `AccessMode`,

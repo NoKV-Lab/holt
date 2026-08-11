@@ -112,7 +112,10 @@ fn db_atomic_commits_and_aborts_across_trees() {
         db.atomic(|batch| {
             batch.put("missing", b"k", b"v");
         }),
-        Err(holt::Error::TreeNotFound { .. })
+        Err(holt::Error::Atomic {
+            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+            source,
+        }) if matches!(source.as_ref(), holt::Error::TreeNotFound { .. })
     ));
 
     assert!(db
@@ -276,7 +279,10 @@ fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
         db.atomic(|batch| {
             batch.put("objects", b"bucket/b", b"etag-b");
         }),
-        Err(holt::Error::TreeNotFound { .. })
+        Err(holt::Error::Atomic {
+            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+            source,
+        }) if matches!(source.as_ref(), holt::Error::TreeNotFound { .. })
     ));
     assert!(matches!(
         objects.put(b"bucket/b", b"etag-b"),

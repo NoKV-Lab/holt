@@ -6,6 +6,25 @@ use crate::store::{AllocError, FreeError};
 /// Result alias used throughout the crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Whether a failed [`crate::DB::atomic`] call may have applied its batch.
+///
+/// The classification describes only the batch passed to that call. Holt may
+/// flush writes acknowledged by earlier calls before it starts the new batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AtomicErrorKind {
+    /// The failed batch did not apply any of its mutations.
+    ///
+    /// The caller may retry it, subject to normal guard revalidation and any
+    /// concurrent changes made after the failed attempt.
+    DefinitelyNotApplied,
+    /// Holt crossed the batch mutation boundary before the failure.
+    ///
+    /// The batch may be fully applied, partly applied in the live process, or
+    /// absent after recovery. The caller must not retry it blindly.
+    OutcomeUnknown,
+}
+
 pub(crate) fn is_blob_store_not_found(error: &Error) -> bool {
     matches!(
         error,
@@ -51,6 +70,16 @@ pub enum Error {
     /// problem). The static string names the specific invariant
     /// for triage.
     Internal(&'static str),
+    /// A classified failure from [`crate::DB::atomic`].
+    ///
+    /// `kind` states whether the requested batch may have applied. `source`
+    /// retains the underlying validation, storage, walker, or journal error.
+    Atomic {
+        /// Commit-boundary classification for the failed batch.
+        kind: AtomicErrorKind,
+        /// Underlying Holt error.
+        source: Box<Error>,
+    },
     /// A blob's slot table or header is corrupt — recovery
     /// should bail out rather than silently misbehave.
     ///
@@ -182,6 +211,14 @@ impl std::fmt::Display for Error {
             }
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
             Self::Internal(what) => write!(f, "internal invariant violated: {what}"),
+            Self::Atomic { kind, source } => match kind {
+                AtomicErrorKind::DefinitelyNotApplied => {
+                    write!(f, "atomic batch definitely not applied: {source}")
+                }
+                AtomicErrorKind::OutcomeUnknown => {
+                    write!(f, "atomic batch outcome unknown: {source}")
+                }
+            },
             Self::NodeCorrupt {
                 context,
                 blob_guid,
@@ -239,6 +276,7 @@ impl std::error::Error for Error {
             Self::BlobStoreIo(e) => Some(e),
             Self::Alloc(e) => Some(e),
             Self::Free(e) => Some(e),
+            Self::Atomic { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -303,6 +341,24 @@ mod tests {
                 "internal invariant violated: lost dirty image",
             ),
             (
+                Error::Atomic {
+                    kind: AtomicErrorKind::DefinitelyNotApplied,
+                    source: Box::new(Error::TreeNotFound {
+                        name: "objects".to_owned(),
+                    }),
+                }
+                .to_string(),
+                "atomic batch definitely not applied: DB tree not found: objects",
+            ),
+            (
+                Error::Atomic {
+                    kind: AtomicErrorKind::OutcomeUnknown,
+                    source: Box::new(Error::Internal("journal acknowledgement lost")),
+                }
+                .to_string(),
+                "atomic batch outcome unknown: internal invariant violated: journal acknowledgement lost",
+            ),
+            (
                 Error::ReplaySanityFailed {
                     context: "bad CRC",
                     record_offset: 42,
@@ -361,6 +417,15 @@ mod tests {
         let free = Error::from(FreeError::InvalidSlot(99));
         assert!(free.source().is_some());
         assert_eq!(free.to_string(), "free: free_node: invalid slot index 99");
+
+        let atomic = Error::Atomic {
+            kind: AtomicErrorKind::DefinitelyNotApplied,
+            source: Box::new(Error::NotFound),
+        };
+        assert_eq!(
+            atomic.source().unwrap().to_string(),
+            Error::NotFound.to_string()
+        );
 
         assert!(Error::NotFound.source().is_none());
         assert!(Error::DstExists.source().is_none());
