@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "holt"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
