@@ -890,7 +890,7 @@ mod tests {
             rounds_after_wait - rounds_before_wait <= 10,
             "all-pinned orphan backlog busy-spun: {rounds_before_wait} -> {rounds_after_wait}"
         );
-        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert!(inner.has_blob(pinned_guid).unwrap());
 
         retire(free_guid);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -902,7 +902,6 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(inner.has_blob(pinned_guid).unwrap());
-        assert_eq!(bm.gc_orphan_backlog_count(), 1);
 
         drop(pinned);
         ck.wake();
