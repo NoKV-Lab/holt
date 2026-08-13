@@ -530,9 +530,13 @@ struct BudgetNode {
 /// Mirrors filter-mode `clone_subtree` arm-for-arm and
 /// `pack_inner_node`'s tier collapse, so the totals are EXACT. Returns
 /// `None` when the whole subtree filters away (matches `clone_subtree`
-/// returning `None`). `EmptyRoot` reports 0 routing bytes so the caller
-/// keeps the empty / bare-leaf-root degenerate cases in the legacy
-/// layout.
+/// returning `None`). An `EmptyRoot` is charged at its actual emitted
+/// size. Although it normally appears only as an empty blob's root,
+/// preserve-mode child-blob merge can leave a reachable `EmptyRoot`
+/// below an inner node in the parent. Filter-mode cloning preserves that
+/// sentinel, so pass 0 must count it like every other internal node.
+/// [`routing_geometry`] still keeps an entirely empty tree in the legacy
+/// layout because its surviving-leaf byte count is zero.
 ///
 /// **Keep in lockstep with `clone_subtree` (below) and
 /// `pack_inner_node`.**
@@ -548,10 +552,13 @@ fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNo
         NodeType::Invalid => Err(Error::node_corrupt(
             "routing_budget: NodeType::Invalid in source",
         )),
-        // EmptyRoot is only ever the root of an empty tree; report 0
-        // routing bytes so the caller steers it to the legacy layout.
+        // Preserve-mode merge of an empty child blob can make an EmptyRoot
+        // reachable below an inner node. `clone_subtree` allocates an
+        // 8-byte sentinel for every such node even in filter mode, so count
+        // it exactly. An entirely empty tree remains legacy because it has
+        // no surviving leaf bytes.
         NodeType::EmptyRoot => Ok(Some(BudgetNode {
-            routing_bytes: 0,
+            routing_bytes: size_of_node(NodeType::EmptyRoot),
             leaf_bytes: 0,
         })),
         NodeType::Leaf => {

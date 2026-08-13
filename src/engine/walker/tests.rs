@@ -16,9 +16,13 @@ use super::types::LookupResult;
 use super::writers::write_struct_at;
 use super::SearchKey;
 use crate::api::errors::Error;
-use crate::layout::{BlobGuid, BlobNode, NodeType, DATA_AREA_START, PAGE_SIZE};
+use crate::layout::{
+    size_of_node, BlobGuid, BlobNode, Node256, NodeType, Prefix, DATA_AREA_START, PAGE_SIZE,
+};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
-use crate::store::{decode_child_off, page_align_up, BlobFrame, BlobFrameRef, BufferManager};
+use crate::store::{
+    decode_child_off, encode_child_off, page_align_up, BlobFrame, BlobFrameRef, BufferManager,
+};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1367,6 +1371,126 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
     }
 }
 
+/// Empty child blobs can be folded into a non-root edge by the preserve-mode
+/// merge path. The resulting reachable `EmptyRoot` sentinels are valid and
+/// filter-mode compaction preserves them. Pass-0 routing measurement must
+/// therefore charge every sentinel's emitted 8 bytes, not only the fresh
+/// destination frame's root sentinel.
+///
+/// The node counts are chosen so the old under-count put the measured arena
+/// 40 bytes below a page boundary while the 163 omitted sentinels put the
+/// actual arena 40 bytes past it. This is the smallest deterministic form of
+/// the History-prune/merge/compact failure seen with deep application keys.
+fn blob_with_reachable_empty_roots(empty_children: usize, prefix_wrapped: usize) -> AlignedBlobBuf {
+    assert!((1..200).contains(&empty_children));
+    assert!(prefix_wrapped <= empty_children);
+    let (buf_vec, _) = fresh_blob();
+    let mut buf = aligned_from_vec(&buf_vec);
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+
+        // One substantial live leaf makes the blob eligible for the routed
+        // layout. Its leading byte occupies a branch outside the synthetic
+        // empty-child range below.
+        let live_key = [200u8, b'l'];
+        put(&mut frame, &live_key, &vec![0xA5; 16 * 1024], 1);
+        let live_leaf_off = root_off(&frame);
+
+        let mut children = [0u16; 256];
+        for (branch, child) in children.iter_mut().enumerate().take(empty_children) {
+            let out = frame.alloc_node(NodeType::EmptyRoot).unwrap();
+            let empty_off = frame.offset_of_slot(out.slot).unwrap();
+            frame.bytes_at_mut(empty_off, 8).unwrap()[1] = NodeType::EmptyRoot.as_u8();
+
+            let child_off = if branch < prefix_wrapped {
+                let out = frame.alloc_node(NodeType::Prefix).unwrap();
+                let prefix_off = frame.offset_of_slot(out.slot).unwrap();
+                let prefix = Prefix::new(b"p", u32::from(encode_child_off(empty_off)));
+                write_struct_at(&mut frame, prefix_off, &prefix).unwrap();
+                prefix_off
+            } else {
+                empty_off
+            };
+            *child = encode_child_off(child_off);
+        }
+        children[live_key[0] as usize] = encode_child_off(live_leaf_off);
+
+        let out = frame.alloc_node(NodeType::Node256).unwrap();
+        let root = frame.offset_of_slot(out.slot).unwrap();
+        let mut node = Node256::empty();
+        node.count = (empty_children + 1) as u8;
+        node.children = children;
+        write_struct_at(&mut frame, root, &node).unwrap();
+        frame.header_mut().root_slot = encode_child_off(root);
+    }
+    buf
+}
+
+#[test]
+fn routed_compaction_counts_reachable_empty_roots_below_inner_nodes() {
+    const EMPTY_CHILDREN: usize = 163;
+    const PREFIX_WRAPPED: usize = 18;
+
+    let mut buf = blob_with_reachable_empty_roots(EMPTY_CHILDREN, PREFIX_WRAPPED);
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert!(
+        frame.header().routing_len != 0,
+        "substantial live leaf should produce a routed compacted blob"
+    );
+    assert_routing_layout(&frame);
+    assert_eq!(get(&frame, &[200, b'l']), Some(vec![0xA5; 16 * 1024]));
+    for branch in 0..EMPTY_CHILDREN as u8 {
+        assert_eq!(get(&frame, &[branch, b'p']), None, "branch {branch}");
+    }
+}
+
+#[test]
+fn routed_compaction_handles_144_byte_binary_expanded_keys_after_churn() {
+    const ROWS: u128 = 320;
+    const ROOT_PREFIX: [u8; 16] = [0x52; 16];
+
+    let (buf_vec, _) = fresh_blob();
+    let mut buf = aligned_from_vec(&buf_vec);
+    let mut oracle = BTreeMap::new();
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        for i in 0..ROWS {
+            // Multiplication by an odd constant is bijective modulo 2^128,
+            // so all expanded request-id suffixes remain distinct.
+            let bits = i
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15_D1B5_4A32_D192_ED03)
+                .wrapping_add(0xA076_1D64_78BD_642F_E703_7ED1_A0B4_28DB);
+            let mut key = ROOT_PREFIX.to_vec();
+            key.extend((0..128).rev().map(|bit| b'0' + ((bits >> bit) & 1) as u8));
+            let value = vec![i as u8; 48];
+            put(&mut frame, &key, &value, i as u64 + 1);
+            oracle.insert(key, value);
+        }
+        for i in (0..ROWS).step_by(3) {
+            let bits = i
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15_D1B5_4A32_D192_ED03)
+                .wrapping_add(0xA076_1D64_78BD_642F_E703_7ED1_A0B4_28DB);
+            let mut key = ROOT_PREFIX.to_vec();
+            key.extend((0..128).rev().map(|bit| b'0' + ((bits >> bit) & 1) as u8));
+            let root = frame.header().root_slot;
+            erase(&mut frame, root, &key).unwrap();
+            oracle.remove(&key);
+        }
+    }
+
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert!(
+        frame.header().routing_len != 0,
+        "deep-key blob should route"
+    );
+    assert_routing_layout(&frame);
+    for (key, value) in oracle {
+        assert_eq!(get(&frame, &key).as_deref(), Some(value.as_slice()));
+    }
+}
+
 /// Walk every node reachable from the root and assert the routing
 /// invariant: a child classifies as internal-vs-leaf purely from
 /// `off < leaf_region_start`, and that classification agrees with the
@@ -1959,6 +2083,36 @@ proptest! {
                 prop_assert_eq!(got, oracle.get(&k).cloned());
             }
         }
+    }
+
+    /// Preserve-mode merge may leave any number of reachable empty child
+    /// sentinels, optionally below Prefix nodes. For every generated shape,
+    /// pass-0's byte budget must exactly match the arena emitted by the
+    /// filter-mode clone, including the fresh destination sentinel.
+    #[test]
+    fn routed_budget_is_exact_with_reachable_empty_roots(
+        empty_children in 1usize..190,
+        prefix_seed in 0usize..190,
+    ) {
+        let prefix_wrapped = prefix_seed % (empty_children + 1);
+        let mut buf = blob_with_reachable_empty_roots(empty_children, prefix_wrapped);
+        compact_blob(&mut buf).unwrap();
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert_routing_layout(&frame);
+
+        let survivors = empty_children + 1; // empty branches + live leaf
+        let root_size = match survivors {
+            2..=4 => size_of_node(NodeType::Node4),
+            5..=16 => size_of_node(NodeType::Node16),
+            17..=48 => size_of_node(NodeType::Node48),
+            _ => size_of_node(NodeType::Node256),
+        };
+        let expected_routing_len = size_of_node(NodeType::EmptyRoot)
+            + root_size
+            + empty_children as u32 * size_of_node(NodeType::EmptyRoot)
+            + prefix_wrapped as u32 * size_of_node(NodeType::Prefix);
+        prop_assert_eq!(frame.header().routing_len, expected_routing_len);
+        prop_assert_eq!(get(&frame, &[200, b'l']), Some(vec![0xA5; 16 * 1024]));
     }
 }
 
