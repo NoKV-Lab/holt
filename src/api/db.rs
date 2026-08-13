@@ -15,6 +15,9 @@ use super::atomic::{BatchOp, RecordVersion};
 use super::checkpoint::{self, CheckpointImage};
 use super::config::TreeConfig;
 use super::errors::{AtomicErrorKind, Error, Result};
+use super::journal::{
+    JournalAnchor, JournalEnvelope, JournalEnvelopePage, JournalState, VolatileJournal,
+};
 use super::snapshot::Snapshot;
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
 use super::tree::{
@@ -159,6 +162,7 @@ pub struct DB {
     next_seq: Arc<AtomicU64>,
     commit_gate: Arc<CommitGate>,
     journal: Option<Arc<Journal>>,
+    volatile_journal: Option<Arc<VolatileJournal>>,
     checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
     open_stats: OpenStats,
     trees: Arc<Mutex<HashMap<u64, OpenTree>>>,
@@ -206,6 +210,9 @@ impl DB {
                         replay_wal(&path, &bm, !cfg.is_read_only(), |tree_id| {
                             Ok(root_guid_for_tree_id(tree_id))
                         })?;
+                    if cfg.is_read_only() {
+                        crate::journal::reader::validate_attached_journal(&path)?;
+                    }
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -226,6 +233,8 @@ impl DB {
             _ => (None, 1),
         };
 
+        let volatile_journal =
+            (cfg.is_memory() && !cfg.is_read_only()).then(|| Arc::new(VolatileJournal::new()));
         let maintenance_gate = Arc::new(Gate::new());
         let commit_gate = Arc::new(CommitGate::new());
         let mut db = Self {
@@ -235,6 +244,7 @@ impl DB {
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             commit_gate,
             journal,
+            volatile_journal,
             checkpointer: None,
             open_stats,
             trees: Arc::new(Mutex::new(HashMap::new())),
@@ -254,9 +264,10 @@ impl DB {
         db.checkpointer = if db.cfg.is_read_only() {
             None
         } else {
-            crate::checkpoint::Checkpointer::spawn(
+            crate::checkpoint::Checkpointer::spawn_with_volatile(
                 Arc::clone(&db.store),
                 db.journal.clone(),
+                db.volatile_journal.clone(),
                 Arc::clone(&db.maintenance_gate),
                 Arc::clone(&db.commit_gate),
                 db.cfg.checkpoint.clone(),
@@ -274,6 +285,16 @@ impl DB {
         }
     }
 
+    fn ensure_ordinary_writes_allowed(&self) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.ensure_ordinary_writes_allowed()?;
+        }
+        if let Some(journal) = &self.volatile_journal {
+            journal.ensure_ordinary_writes_allowed()?;
+        }
+        Ok(())
+    }
+
     /// Create a named tree inside this DB.
     ///
     /// Creation is recorded in the internal catalog before the
@@ -283,6 +304,7 @@ impl DB {
         self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.ensure_ordinary_writes_allowed()?;
         if self.catalog_entry(name_bytes)?.is_some() {
             return Err(Error::TreeExists {
                 name: name.to_owned(),
@@ -399,6 +421,7 @@ impl DB {
         self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.ensure_ordinary_writes_allowed()?;
         let entry = match self.catalog_entry(name_bytes)? {
             Some(entry) if entry.state == CatalogState::Live => entry,
             Some(_) | None => {
@@ -458,6 +481,155 @@ impl DB {
             return Ok(true);
         }
         self.apply_atomic(batch.pending)
+    }
+
+    /// Initialize the application recovery stream at one durable anchor.
+    ///
+    /// A file-backed DB stores the anchor in its WAL header. A memory DB keeps
+    /// the stream only for that DB's process lifetime. In both profiles the DB
+    /// must be writable and cleanly checkpointed before first initialization.
+    /// An exact retry with the same anchor succeeds; a different anchor fails
+    /// closed.
+    pub fn initialize_journal_stream(&self, genesis: JournalAnchor) -> Result<()> {
+        self.ensure_writable()?;
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _commit = self.commit_gate.enter_checkpoint();
+
+        if let Some(journal) = &self.journal {
+            if journal.state().is_some() {
+                return journal.initialize_anchor(genesis);
+            }
+        } else if let Some(journal) = &self.volatile_journal {
+            if journal.state().is_some() {
+                return journal.initialize(genesis);
+            }
+        } else {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "file-backed WAL or memory storage is required",
+            });
+        }
+
+        if self
+            .catalog_entries_unlocked()?
+            .iter()
+            .any(|(_, entry)| entry.state == CatalogState::Dropping)
+        {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "dropping trees must be finalized before stream initialization",
+            });
+        }
+
+        if self.store.dirty_count() != 0
+            || self.store.flushing_count() != 0
+            || self.store.pending_delete_count() != 0
+            || self.store.orphan_staging_count() != 0
+            || self.store.write_delta_count() != 0
+            || self.store.needs_flush()
+            || self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.needs_checkpoint())
+        {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "database must be cleanly checkpointed before stream initialization",
+            });
+        }
+        if let Some(journal) = &self.journal {
+            journal.initialize_anchor(genesis)
+        } else {
+            self.volatile_journal
+                .as_ref()
+                .expect("memory journal checked above")
+                .initialize(genesis)
+        }
+    }
+
+    /// Return the checkpoint floor and current attached-stream tail.
+    pub fn journal_state(&self) -> Result<JournalState> {
+        if self.cfg.is_read_only() {
+            let path = self.cfg.wal_path().ok_or(Error::JournalStreamUnavailable {
+                reason: "file-backed WAL or memory storage is required",
+            })?;
+            return crate::journal::reader::attached_journal_state(&path);
+        }
+        let _commit = self.commit_gate.enter_checkpoint();
+        let state = if let Some(journal) = &self.journal {
+            journal.state()
+        } else if let Some(journal) = &self.volatile_journal {
+            journal.state()
+        } else {
+            None
+        };
+        state.ok_or(Error::JournalStreamUnavailable {
+            reason: "stream has not been initialized",
+        })
+    }
+
+    /// Read a bounded page of retained recovery envelopes after `cursor`.
+    ///
+    /// A cursor before the local checkpoint floor returns
+    /// [`Error::JournalPositionExpired`]. This local API does not imply remote
+    /// or shared-log retention. `row_limit` must be non-zero.
+    /// `payload_byte_limit` is a soft boundary over payload bytes: the first
+    /// retained envelope is returned even when its payload exceeds the limit,
+    /// including a zero-byte limit.
+    pub fn journal_envelopes_after(
+        &self,
+        cursor: JournalAnchor,
+        row_limit: usize,
+        payload_byte_limit: usize,
+    ) -> Result<JournalEnvelopePage> {
+        if self.cfg.is_read_only() {
+            let path = self.cfg.wal_path().ok_or(Error::JournalStreamUnavailable {
+                reason: "file-backed WAL or memory storage is required",
+            })?;
+            return crate::journal::reader::scan_attached_envelope_page(
+                &path,
+                cursor,
+                row_limit,
+                payload_byte_limit,
+            );
+        }
+        // Stabilize both the committed ring prefix and checkpoint truncation
+        // for the complete scan. Journal then flushes that prefix before it
+        // opens the WAL file.
+        let _commit = self.commit_gate.enter_checkpoint();
+        if let Some(journal) = &self.journal {
+            journal.envelopes_after(cursor, row_limit, payload_byte_limit)
+        } else if let Some(journal) = &self.volatile_journal {
+            journal.envelopes_after(cursor, row_limit, payload_byte_limit)
+        } else {
+            Err(Error::JournalStreamUnavailable {
+                reason: "file-backed WAL or memory storage is required",
+            })
+        }
+    }
+
+    /// Apply one guarded DB batch and attach canonical application recovery
+    /// bytes to the same WAL record.
+    ///
+    /// Holt validates the caller's previous anchor before any mutation. A
+    /// failed batch guard returns `Ok(false)` without emitting an envelope.
+    /// Every error uses the same definitely-not-applied versus outcome-unknown
+    /// boundary as [`Self::atomic`].
+    pub fn atomic_with_journal_envelope<F>(
+        &self,
+        envelope: JournalEnvelope,
+        build: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut DBAtomicBatch),
+    {
+        self.ensure_writable()
+            .map_err(atomic_definitely_not_applied)?;
+        let mut batch = DBAtomicBatch::default();
+        build(&mut batch);
+        if batch.pending.is_empty() {
+            return Err(atomic_definitely_not_applied(Error::Internal(
+                "attached journal batch must mutate database state",
+            )));
+        }
+        self.apply_atomic_with_journal_envelope(batch.pending, envelope)
     }
 
     /// Run a read-only transaction over explicit tree/prefix scopes.
@@ -622,6 +794,7 @@ impl DB {
     /// Holt does not yet provide online replacement of a live DB image.
     pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<()> {
         self.ensure_writable()?;
+        self.ensure_ordinary_writes_allowed()?;
         let decoded = checkpoint::decode(image.as_bytes())?;
         for (name, kv) in &decoded.families {
             let name = std::str::from_utf8(name)
@@ -661,6 +834,20 @@ impl DB {
                 &self.maintenance_gate,
                 &self.commit_gate,
             )?;
+        }
+        if let Some(journal) = &self.volatile_journal {
+            // Bind the volatile floor to an exact clean in-memory store image.
+            // The earlier DB maintenance passes release their gates between
+            // phases, so a writer could otherwise land after the last flush
+            // but before this floor advance.
+            let _maintenance = self.maintenance_gate.enter_exclusive();
+            Tree::checkpoint_shared_store_with_maintenance_held(
+                &self.store,
+                None,
+                &self.commit_gate,
+            )?;
+            let _commit = self.commit_gate.enter_checkpoint();
+            journal.checkpoint();
         }
         Ok(())
     }
@@ -1064,6 +1251,7 @@ impl DB {
             Arc::clone(&self.next_seq),
             Arc::clone(&self.commit_gate),
             self.journal.clone(),
+            self.volatile_journal.clone(),
             self.checkpointer.clone(),
             self.open_stats,
         )
@@ -1071,6 +1259,8 @@ impl DB {
 
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_ordinary_writes_allowed()
+            .map_err(atomic_definitely_not_applied)?;
         let groups = self
             .group_batch_ops(pending)
             .map_err(atomic_definitely_not_applied)?;
@@ -1116,6 +1306,107 @@ impl DB {
             self.apply_batch_groups_in_memory(&groups, base_seq)
         };
         apply.map_err(atomic_outcome_unknown)?;
+        Ok(true)
+    }
+
+    fn apply_atomic_with_journal_envelope(
+        &self,
+        pending: Vec<DBBatchOp>,
+        envelope: JournalEnvelope,
+    ) -> Result<bool> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        if self.journal.is_none() && self.volatile_journal.is_none() {
+            return Err(atomic_definitely_not_applied(
+                Error::JournalStreamUnavailable {
+                    reason: "file-backed WAL or memory storage is required",
+                },
+            ));
+        }
+        let groups = self
+            .group_batch_ops(pending)
+            .map_err(atomic_definitely_not_applied)?;
+        let count = count_wal_ops(&groups);
+        if count == 0 {
+            return Err(atomic_definitely_not_applied(Error::Internal(
+                "attached journal batch must contain a mutation",
+            )));
+        }
+        let record_len = encoded_db_batch_record_len(&groups)
+            .checked_add(encoded_journal_envelope_len(&envelope))
+            .ok_or_else(|| {
+                atomic_definitely_not_applied(Error::Internal(
+                    "attached journal record length overflow",
+                ))
+            })?;
+        let mut gates = groups
+            .iter()
+            .map(|group| (group.tree_id, group.tree.mutation_gate()))
+            .collect::<Vec<_>>();
+        gates.sort_by_key(|(tree_id, _)| *tree_id);
+        gates.dedup_by_key(|(tree_id, _)| *tree_id);
+        let _tree_guards = gates
+            .iter()
+            .map(|(_, gate)| gate.enter_batch())
+            .collect::<Vec<_>>();
+        {
+            let _commit = self.commit_gate.enter_writer();
+            for group in &groups {
+                self.store
+                    .flush_write_deltas_for_tree(group.tree_id)
+                    .map_err(atomic_definitely_not_applied)?;
+            }
+        }
+        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
+        if !Self::preflight_batch_groups(&groups, base_seq)
+            .map_err(atomic_definitely_not_applied)?
+        {
+            return Ok(false);
+        }
+
+        if let Some(journal) = &self.journal {
+            // Lock order is commit gate -> attached-tail gate. Checkpoint takes
+            // the commit gate exclusively before it snapshots the tail, so the
+            // reverse order would deadlock a writer against WAL truncation.
+            let ack = {
+                let _commit = self.commit_gate.enter_writer();
+                let append = journal
+                    .begin_attached(envelope.previous(), record_len)
+                    .map_err(atomic_definitely_not_applied)?;
+                self.apply_batch_groups_with_attached_journal(
+                    &groups, base_seq, append, &envelope, record_len,
+                )
+                .map_err(atomic_outcome_unknown)?
+            };
+            if let Some(ack) = ack {
+                ack.wait().map_err(atomic_outcome_unknown)?;
+            }
+        } else {
+            let journal = self.volatile_journal.as_ref().ok_or_else(|| {
+                atomic_definitely_not_applied(Error::JournalStreamUnavailable {
+                    reason: "memory stream is unavailable",
+                })
+            })?;
+            {
+                let _commit = self.commit_gate.enter_writer();
+                let append = journal
+                    .begin_attached(envelope.previous(), record_len)
+                    .map_err(atomic_definitely_not_applied)?;
+                let mut group_base = base_seq;
+                for group in &groups {
+                    group
+                        .tree
+                        .apply_batch_walker_inline(&group.ops, group_base, None)
+                        .map_err(atomic_outcome_unknown)?;
+                    group_base += count_group_wal_ops(group);
+                }
+                append.submit(envelope).map_err(atomic_outcome_unknown)?;
+            }
+            if self.cfg.memory_flush_on_write {
+                if let Some(group) = groups.first() {
+                    group.tree.flush_inline().map_err(atomic_outcome_unknown)?;
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -1185,6 +1476,27 @@ impl DB {
         Ok(())
     }
 
+    fn apply_batch_groups_with_attached_journal(
+        &self,
+        groups: &[DBBatchGroup],
+        base_seq: u64,
+        append: crate::journal::JournalAppendGuard<'_>,
+        envelope: &JournalEnvelope,
+        record_len: usize,
+    ) -> Result<Option<crate::journal::JournalAck>> {
+        let mut record = append.record_buffer(record_len);
+        let mut enc = BatchEncoder::begin_with_envelope(&mut record, base_seq, 0, envelope);
+        let mut group_base = base_seq;
+        for group in groups {
+            group
+                .tree
+                .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
+            group_base += count_group_wal_ops(group);
+        }
+        let _n = enc.finish();
+        append.submit(record, envelope, self.cfg.durability.wal_sync())
+    }
+
     fn apply_batch_groups_in_memory(&self, groups: &[DBBatchGroup], base_seq: u64) -> Result<()> {
         let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
         let mut group_base = base_seq;
@@ -1204,6 +1516,7 @@ impl DB {
     }
 
     fn apply_system_batch_unlocked(&self, tree_id: u64, ops: Vec<BatchOp>) -> Result<u64> {
+        self.ensure_ordinary_writes_allowed()?;
         let open = {
             let mut trees = self.trees.lock().unwrap();
             if let Some(open) = trees.get(&tree_id) {
@@ -1429,6 +1742,15 @@ fn encoded_db_batch_record_len(groups: &[DBBatchGroup]) -> usize {
     len + crate::journal::codec::RECORD_FOOTER_SIZE
 }
 
+fn encoded_journal_envelope_len(envelope: &JournalEnvelope) -> usize {
+    1 + 8
+        + super::journal::JOURNAL_DIGEST_BYTES
+        + 8
+        + super::journal::JOURNAL_DIGEST_BYTES
+        + 4
+        + envelope.payload().len()
+}
+
 fn count_wal_ops(groups: &[DBBatchGroup]) -> u64 {
     groups.iter().map(count_group_wal_ops).sum::<u64>()
 }
@@ -1528,7 +1850,7 @@ mod tests {
     use crate::store::blob_store::{AlignedBlobBuf, MemoryBlobStore};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Condvar};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -1603,6 +1925,802 @@ mod tests {
         fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
             self.inner.has_blob(guid)
         }
+    }
+
+    #[derive(Default)]
+    struct BlockingCheckpointState {
+        armed: bool,
+        entered: bool,
+        released: bool,
+    }
+
+    struct BlockingCheckpointStore {
+        inner: MemoryBlobStore,
+        state: Mutex<BlockingCheckpointState>,
+        wake: Condvar,
+    }
+
+    impl BlockingCheckpointStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                state: Mutex::new(BlockingCheckpointState::default()),
+                wake: Condvar::new(),
+            }
+        }
+
+        fn arm(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.armed = true;
+            state.entered = false;
+            state.released = false;
+        }
+
+        fn wait_until_blocked(&self, timeout: Duration) -> bool {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .wake
+                .wait_timeout_while(state, timeout, |state| !state.entered)
+                .unwrap();
+            state.entered
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.wake.notify_all();
+        }
+
+        fn block_if_armed(&self) {
+            let mut state = self.state.lock().unwrap();
+            if !state.armed {
+                return;
+            }
+            state.armed = false;
+            state.entered = true;
+            self.wake.notify_all();
+            while !state.released {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+    }
+
+    impl BlobStore for BlockingCheckpointStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.block_if_armed();
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.block_if_armed();
+            self.inner.write_blobs(writes)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    fn background_memory_config() -> TreeConfig {
+        let mut cfg = TreeConfig::memory();
+        cfg.memory_flush_on_write = false;
+        cfg.checkpoint.enabled = true;
+        cfg.checkpoint.idle_interval = Duration::from_secs(10);
+        cfg.checkpoint.dirty_blob_threshold = 1;
+        cfg.checkpoint.auto_vacuum = false;
+        cfg
+    }
+
+    fn journal_anchor(sequence: u64, byte: u8) -> JournalAnchor {
+        JournalAnchor::new(
+            sequence,
+            [byte; super::super::journal::JOURNAL_DIGEST_BYTES],
+        )
+    }
+
+    fn assert_oversized_first_envelope_advances(db: &DB) {
+        db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0xc0);
+        let first = journal_anchor(1, 0xc1);
+        let second = journal_anchor(2, 0xc2);
+        let first_envelope = JournalEnvelope::new(genesis, first, vec![0x41; 64]).unwrap();
+        let second_envelope = JournalEnvelope::new(first, second, vec![0x42; 32]).unwrap();
+        db.initialize_journal_stream(genesis).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(first_envelope.clone(), |batch| {
+                batch.put("data", b"first", b"value");
+            })
+            .unwrap());
+        assert!(db
+            .atomic_with_journal_envelope(second_envelope.clone(), |batch| {
+                batch.put("data", b"second", b"value");
+            })
+            .unwrap());
+
+        for payload_byte_limit in [0, 1] {
+            let first_page = db
+                .journal_envelopes_after(genesis, 8, payload_byte_limit)
+                .unwrap();
+            assert_eq!(
+                first_page.envelopes(),
+                std::slice::from_ref(&first_envelope)
+            );
+            assert_eq!(first_page.next(), first);
+            assert!(first_page.has_more());
+
+            let second_page = db
+                .journal_envelopes_after(first, 8, payload_byte_limit)
+                .unwrap();
+            assert_eq!(
+                second_page.envelopes(),
+                std::slice::from_ref(&second_envelope)
+            );
+            assert_eq!(second_page.next(), second);
+            assert!(!second_page.has_more());
+        }
+
+        assert!(matches!(
+            db.journal_envelopes_after(genesis, 0, 1),
+            Err(Error::InvalidJournalScanLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn file_journal_byte_limit_is_soft_for_first_envelope() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = crate::Durability::Wal { sync: true };
+        let db = DB::open(cfg).unwrap();
+
+        assert_oversized_first_envelope_advances(&db);
+    }
+
+    #[test]
+    fn volatile_journal_byte_limit_is_soft_for_first_envelope() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+
+        assert_oversized_first_envelope_advances(&db);
+    }
+
+    #[test]
+    fn background_checkpoint_advances_volatile_floor_after_clean_image() {
+        let db = DB::open(background_memory_config()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0xc0);
+        let first = journal_anchor(1, 0xc1);
+        db.initialize_journal_stream(genesis).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(
+                JournalEnvelope::new(genesis, first, b"first".to_vec()).unwrap(),
+                |batch| batch.put("data", b"key", b"value"),
+            )
+            .unwrap());
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, first)
+        );
+
+        db.checkpointer.as_ref().unwrap().wake();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while db.journal_state().unwrap().checkpoint() != first {
+            assert!(
+                Instant::now() < deadline,
+                "background checkpoint never advanced the volatile floor"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(data.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
+        assert!(matches!(
+            db.journal_envelopes_after(genesis, 8, 4096),
+            Err(Error::JournalPositionExpired {
+                requested: 0,
+                checkpoint: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn concurrent_attached_write_does_not_outrun_volatile_checkpoint_image() {
+        let store = Arc::new(BlockingCheckpointStore::new());
+        let db = DB::open_with_blob_store(
+            background_memory_config(),
+            Arc::clone(&store) as Arc<dyn BlobStore>,
+        )
+        .unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0xd0);
+        let first = journal_anchor(1, 0xd1);
+        let second = journal_anchor(2, 0xd2);
+        db.initialize_journal_stream(genesis).unwrap();
+
+        store.arm();
+        assert!(db
+            .atomic_with_journal_envelope(
+                JournalEnvelope::new(genesis, first, b"first".to_vec()).unwrap(),
+                |batch| batch.put("data", b"first", b"one"),
+            )
+            .unwrap());
+        db.checkpointer.as_ref().unwrap().wake();
+        assert!(
+            store.wait_until_blocked(Duration::from_secs(2)),
+            "background checkpoint never reached the blocked store write"
+        );
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, first),
+            "floor advanced before the captured image reached the store"
+        );
+
+        let writer_db = db.clone();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            writer_tx
+                .send(writer_db.atomic_with_journal_envelope(
+                    JournalEnvelope::new(first, second, b"second".to_vec()).unwrap(),
+                    |batch| batch.put("data", b"second", b"two"),
+                ))
+                .unwrap();
+        });
+        writer_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("attached writer blocked behind checkpoint I/O")
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, second),
+            "floor advanced across a concurrent dirty write"
+        );
+
+        store.release();
+        db.checkpointer.as_ref().unwrap().wake();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while db.journal_state().unwrap().checkpoint() != second {
+            assert!(
+                Instant::now() < deadline,
+                "background checkpoint never caught up to the concurrent tail"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(data.get(b"first").unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(data.get(b"second").unwrap().as_deref(), Some(&b"two"[..]));
+        assert!(matches!(
+            db.journal_envelopes_after(genesis, 8, 4096),
+            Err(Error::JournalPositionExpired {
+                requested: 0,
+                checkpoint: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn attached_journal_batch_advances_once_and_survives_checkpoint_reopen() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = crate::Durability::Wal { sync: true };
+
+        let db = DB::open(cfg.clone()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0x10);
+        let first = journal_anchor(1, 0x11);
+        db.initialize_journal_stream(genesis).unwrap();
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, genesis)
+        );
+
+        let first_envelope =
+            JournalEnvelope::new(genesis, first, b"first canonical command".to_vec()).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(first_envelope.clone(), |batch| {
+                batch.put_if_absent("data", b"key", b"value");
+            })
+            .unwrap());
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, first)
+        );
+        let page = db.journal_envelopes_after(genesis, 8, 4096).unwrap();
+        assert_eq!(page.envelopes(), &[first_envelope]);
+        assert_eq!(page.next(), first);
+        assert!(!page.has_more());
+
+        let second = journal_anchor(2, 0x12);
+        let rejected = JournalEnvelope::new(first, second, b"guarded command".to_vec()).unwrap();
+        assert!(!db
+            .atomic_with_journal_envelope(rejected.clone(), |batch| {
+                batch.put_if_absent("data", b"key", b"replacement");
+            })
+            .unwrap());
+        assert_eq!(db.journal_state().unwrap().tail(), first);
+        assert!(db
+            .journal_envelopes_after(first, 8, 4096)
+            .unwrap()
+            .envelopes()
+            .is_empty());
+
+        db.checkpoint().unwrap();
+        assert_eq!(db.journal_state().unwrap(), JournalState::new(first, first));
+        assert!(matches!(
+            db.journal_envelopes_after(genesis, 8, 4096),
+            Err(Error::JournalPositionExpired {
+                requested: 0,
+                checkpoint: 1,
+            })
+        ));
+        drop(data);
+        drop(db);
+
+        let reopened = DB::open(cfg).unwrap();
+        assert_eq!(
+            reopened.journal_state().unwrap(),
+            JournalState::new(first, first)
+        );
+        assert_eq!(
+            reopened.open_tree("data").unwrap().get(b"key").unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert!(reopened
+            .atomic_with_journal_envelope(rejected, |batch| {
+                batch.put("data", b"next", b"value-2");
+            })
+            .unwrap());
+        assert_eq!(reopened.journal_state().unwrap().tail(), second);
+    }
+
+    #[test]
+    fn attached_journal_rejects_missing_or_stale_stream_before_mutation() {
+        let memory = DB::open(TreeConfig::memory()).unwrap();
+        memory.create_tree("data").unwrap();
+        let genesis = journal_anchor(0, 0x20);
+        let first = journal_anchor(1, 0x21);
+        let envelope = JournalEnvelope::new(genesis, first, b"command".to_vec()).unwrap();
+        assert!(matches!(
+            memory.atomic_with_journal_envelope(envelope.clone(), |batch| {
+                batch.put("data", b"key", b"value");
+            }),
+            Err(Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            }) if matches!(source.as_ref(), Error::JournalStreamUnavailable { .. })
+        ));
+        assert!(memory
+            .open_tree("data")
+            .unwrap()
+            .get(b"key")
+            .unwrap()
+            .is_none());
+
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        let db = DB::open(cfg).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+        db.initialize_journal_stream(genesis).unwrap();
+        db.initialize_journal_stream(genesis).unwrap();
+        assert!(matches!(
+            db.initialize_journal_stream(journal_anchor(0, 0x22)),
+            Err(Error::JournalAnchorMismatch { .. })
+        ));
+
+        let wrong_previous = journal_anchor(0, 0x23);
+        let stale = JournalEnvelope::new(wrong_previous, first, b"stale".to_vec()).unwrap();
+        assert!(matches!(
+            db.atomic_with_journal_envelope(stale, |batch| {
+                batch.put("data", b"key", b"value");
+            }),
+            Err(Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            }) if matches!(source.as_ref(), Error::JournalAnchorMismatch { .. })
+        ));
+        assert!(data.get(b"key").unwrap().is_none());
+        assert_eq!(db.journal_state().unwrap().tail(), genesis);
+
+        assert!(db
+            .atomic_with_journal_envelope(envelope, |batch| {
+                batch.put("data", b"key", b"value");
+            })
+            .unwrap());
+        assert_eq!(data.get(b"key").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn initialized_journal_rejects_ordinary_writes_before_mutation() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        let db = DB::open(cfg).unwrap();
+        let data = db.create_tree("data").unwrap();
+        data.put(b"existing", b"old").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0x70);
+        db.initialize_journal_stream(genesis).unwrap();
+
+        assert!(matches!(
+            data.put(b"existing", b"new"),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+        assert_eq!(data.get(b"existing").unwrap(), Some(b"old".to_vec()));
+        assert!(data.get(b"new-key").unwrap().is_none());
+        assert!(matches!(
+            data.put_many_if_absent(&[(b"bulk".as_slice(), b"value".as_slice())]),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+        assert!(data.get(b"bulk").unwrap().is_none());
+        assert!(matches!(
+            db.create_tree("late"),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+        assert!(matches!(
+            db.drop_tree("data"),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+
+        assert!(matches!(
+            db.atomic(|batch| batch.put("data", b"new-key", b"new-value")),
+            Err(Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            }) if matches!(source.as_ref(), Error::JournalStreamUnavailable { .. })
+        ));
+        assert!(data.get(b"new-key").unwrap().is_none());
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, genesis)
+        );
+
+        let first = journal_anchor(1, 0x71);
+        let envelope = JournalEnvelope::new(genesis, first, b"attached".to_vec()).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(envelope, |batch| {
+                batch.put("data", b"new-key", b"new-value");
+            })
+            .unwrap());
+        assert_eq!(data.get(b"new-key").unwrap(), Some(b"new-value".to_vec()));
+        assert_eq!(db.journal_state().unwrap().tail(), first);
+    }
+
+    #[test]
+    fn memory_db_uses_an_explicit_volatile_attached_stream() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0x80);
+        let first = journal_anchor(1, 0x81);
+        let second = journal_anchor(2, 0x82);
+        let third = journal_anchor(3, 0x83);
+        db.initialize_journal_stream(genesis).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(
+                JournalEnvelope::new(genesis, first, b"volatile command".to_vec()).unwrap(),
+                |batch| batch.put("data", b"key", b"value"),
+            )
+            .unwrap());
+        assert_eq!(data.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, first)
+        );
+        assert_eq!(
+            db.journal_envelopes_after(genesis, 8, 4096)
+                .unwrap()
+                .envelopes()
+                .len(),
+            1
+        );
+        for (previous, current, key) in [
+            (first, second, b"second".as_slice()),
+            (second, third, b"third".as_slice()),
+        ] {
+            assert!(db
+                .atomic_with_journal_envelope(
+                    JournalEnvelope::new(previous, current, key.to_vec()).unwrap(),
+                    |batch| batch.put("data", key, b"value"),
+                )
+                .unwrap());
+        }
+        let first_page = db.journal_envelopes_after(genesis, 1, 4096).unwrap();
+        assert_eq!(first_page.envelopes().len(), 1);
+        assert_eq!(first_page.next(), first);
+        assert!(first_page.has_more());
+        let second_page = db.journal_envelopes_after(first, 8, 4096).unwrap();
+        assert_eq!(second_page.envelopes().len(), 2);
+        assert_eq!(second_page.next(), third);
+        assert!(!second_page.has_more());
+        assert!(matches!(
+            db.journal_envelopes_after(journal_anchor(1, 0xff), 8, 4096),
+            Err(Error::JournalAnchorMismatch {
+                requested: 1,
+                expected: 1,
+            })
+        ));
+        assert!(matches!(
+            data.put(b"ordinary", b"rejected"),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+
+        data.checkpoint().unwrap();
+        assert_eq!(db.journal_state().unwrap(), JournalState::new(third, third));
+        assert!(matches!(
+            db.journal_envelopes_after(genesis, 8, 4096),
+            Err(Error::JournalPositionExpired {
+                requested: 0,
+                checkpoint: 3,
+            })
+        ));
+        assert_eq!(data.get(b"third").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn stream_initialization_fences_a_tree_write_waiting_outside_maintenance() {
+        use crate::api::tree::{
+            set_ordinary_write_gate_barrier_for_current_thread, OrdinaryWriteGateBarrier,
+        };
+
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let barrier = Arc::new(OrdinaryWriteGateBarrier::new());
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            set_ordinary_write_gate_barrier_for_current_thread(writer_barrier);
+            data.put(b"racing", b"value")
+        });
+
+        barrier.entered.wait();
+        let genesis = journal_anchor(0, 0x82);
+        db.initialize_journal_stream(genesis).unwrap();
+        barrier.release.wait();
+
+        assert!(matches!(
+            writer.join().unwrap(),
+            Err(Error::JournalStreamUnavailable { .. })
+        ));
+        assert!(db
+            .open_tree("data")
+            .unwrap()
+            .get(b"racing")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.journal_state().unwrap(),
+            JournalState::new(genesis, genesis)
+        );
+    }
+
+    #[test]
+    fn concurrent_envelopes_with_same_previous_have_one_winner() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        let db = DB::open(cfg).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0x90);
+        db.initialize_journal_stream(genesis).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (byte, key) in [(0x91, b"one".as_slice()), (0x92, b"two".as_slice())] {
+            let db = db.clone();
+            let start = Arc::clone(&start);
+            let key = key.to_vec();
+            workers.push(thread::spawn(move || {
+                let current = journal_anchor(1, byte);
+                let envelope = JournalEnvelope::new(genesis, current, vec![byte; 8]).unwrap();
+                start.wait();
+                (
+                    key.clone(),
+                    current,
+                    db.atomic_with_journal_envelope(envelope, |batch| {
+                        batch.put("data", &key, b"value");
+                    }),
+                )
+            }));
+        }
+        start.wait();
+
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, _, result)| result.as_ref().is_ok_and(|value| *value))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, _, result)| matches!(
+                    result,
+                    Err(Error::Atomic {
+                        kind: AtomicErrorKind::DefinitelyNotApplied,
+                        source,
+                    }) if matches!(source.as_ref(), Error::JournalAnchorMismatch { .. })
+                ))
+                .count(),
+            1
+        );
+        let page = db.journal_envelopes_after(genesis, 8, 4096).unwrap();
+        assert_eq!(page.envelopes().len(), 1);
+        let winner = page.envelopes()[0].current();
+        assert_eq!(db.journal_state().unwrap().tail(), winner);
+        for (key, current, _) in results {
+            assert_eq!(data.get(&key).unwrap().is_some(), current == winner);
+        }
+    }
+
+    #[test]
+    fn scan_flushes_an_async_attached_record_before_reading() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = crate::Durability::Wal { sync: false };
+        let db = DB::open(cfg).unwrap();
+        db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+
+        let genesis = journal_anchor(0, 0xa0);
+        let first = journal_anchor(1, 0xa1);
+        db.initialize_journal_stream(genesis).unwrap();
+        let envelope = JournalEnvelope::new(genesis, first, b"async".to_vec()).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(envelope.clone(), |batch| {
+                batch.put("data", b"key", b"value");
+            })
+            .unwrap());
+
+        assert_eq!(
+            db.journal_envelopes_after(genesis, 8, 4096)
+                .unwrap()
+                .envelopes(),
+            &[envelope]
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_attached_writes_complete_without_lock_inversion() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        let db = DB::open(cfg).unwrap();
+        db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+        let genesis = journal_anchor(0, 0xb0);
+        db.initialize_journal_stream(genesis).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_db = db.clone();
+        let writer_tx = done_tx.clone();
+        thread::spawn(move || {
+            let mut previous = genesis;
+            for sequence in 1..=12 {
+                let current = journal_anchor(sequence, 0xb0 + sequence as u8);
+                let envelope =
+                    JournalEnvelope::new(previous, current, vec![sequence as u8]).unwrap();
+                writer_db
+                    .atomic_with_journal_envelope(envelope, |batch| {
+                        batch.put("data", &sequence.to_le_bytes(), b"value");
+                    })
+                    .unwrap();
+                previous = current;
+                thread::yield_now();
+            }
+            writer_tx.send(()).unwrap();
+        });
+        let checkpoint_db = db.clone();
+        thread::spawn(move || {
+            for _ in 0..12 {
+                checkpoint_db.checkpoint().unwrap();
+                thread::yield_now();
+            }
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(db.journal_state().unwrap().tail().sequence(), 12);
+    }
+
+    #[test]
+    fn volatile_named_tree_checkpoint_and_attached_writes_do_not_deadlock() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+        let genesis = journal_anchor(0, 0xc0);
+        db.initialize_journal_stream(genesis).unwrap();
+
+        let writer_db = db.clone();
+        let writer = thread::spawn(move || {
+            let mut previous = genesis;
+            for sequence in 1..=12 {
+                let current = journal_anchor(sequence, 0xc0 + sequence as u8);
+                writer_db
+                    .atomic_with_journal_envelope(
+                        JournalEnvelope::new(previous, current, vec![sequence as u8]).unwrap(),
+                        |batch| batch.put("data", &sequence.to_le_bytes(), b"value"),
+                    )
+                    .unwrap();
+                previous = current;
+                thread::yield_now();
+            }
+        });
+        let checkpointer = thread::spawn(move || {
+            for _ in 0..12 {
+                data.checkpoint().unwrap();
+                thread::yield_now();
+            }
+        });
+
+        writer.join().unwrap();
+        checkpointer.join().unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.journal_state().unwrap().tail().sequence(), 12);
+        assert_eq!(db.journal_state().unwrap().checkpoint().sequence(), 12);
+    }
+
+    #[test]
+    fn oversized_attached_record_is_definitely_not_applied() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+        let genesis = journal_anchor(0, 0xc0);
+        let first = journal_anchor(1, 0xc1);
+        db.initialize_journal_stream(genesis).unwrap();
+        let payload = vec![0xc1; super::super::journal::MAX_JOURNAL_RECORD_BYTES];
+        let envelope = JournalEnvelope::new(genesis, first, payload).unwrap();
+
+        assert!(matches!(
+            db.atomic_with_journal_envelope(envelope, |batch| {
+                batch.put("data", b"key", b"value");
+            }),
+            Err(Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            }) if matches!(source.as_ref(), Error::WalRecordTooLarge { .. })
+        ));
+        assert!(data.get(b"key").unwrap().is_none());
+        assert_eq!(db.journal_state().unwrap().tail(), genesis);
     }
 
     #[test]

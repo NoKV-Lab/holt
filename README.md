@@ -67,7 +67,7 @@ system built for that shape.
 
 ```toml
 [dependencies]
-holt = "0.8"
+holt = "0.9"
 ```
 
 File-backed trees are Unix-only. Linux uses the `io-uring` feature by
@@ -181,6 +181,46 @@ checkpointing:
 - `Durability::Wal { sync: false }` is the default throughput mode.
   Use `sync: true` when every committed mutation must force WAL sync.
 
+### Attached Recovery Stream
+
+Applications that need canonical recovery records can attach one opaque
+envelope to the same WAL record as a guarded `DB` batch:
+
+```rust
+use holt::{DB, Durability, JournalAnchor, JournalEnvelope, TreeConfig};
+
+let mut config = TreeConfig::new("/var/lib/app/db.holt");
+config.durability = Durability::Wal { sync: true };
+let db = DB::open(config)?;
+db.create_tree("metadata")?;
+db.checkpoint()?;
+
+let genesis = JournalAnchor::new(0, [0x10; 32]);
+let first = JournalAnchor::new(1, [0x11; 32]);
+db.initialize_journal_stream(genesis)?;
+db.atomic_with_journal_envelope(
+    JournalEnvelope::new(genesis, first, b"canonical command".to_vec())?,
+    |batch| batch.put("metadata", b"key", b"value"),
+)?;
+
+let page = db.journal_envelopes_after(genesis, 128, 1024 * 1024)?;
+assert_eq!(page.next(), first);
+```
+
+After stream initialization, Holt rejects ordinary logical writes. Route each
+mutation through `DB::atomic_with_journal_envelope`. File-backed databases
+persist the stream anchor and retained suffix in the local WAL. Memory
+databases provide the same ordering and paging contract only for the process
+lifetime.
+
+A checkpoint advances the local retention floor. Older cursors return
+`Error::JournalPositionExpired`. This API provides local recovery records. It
+does not provide a shared or remote log.
+
+The example uses `sync: true`, so a successful attached-batch acknowledgement
+survives a power loss. With `sync: false`, Holt preserves atomic ordering but
+does not force each acknowledgement to stable storage.
+
 ## Benchmarks
 
 Benchmark code lives in the separate non-published package under
@@ -207,7 +247,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.8.5"
+holt = "=0.9.0"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and

@@ -3,6 +3,8 @@
 //! Each variant carries the minimal info needed to replay the
 //! operation deterministically during WAL recovery.
 
+use crate::api::journal::JournalEnvelope;
+
 /// Logical WAL operation variants emitted by the public tree API.
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
@@ -13,8 +15,8 @@ pub enum WalOp {
     ///
     /// Replay only redoes from `(key, value)`; there is no
     /// `prev_value` field because replay never undoes (it's an
-    /// idempotent forward redo) and holt does not provide a
-    /// journal-scan audit surface.
+    /// idempotent forward redo). Ordinary primitive records are not exposed
+    /// through the attached recovery scan.
     Insert {
         /// Logical tree owner.
         tree_id: u64,
@@ -56,6 +58,17 @@ pub enum WalOp {
         /// Inner ops, applied in order.
         ops: Vec<WalOp>,
     },
+    /// DB batch with application-owned canonical recovery bytes attached.
+    ///
+    /// The envelope and inner operations share one record CRC and therefore
+    /// one torn-write boundary. Replay still expands `ops` through the ordinary
+    /// primitive-op path; record-level recovery scanning retains `envelope`.
+    DbBatchWithEnvelope {
+        /// Validated recovery envelope preserved by the WAL codec.
+        envelope: JournalEnvelope,
+        /// Inner DB operations, applied in order.
+        ops: Vec<WalOp>,
+    },
 }
 
 impl WalOp {
@@ -70,7 +83,7 @@ impl WalOp {
             Self::Insert { tree_id, .. }
             | Self::Erase { tree_id, .. }
             | Self::RenameObject { tree_id, .. } => Some(*tree_id),
-            Self::Batch { .. } => None,
+            Self::Batch { .. } | Self::DbBatchWithEnvelope { .. } => None,
         }
     }
 }

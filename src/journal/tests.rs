@@ -9,12 +9,14 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 
 use super::codec::{
-    crc32, encode_file_header, FileHeader, FILE_HEADER_SIZE, FORMAT_VERSION, RECORD_MAGIC,
+    crc32, decode_file_header, encode_file_header, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
+    FORMAT_VERSION, LEGACY_FILE_HEADER_SIZE, LEGACY_FORMAT_VERSION, RECORD_MAGIC,
 };
 use super::reader::replay;
 use super::wal_op::WalOp;
 use super::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
 use crate::api::errors::Error;
+use crate::{JournalAnchor, JournalEnvelope};
 
 fn wal_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("test.wal")
@@ -56,6 +58,333 @@ fn sample_ops() -> Vec<WalOp> {
     ]
 }
 
+fn sample_envelope() -> JournalEnvelope {
+    JournalEnvelope::new(
+        JournalAnchor::new(6, [0x66; 32]),
+        JournalAnchor::new(7, [0x77; 32]),
+        b"canonical-recovery-v1".to_vec(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn v3_and_v4_file_headers_have_stable_golden_bytes() {
+    let mut expected_prefix = [
+        0x57, 0x41, 0x4c, 0x41, 0x04, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+        0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    let header_v4 = FileHeader {
+        version: FORMAT_VERSION,
+        tree_id: 0x0102_0304_0506_0708,
+        created_at: 0x1112_1314_1516_1718,
+        checkpoint_anchor: None,
+        anchor_generation: 0,
+    };
+    let mut encoded = Vec::new();
+    encode_file_header(&header_v4, &mut encoded);
+    assert_eq!(encoded.len(), FILE_HEADER_SIZE);
+    assert_eq!(&encoded[..LEGACY_FILE_HEADER_SIZE], expected_prefix);
+    assert!(encoded[LEGACY_FILE_HEADER_SIZE..]
+        .iter()
+        .all(|byte| *byte == 0));
+    assert_eq!(decode_file_header(&encoded).unwrap(), header_v4);
+
+    expected_prefix[4] = 0x03;
+    expected_prefix[24..32].fill(0);
+    let header_v3 = FileHeader {
+        version: LEGACY_FORMAT_VERSION,
+        checkpoint_anchor: None,
+        anchor_generation: 0,
+        ..header_v4
+    };
+    encoded.clear();
+    encode_file_header(&header_v3, &mut encoded);
+    assert_eq!(encoded, expected_prefix);
+    assert_eq!(decode_file_header(&encoded).unwrap(), header_v3);
+}
+
+#[test]
+fn nonempty_format_3_is_replayable_but_rejected_for_append() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            version: LEGACY_FORMAT_VERSION,
+            tree_id: 9,
+            created_at: 0,
+            checkpoint_anchor: None,
+            anchor_generation: 0,
+        },
+        &mut bytes,
+    );
+    let mut body = Vec::new();
+    body.extend_from_slice(&9u64.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(b"k");
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(b"v");
+    append_raw_record(&mut bytes, 11, 0, &body);
+    fs::write(&path, &bytes).unwrap();
+
+    let mut seen = Vec::new();
+    let (header, stats) = replay(&path, |op, seq, _| {
+        seen.push((op.clone(), seq));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(header.version, LEGACY_FORMAT_VERSION);
+    assert_eq!(header.tree_id, 9);
+    assert_eq!(stats.records_seen, 1);
+    assert_eq!(stats.highest_seq, Some(11));
+    assert!(matches!(
+        seen.as_slice(),
+        [(WalOp::Insert {
+            tree_id: 9,
+            key,
+            value,
+        }, 11)] if key == b"k" && value == b"v"
+    ));
+
+    let before = fs::read(&path).unwrap();
+    assert!(matches!(
+        WalWriter::open_existing(&path),
+        Err(Error::ReplaySanityFailed {
+            context: "nonempty WAL format 3 is replay-only; checkpoint it with a format-3 Holt binary before v4 writes",
+            record_offset: 0,
+        })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn header_only_format_3_is_upgraded_before_append() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let legacy = FileHeader {
+        version: LEGACY_FORMAT_VERSION,
+        tree_id: 17,
+        created_at: 23,
+        checkpoint_anchor: None,
+        anchor_generation: 0,
+    };
+    let mut bytes = Vec::new();
+    encode_file_header(&legacy, &mut bytes);
+    fs::write(&path, &bytes).unwrap();
+
+    let writer = WalWriter::open_existing(&path).unwrap();
+    assert_eq!(writer.header().version, FORMAT_VERSION);
+    assert_eq!(writer.header().tree_id, legacy.tree_id);
+    assert_eq!(writer.header().created_at, legacy.created_at);
+    drop(writer);
+
+    let upgraded = fs::read(&path).unwrap();
+    assert_eq!(upgraded.len(), FILE_HEADER_SIZE);
+    let header = decode_file_header(&upgraded).unwrap();
+    assert_eq!(header.version, FORMAT_VERSION);
+    assert_eq!(header.tree_id, legacy.tree_id);
+    assert_eq!(header.created_at, legacy.created_at);
+}
+
+#[test]
+fn format_4_attached_batch_flattens_for_replay_and_is_rejected_under_v3_header() {
+    let envelope = sample_envelope();
+    let mut attached_record = Vec::new();
+    {
+        let mut encoder = BatchEncoder::begin_with_envelope(&mut attached_record, 20, 0, &envelope);
+        encoder.push_insert(3, b"a", b"one");
+        encoder.push_erase(3, b"b");
+        assert_eq!(encoder.finish(), 2);
+    }
+
+    let dir = tempdir().unwrap();
+    let v4_path = dir.path().join("v4.wal");
+    let mut v4 = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            version: FORMAT_VERSION,
+            tree_id: 0,
+            created_at: 0,
+            checkpoint_anchor: None,
+            anchor_generation: 0,
+        },
+        &mut v4,
+    );
+    v4.extend_from_slice(&attached_record);
+    fs::write(&v4_path, &v4).unwrap();
+
+    let mut seen = Vec::new();
+    let (header, stats) = replay(&v4_path, |op, seq, _| {
+        seen.push((op.clone(), seq));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(header.version, FORMAT_VERSION);
+    assert_eq!(stats.records_seen, 1);
+    assert_eq!(stats.highest_seq, Some(21));
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(seen[0], (WalOp::Insert { .. }, 20)));
+    assert!(matches!(seen[1], (WalOp::Erase { .. }, 21)));
+
+    let v3_path = dir.path().join("v3-with-tag-13.wal");
+    let mut v3 = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            version: LEGACY_FORMAT_VERSION,
+            tree_id: 0,
+            created_at: 0,
+            checkpoint_anchor: None,
+            anchor_generation: 0,
+        },
+        &mut v3,
+    );
+    v3.extend_from_slice(&attached_record);
+    fs::write(&v3_path, &v3).unwrap();
+    assert!(matches!(
+        replay(&v3_path, |_, _, _| Ok(())),
+        Err(Error::ReplaySanityFailed {
+            context: "attached batch requires WAL format version 4",
+            record_offset,
+        }) if record_offset == LEGACY_FILE_HEADER_SIZE as u64
+    ));
+}
+
+#[test]
+fn checkpoint_anchor_slots_fall_back_to_mirrored_anchor() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let first = JournalAnchor::new(1, [0x31; 32]);
+    let second = JournalAnchor::new(2, [0x32; 32]);
+    {
+        let mut writer = WalWriter::create(&path, 0).unwrap();
+        writer.persist_checkpoint_anchor(first).unwrap();
+        writer.persist_checkpoint_anchor(second).unwrap();
+    }
+
+    let bytes = fs::read(&path).unwrap();
+    let header = decode_file_header(&bytes).unwrap();
+    assert_eq!(header.checkpoint_anchor, Some(second));
+    assert_eq!(header.anchor_generation, 4);
+
+    // Generation 4 lives in slot B. If it is lost, generation 3 in slot A
+    // still names the same checkpoint anchor.
+    let mut torn = bytes;
+    let slot_b_crc_byte = super::codec::ANCHOR_SLOT_OFFSETS[1] + 64;
+    torn[slot_b_crc_byte] ^= 0x80;
+    fs::write(&path, &torn).unwrap();
+    let recovered = decode_file_header(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(recovered.checkpoint_anchor, Some(second));
+    assert_eq!(recovered.anchor_generation, 3);
+}
+
+#[test]
+fn first_checkpoint_anchor_is_mirrored_before_initialization_returns() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let genesis = JournalAnchor::new(0, [0x39; 32]);
+    {
+        let mut writer = WalWriter::create(&path, 0).unwrap();
+        writer.persist_checkpoint_anchor(genesis).unwrap();
+    }
+
+    let bytes = fs::read(&path).unwrap();
+    let header = decode_file_header(&bytes).unwrap();
+    assert_eq!(header.checkpoint_anchor, Some(genesis));
+    assert_eq!(header.anchor_generation, 2);
+
+    for slot in 0..2 {
+        let mut damaged = bytes.clone();
+        damaged[super::codec::ANCHOR_SLOT_OFFSETS[slot] + 64] ^= 0x80;
+        let recovered = decode_file_header(&damaged).unwrap();
+        assert_eq!(recovered.checkpoint_anchor, Some(genesis));
+    }
+}
+
+#[test]
+fn advanced_checkpoint_anchor_survives_either_slot_corruption_after_truncate() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let genesis = JournalAnchor::new(0, [0x3a; 32]);
+    let advanced = JournalAnchor::new(7, [0x3b; 32]);
+    {
+        let mut writer = WalWriter::create(&path, 0).unwrap();
+        writer.persist_checkpoint_anchor(genesis).unwrap();
+        writer.checkpoint_and_truncate(Some(advanced)).unwrap();
+    }
+
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), FILE_HEADER_SIZE);
+    let header = decode_file_header(&bytes).unwrap();
+    assert_eq!(header.checkpoint_anchor, Some(advanced));
+    assert_eq!(header.anchor_generation, 4);
+
+    for slot in 0..2 {
+        let mut damaged = bytes.clone();
+        damaged[super::codec::ANCHOR_SLOT_OFFSETS[slot] + 64] ^= 0x80;
+        let recovered = decode_file_header(&damaged).unwrap();
+        assert_eq!(recovered.checkpoint_anchor, Some(advanced));
+    }
+}
+
+#[test]
+fn interrupted_checkpoint_keeps_wal_and_retry_repairs_anchor_mirror() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+    let genesis = JournalAnchor::new(0, [0x40; 32]);
+    let first = JournalAnchor::new(1, [0x41; 32]);
+    let second = JournalAnchor::new(2, [0x42; 32]);
+    let first_envelope = JournalEnvelope::new(genesis, first, b"first".to_vec()).unwrap();
+    let second_envelope = JournalEnvelope::new(first, second, b"second".to_vec()).unwrap();
+
+    let mut writer = WalWriter::create(&path, 0).unwrap();
+    writer.persist_checkpoint_anchor(genesis).unwrap();
+    for (seq, envelope) in [(10, &first_envelope), (11, &second_envelope)] {
+        let mut record = Vec::new();
+        BatchEncoder::begin_with_envelope(&mut record, seq, 0, envelope).finish();
+        writer.append_encoded(&record).unwrap();
+    }
+    writer.flush().unwrap();
+    let wal_len = fs::metadata(&path).unwrap().len();
+
+    // Fail after the first new generation reaches disk. Checkpoint must leave
+    // the old record stream intact so recovery can validate the new floor and
+    // retain the suffix after it.
+    WalWriter::fail_anchor_generation_after_for_test(1);
+    assert!(matches!(
+        writer.checkpoint_and_truncate(Some(first)),
+        Err(Error::Internal("checkpoint anchor generation test failure"))
+    ));
+    assert_eq!(fs::metadata(&path).unwrap().len(), wal_len);
+    drop(writer);
+
+    let scan = super::reader::scan_attached_envelopes(&path).unwrap();
+    assert_eq!(scan.checkpoint, Some(first));
+    assert_eq!(scan.tail, Some(second));
+    assert_eq!(scan.envelopes, vec![second_envelope]);
+
+    // Reopen sees the first new generation. Retrying the same checkpoint must
+    // write its sibling before truncation; either slot can then be lost.
+    {
+        let mut writer = WalWriter::open_existing(&path).unwrap();
+        assert_eq!(writer.header().checkpoint_anchor, Some(first));
+        assert_eq!(writer.header().anchor_generation, 3);
+        writer.checkpoint_and_truncate(Some(first)).unwrap();
+    }
+
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), FILE_HEADER_SIZE);
+    let header = decode_file_header(&bytes).unwrap();
+    assert_eq!(header.checkpoint_anchor, Some(first));
+    assert_eq!(header.anchor_generation, 4);
+    for slot in 0..2 {
+        let mut damaged = bytes.clone();
+        damaged[super::codec::ANCHOR_SLOT_OFFSETS[slot] + 64] ^= 0x80;
+        let recovered = decode_file_header(&damaged).unwrap();
+        assert_eq!(recovered.checkpoint_anchor, Some(first));
+    }
+}
+
 #[test]
 fn create_open_round_trip_all_variants() {
     let dir = tempdir().unwrap();
@@ -63,6 +392,7 @@ fn create_open_round_trip_all_variants() {
     let ops = sample_ops();
 
     let mut w = WalWriter::create(&path, 42).unwrap();
+    assert_eq!(w.header().version, FORMAT_VERSION);
     assert_eq!(w.header().tree_id, 42);
     assert_eq!(w.bytes_written(), FILE_HEADER_SIZE as u64);
 
@@ -97,8 +427,11 @@ fn replay_rejects_removed_structural_tag() {
     let mut bytes = Vec::new();
     encode_file_header(
         &FileHeader {
+            version: FORMAT_VERSION,
             tree_id: 0,
             created_at: 0,
+            checkpoint_anchor: None,
+            anchor_generation: 0,
         },
         &mut bytes,
     );

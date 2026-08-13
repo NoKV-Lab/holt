@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
+use super::journal::VolatileJournal;
 use super::snapshot::Snapshot;
 use super::stats::OpenStats;
 use super::stats::{
@@ -53,6 +54,44 @@ const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 const SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE: u32 = 350;
 const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 const WRITE_DELTA_FLUSH_THRESHOLD: usize = 262_144;
+
+#[cfg(test)]
+pub(crate) struct OrdinaryWriteGateBarrier {
+    pub(crate) entered: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl OrdinaryWriteGateBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ORDINARY_WRITE_GATE_BARRIER: std::cell::RefCell<Option<Arc<OrdinaryWriteGateBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_ordinary_write_gate_barrier_for_current_thread(
+    barrier: Arc<OrdinaryWriteGateBarrier>,
+) {
+    ORDINARY_WRITE_GATE_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_before_ordinary_write_gate() {
+    let barrier = ORDINARY_WRITE_GATE_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
 
 #[cfg(test)]
 struct FullGcSnapshotCaptureBarrier {
@@ -288,6 +327,9 @@ pub struct Tree {
     /// Group-commit WAL worker — `Some` for persistent trees,
     /// `None` for memory trees.
     journal: Option<Arc<Journal>>,
+    /// Process-local attached-stream fence shared by trees opened from a
+    /// memory-mode DB. Standalone trees do not expose attached envelopes.
+    volatile_journal: Option<Arc<VolatileJournal>>,
     /// Direct-mapped cache for short hot key-only prefix scans.
     /// Conservatively invalidated by `next_seq`, so every write
     /// makes old entries miss.
@@ -669,6 +711,7 @@ impl Tree {
             Arc::new(AtomicU64::new(next_seq)),
             commit_gate,
             journal,
+            None,
             checkpointer,
             open_stats,
         )
@@ -685,6 +728,7 @@ impl Tree {
         next_seq: Arc<AtomicU64>,
         commit_gate: Arc<CommitGate>,
         journal: Option<Arc<Journal>>,
+        volatile_journal: Option<Arc<VolatileJournal>>,
         checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
         open_stats: OpenStats,
     ) -> Result<Self> {
@@ -701,6 +745,7 @@ impl Tree {
             next_seq,
             commit_gate,
             journal,
+            volatile_journal,
             prefix_list_cache: runtime.prefix_list_cache,
             mutation_gate: runtime.mutation_gate,
             dropped: runtime.dropped,
@@ -728,6 +773,16 @@ impl Tree {
         } else {
             Ok(())
         }
+    }
+
+    fn preflight_ordinary_record(&self, record_len: usize) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.preflight_submit(record_len)?;
+        }
+        if let Some(journal) = &self.volatile_journal {
+            journal.ensure_ordinary_writes_allowed()?;
+        }
+        Ok(())
     }
 
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
@@ -871,6 +926,7 @@ impl Tree {
         }
 
         if !new_ops.is_empty() {
+            self.preflight_ordinary_record(encoded_batch_record_len(&new_ops))?;
             let base_seq = self
                 .next_seq
                 .fetch_add(new_ops.len() as u64, Ordering::Relaxed);
@@ -917,17 +973,18 @@ impl Tree {
 
     fn put_deferred(&self, key: &[u8], value: &[u8]) -> Result<()> {
         Self::validate_insert_shape(key, value)?;
+        let journal = self
+            .journal
+            .as_ref()
+            .expect("can_stage_deferred_write requires journal");
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            journal.preflight_submit(encoded_insert_record_len(key.len(), value.len()))?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let creates_key = self.get_version(key)?.is_none();
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let journal = self
-                .journal
-                .as_ref()
-                .expect("can_stage_deferred_write requires journal");
             let _commit = self.commit_gate.enter_writer();
             let mut record =
                 journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
@@ -959,8 +1016,11 @@ impl Tree {
         let search = engine::SearchKey::user(key);
 
         let (outcome, journal_ack) = {
+            #[cfg(test)]
+            pause_before_ordinary_write_gate();
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            self.preflight_ordinary_record(encoded_insert_record_len(key.len(), value.len()))?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1060,19 +1120,20 @@ impl Tree {
     }
 
     fn delete_deferred(&self, key: &[u8]) -> Result<bool> {
+        let journal = self
+            .journal
+            .as_ref()
+            .expect("can_stage_deferred_write requires journal");
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            journal.preflight_submit(encoded_erase_record_len(key.len()))?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             if self.get_version(key)?.is_none() {
                 return Ok(false);
             }
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let journal = self
-                .journal
-                .as_ref()
-                .expect("can_stage_deferred_write requires journal");
             let _commit = self.commit_gate.enter_writer();
             let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
             encode_erase_record(&mut record, seq, self.tree_id, key);
@@ -1112,6 +1173,7 @@ impl Tree {
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            self.preflight_ordinary_record(encoded_erase_record_len(key.len()))?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1195,6 +1257,7 @@ impl Tree {
         let journal_ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            self.preflight_ordinary_record(encoded_rename_object_record_len(src.len(), dst.len()))?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1352,14 +1415,12 @@ impl Tree {
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         self.ensure_writable()?;
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
-        if count != 0 {
-            if let Some(journal) = &self.journal {
-                journal.preflight_submit(encoded_batch_record_len(&pending))?;
-            }
-        }
         self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
+        if count != 0 {
+            self.preflight_ordinary_record(encoded_batch_record_len(&pending))?;
+        }
         let _tree_mutation = self.mutation_gate.enter_batch();
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
@@ -1382,6 +1443,7 @@ impl Tree {
     /// holds the maintenance + mutation gates and has reserved the
     /// `base_seq` range; every inner op applies via the run walker.
     fn commit_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<()> {
+        self.preflight_ordinary_record(encoded_batch_record_len(pending))?;
         // W2D-strict protocol: all inner ops' walker mutations +
         // `mark_dirty` calls, plus the single envelope WAL submit, happen
         // under `commit_gate` — see `Tree::put_inner_conditional`.
@@ -2347,12 +2409,23 @@ impl Tree {
     pub fn checkpoint(&self) -> Result<()> {
         self.ensure_writable()?;
         if self.tree_id != 0 {
-            return Self::checkpoint_shared_store(
+            Self::checkpoint_shared_store(
                 &self.store,
                 self.journal.as_ref(),
                 &self.maintenance_gate,
                 &self.commit_gate,
-            );
+            )?;
+            if let Some(journal) = &self.volatile_journal {
+                let _maintenance = self.maintenance_gate.enter_exclusive();
+                Self::checkpoint_shared_store_with_maintenance_held(
+                    &self.store,
+                    None,
+                    &self.commit_gate,
+                )?;
+                let _commit = self.commit_gate.enter_checkpoint();
+                journal.checkpoint();
+            }
+            return Ok(());
         }
 
         // Standalone checkpoints also make bounded progress on retired COW
@@ -3215,10 +3288,10 @@ where
                     engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
-            // `Batch` is unpacked into per-inner callbacks inside
+            // Batch records are unpacked into per-inner callbacks inside
             // `journal::reader::replay_bytes`, so it never reaches
             // this match — defensive arm only.
-            WalOp::Batch { ops: _ } => false,
+            WalOp::Batch { ops: _ } | WalOp::DbBatchWithEnvelope { .. } => false,
         };
         if root_dirty {
             // Honour the walker's caller-side `mark_dirty(root,

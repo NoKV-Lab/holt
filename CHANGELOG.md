@@ -9,6 +9,51 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-14
+
+### Added
+
+- Added `DB::initialize_journal_stream`,
+  `DB::atomic_with_journal_envelope`, `DB::journal_state`, and
+  `DB::journal_envelopes_after`. One opaque application recovery envelope and
+  its guarded multi-tree mutation now share one WAL record and one CRC.
+- Added `JournalAnchor`, `JournalEnvelope`, bounded paged scans, typed stale
+  cursor and anchor mismatch errors, and a 16 MiB encoded-record limit.
+- Added an explicit process-local stream for memory databases. It follows the
+  same ordering, fencing, paging, and checkpoint-floor rules but provides no
+  reopen or crash durability.
+
+### Changed
+
+- Advanced the WAL to format 4. Its 4096-byte header contains two
+  independently checksummed checkpoint-anchor slots. Checkpoint writes and
+  syncs both slots before it truncates the retained record suffix.
+- After callers initialize an attached recovery stream, Holt rejects ordinary
+  logical writes before mutation. Callers must route changes through
+  `DB::atomic_with_journal_envelope`; failed guards and stale anchors append no
+  envelope.
+- WAL scans stabilize and flush the committed async-ring prefix before reading
+  the retained suffix. Checkpoint and attached append use one lock order so
+  neither can cross the other's anchor boundary.
+
+### Fixed
+
+- Compaction now budgets the eight-byte routing node used by every reachable
+  `EmptyRoot`. Delete-heavy trees can retain empty child blobs, so treating the
+  sentinel as root-only undercounted the routing arena and could stop
+  compaction when the encoded layout crossed a page boundary.
+
+### Upgrade notes
+
+- Writable open upgrades a header-only format-3 WAL to format 4. Holt replays
+  a nonempty format-3 WAL only in read-only mode. It rejects writable open
+  before changing files or cached state.
+- Before upgrading a nonempty format-3 store, open it with Holt 0.8.5 and call
+  `DB::checkpoint()`. You can also export it through a read-only 0.9.0 open
+  and install the image into a fresh 0.9.0 store.
+- To downgrade from format 4, call `DB::export_checkpoint()`. Install the
+  image into a fresh 0.8.x store with `DB::install_checkpoint()`.
+
 ## [0.8.5] — 2026-08-11
 
 ### Added

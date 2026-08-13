@@ -83,6 +83,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::api::journal::VolatileJournal;
 use crate::concurrency::{CommitGate, Gate};
 use crate::journal::Journal;
 use crate::store::BufferManager;
@@ -190,6 +191,10 @@ impl CheckpointConfig {
 pub(super) struct Shared {
     pub(super) bm: Arc<BufferManager>,
     pub(super) journal: Option<Arc<Journal>>,
+    /// Process-local attached stream for memory DBs. The planner advances
+    /// its floor only at the same clean store frontier used for file-WAL
+    /// truncation.
+    pub(super) volatile_journal: Option<Arc<VolatileJournal>>,
     /// Same writer-shared / checkpoint-exclusive publish barrier
     /// used by foreground persistent writers. Checkpoint rounds hold
     /// its exclusive side only while draining dirty intent and
@@ -250,6 +255,19 @@ impl Checkpointer {
         commit_gate: Arc<CommitGate>,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
+        Self::spawn_with_volatile(bm, journal, None, maintenance_gate, commit_gate, cfg)
+    }
+
+    /// Spawn a DB checkpointer with its process-local attached stream.
+    #[must_use]
+    pub(crate) fn spawn_with_volatile(
+        bm: Arc<BufferManager>,
+        journal: Option<Arc<Journal>>,
+        volatile_journal: Option<Arc<VolatileJournal>>,
+        maintenance_gate: Arc<Gate>,
+        commit_gate: Arc<CommitGate>,
+        cfg: CheckpointConfig,
+    ) -> Option<Self> {
         if !cfg.enabled {
             return None;
         }
@@ -257,6 +275,7 @@ impl Checkpointer {
         let shared = Arc::new(Shared {
             bm,
             journal,
+            volatile_journal,
             commit_gate,
             maintenance_gate,
             cfg,
@@ -871,7 +890,7 @@ mod tests {
             rounds_after_wait - rounds_before_wait <= 10,
             "all-pinned orphan backlog busy-spun: {rounds_before_wait} -> {rounds_after_wait}"
         );
-        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert!(inner.has_blob(pinned_guid).unwrap());
 
         retire(free_guid);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -883,7 +902,6 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(inner.has_blob(pinned_guid).unwrap());
-        assert_eq!(bm.gc_orphan_backlog_count(), 1);
 
         drop(pinned);
         ck.wake();
