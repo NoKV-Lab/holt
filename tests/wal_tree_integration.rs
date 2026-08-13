@@ -17,7 +17,7 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use holt::{Durability, Tree, TreeConfig, DB};
+use holt::{Durability, JournalAnchor, JournalEnvelope, Tree, TreeConfig, DB};
 
 fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
@@ -39,6 +39,45 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
 }
 
 const OVERSIZED_ATOMIC_OPS: u32 = 257;
+const WAL_HEADER_SIZE: u64 = 4096;
+
+fn journal_anchor(sequence: u64, byte: u8) -> JournalAnchor {
+    JournalAnchor::new(sequence, [byte; 32])
+}
+
+#[test]
+fn attached_batch_replays_state_tail_and_envelope_without_checkpoint() {
+    let dir = tempdir().unwrap();
+    let genesis = journal_anchor(0, 0x40);
+    let first = journal_anchor(1, 0x41);
+    let envelope =
+        JournalEnvelope::new(genesis, first, b"canonical recovery command".to_vec()).unwrap();
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        db.create_tree("metadata").unwrap();
+        db.checkpoint().unwrap();
+        db.initialize_journal_stream(genesis).unwrap();
+        assert!(db
+            .atomic_with_journal_envelope(envelope.clone(), |batch| {
+                batch.put("metadata", b"key", b"value");
+            })
+            .unwrap());
+        assert!(fs::metadata(wal_path(dir.path())).unwrap().len() > WAL_HEADER_SIZE);
+    }
+
+    let db = DB::open(durable_cfg(dir.path())).unwrap();
+    assert_eq!(
+        db.open_tree("metadata").unwrap().get(b"key").unwrap(),
+        Some(b"value".to_vec())
+    );
+    assert_eq!(db.journal_state().unwrap().checkpoint(), genesis);
+    assert_eq!(db.journal_state().unwrap().tail(), first);
+    let page = db.journal_envelopes_after(genesis, 8, 4096).unwrap();
+    assert_eq!(page.envelopes(), &[envelope]);
+    assert_eq!(page.next(), first);
+    assert!(!page.has_more());
+}
 
 #[test]
 fn db_named_trees_replay_from_one_wal() {
@@ -250,7 +289,10 @@ fn clean_checkpoint_skips_empty_wal_flush() {
 
     tree.put(b"wal-clean/k", b"v").unwrap();
     tree.checkpoint().unwrap();
-    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+    assert_eq!(
+        fs::metadata(wal_path(dir.path())).unwrap().len(),
+        WAL_HEADER_SIZE
+    );
 
     let after_truncate = tree.stats().unwrap().journal.unwrap();
     tree.checkpoint().unwrap();
@@ -276,7 +318,10 @@ fn checkpoint_reuses_durable_group_commit_wal_sync() {
         after_checkpoint.syncs, after_put.syncs,
         "checkpoint must not fsync WAL records already made durable by group commit",
     );
-    assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+    assert_eq!(
+        fs::metadata(wal_path(dir.path())).unwrap().len(),
+        WAL_HEADER_SIZE
+    );
 }
 
 #[test]
@@ -298,7 +343,10 @@ fn persistent_put_then_reopen_via_wal_replay() {
 
     // The WAL file exists and has bytes past the header.
     let wal_size_after_drop = fs::metadata(wal_path(dir.path())).unwrap().len();
-    assert!(wal_size_after_drop > 32, "WAL should hold records");
+    assert!(
+        wal_size_after_drop > WAL_HEADER_SIZE,
+        "WAL should hold records"
+    );
 
     // Round 2: reopen. Replay rebuilds every key from the log.
     {
@@ -350,7 +398,10 @@ fn checkpoint_merges_deferred_put_before_truncating_wal() {
         let tree = Tree::open(cfg.clone()).unwrap();
         tree.put(b"checkpoint/deferred", b"value").unwrap();
         tree.checkpoint().unwrap();
-        assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), 32);
+        assert_eq!(
+            fs::metadata(wal_path(dir.path())).unwrap().len(),
+            WAL_HEADER_SIZE
+        );
     }
 
     let tree = Tree::open(cfg).unwrap();
@@ -425,7 +476,10 @@ fn replay_then_checkpoint_then_reopen_preserves_data() {
         // to store before truncating the WAL.**
         tree.checkpoint().unwrap();
         let wal_size_after = fs::metadata(wal_path(dir.path())).unwrap().len();
-        assert_eq!(wal_size_after, 32, "WAL truncated to header-only");
+        assert_eq!(
+            wal_size_after, WAL_HEADER_SIZE,
+            "WAL truncated to header-only"
+        );
     }
 
     // Round 3: store is the source of truth (WAL empty). If
@@ -459,11 +513,11 @@ fn checkpoint_truncates_wal_and_keys_survive_reopen() {
                 .unwrap();
         }
         let wal_size_before = fs::metadata(wal_path(dir.path())).unwrap().len();
-        assert!(wal_size_before > 32);
+        assert!(wal_size_before > WAL_HEADER_SIZE);
         tree.checkpoint().unwrap();
         let wal_size_after = fs::metadata(wal_path(dir.path())).unwrap().len();
         assert_eq!(
-            wal_size_after, 32,
+            wal_size_after, WAL_HEADER_SIZE,
             "checkpoint should truncate WAL to header-only",
         );
     }
@@ -585,7 +639,7 @@ fn enqueue_mode_loses_writes_without_checkpoint_or_fsync() {
         // file on disk is still header-only.
     }
     let wal_size = fs::metadata(wal_path(dir.path())).unwrap().len();
-    assert_eq!(wal_size, 32);
+    assert_eq!(wal_size, WAL_HEADER_SIZE);
 
     let tree = Tree::open(cfg).unwrap();
     for i in 0..50u32 {
@@ -998,10 +1052,7 @@ fn oversized_tree_atomic_record_fails_before_publish_or_seq_reservation() {
         .unwrap_err();
 
     assert!(
-        matches!(
-            err,
-            holt::Error::Internal("journal record exceeds WAL ring capacity")
-        ),
+        matches!(err, holt::Error::WalRecordTooLarge { .. }),
         "expected the WAL record limit, got {err:?}",
     );
     assert_eq!(fs::metadata(wal_path(dir.path())).unwrap().len(), wal_len);
@@ -1051,7 +1102,7 @@ fn oversized_db_atomic_record_fails_before_publish_or_seq_reservation() {
                 ref source,
             } if matches!(
                 source.as_ref(),
-                holt::Error::Internal("journal record exceeds WAL ring capacity")
+                holt::Error::WalRecordTooLarge { .. }
             )
         ),
         "expected the WAL record limit, got {err:?}",
@@ -1177,7 +1228,7 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
         // waiting: repeated tick writes can keep slow machines in a
         // permanently dirty state and make this test self-defeating.
         // The background checkpointer wakes on its idle interval.
-        let header_size_after_truncate = 32u64; // FILE_HEADER_SIZE
+        let header_size_after_truncate = WAL_HEADER_SIZE;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();

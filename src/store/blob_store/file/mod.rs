@@ -112,6 +112,8 @@ const DATA_FILENAME: &str = "blobs.dat";
 /// Advisory lock file inside `data_dir`, flock'd for the lifetime of
 /// an open instance. Readers hold shared locks; writers hold exclusive locks.
 const LOCK_FILENAME: &str = "store.lock";
+/// WAL file checked under the store lock before a writable open touches data.
+const JOURNAL_FILENAME: &str = "journal.wal";
 /// How long `open` waits for a previous instance to release the
 /// directory lock before failing. Covers the handover pattern where
 /// a caller opens a new instance while the previous one is still
@@ -384,6 +386,17 @@ fn open_read_accelerator_file(
     }
 }
 
+fn preflight_writable_journal(data_dir: &Path, access: FileAccess) -> Result<()> {
+    if access.is_read_only() {
+        return Ok(());
+    }
+    let path = data_dir.join(JOURNAL_FILENAME);
+    if path.exists() {
+        crate::journal::reader::preflight_writable_wal(&path)?;
+    }
+    Ok(())
+}
+
 impl FileBlobStore {
     /// Open or create a persistent store at `data_dir`.
     ///
@@ -447,6 +460,7 @@ impl FileBlobStore {
         // replay (including torn-tail truncation) must not run
         // while another instance can still append deltas.
         let dir_lock = acquire_dir_lock(&data_dir, access, DIR_LOCK_ACQUIRE_TIMEOUT)?;
+        preflight_writable_journal(&data_dir, access)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let read_index_path = data_dir.join(READ_INDEX_FILENAME);
@@ -530,6 +544,7 @@ impl FileBlobStore {
         // replay (including torn-tail truncation) must not run
         // while another instance can still append deltas.
         let dir_lock = acquire_dir_lock(&data_dir, access, DIR_LOCK_ACQUIRE_TIMEOUT)?;
+        preflight_writable_journal(&data_dir, access)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
         let read_index_path = data_dir.join(READ_INDEX_FILENAME);

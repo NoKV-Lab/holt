@@ -752,6 +752,7 @@ mod tests {
         Arc::new(Shared {
             bm: Arc::new(BufferManager::new(store, 8)),
             journal: None,
+            volatile_journal: None,
             commit_gate: Arc::new(CommitGate::new()),
             maintenance_gate: Arc::new(Gate::new()),
             cfg: CheckpointConfig::default(),

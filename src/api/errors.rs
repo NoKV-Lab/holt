@@ -113,6 +113,40 @@ pub enum Error {
         /// offset.
         record_offset: u64,
     },
+    /// An attached journal operation requires a supported DB profile whose
+    /// stream has been initialized with an application genesis anchor.
+    JournalStreamUnavailable {
+        /// Static reason the stream cannot serve the request.
+        reason: &'static str,
+    },
+    /// The caller's attached-journal cursor is older than the local
+    /// checkpoint floor and its envelopes are no longer retained.
+    JournalPositionExpired {
+        /// Sequence requested by the caller.
+        requested: u64,
+        /// Oldest sequence retained by the local journal.
+        checkpoint: u64,
+    },
+    /// The caller supplied an anchor that conflicts with Holt's anchor at the
+    /// same sequence or does not name the current stream tail.
+    JournalAnchorMismatch {
+        /// Sequence supplied by the caller.
+        requested: u64,
+        /// Sequence Holt expected at this boundary.
+        expected: u64,
+    },
+    /// One encoded WAL record cannot fit in Holt's bounded submit buffer.
+    WalRecordTooLarge {
+        /// Encoded record size requested by the caller.
+        bytes: usize,
+        /// Maximum encoded record size accepted by this Holt build.
+        maximum: usize,
+    },
+    /// An attached-journal page request used an invalid limit.
+    InvalidJournalScanLimit {
+        /// Static reason the limit is invalid.
+        reason: &'static str,
+    },
     /// `Tree::rename` (or similar) called with a `src` that has no
     /// leaf in the tree.
     NotFound,
@@ -243,6 +277,36 @@ impl std::fmt::Display for Error {
                     f,
                     "WAL replay sanity-check failed at offset {record_offset}: {context}"
                 )
+            }
+            Self::JournalStreamUnavailable { reason } => {
+                write!(f, "attached journal stream unavailable: {reason}")
+            }
+            Self::JournalPositionExpired {
+                requested,
+                checkpoint,
+            } => write!(
+                f,
+                "attached journal position {requested} expired at checkpoint {checkpoint}"
+            ),
+            Self::JournalAnchorMismatch {
+                requested,
+                expected,
+            } => {
+                if requested == expected {
+                    write!(f, "attached journal digest mismatch at position {requested}")
+                } else {
+                    write!(
+                        f,
+                        "attached journal anchor {requested} does not match expected position {expected}"
+                    )
+                }
+            }
+            Self::WalRecordTooLarge { bytes, maximum } => write!(
+                f,
+                "WAL record is too large ({bytes} bytes; maximum {maximum})"
+            ),
+            Self::InvalidJournalScanLimit { reason } => {
+                write!(f, "invalid attached journal scan limit: {reason}")
             }
             Self::NotFound => write!(f, "key not found"),
             Self::DstExists => write!(
@@ -394,6 +458,62 @@ mod tests {
             (
                 Error::SnapshotEpochExhausted.to_string(),
                 "snapshot epoch exhausted",
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn display_covers_attached_journal_errors() {
+        let cases = [
+            (
+                Error::JournalStreamUnavailable {
+                    reason: "stream has not been initialized",
+                }
+                .to_string(),
+                "attached journal stream unavailable: stream has not been initialized",
+            ),
+            (
+                Error::JournalPositionExpired {
+                    requested: 7,
+                    checkpoint: 9,
+                }
+                .to_string(),
+                "attached journal position 7 expired at checkpoint 9",
+            ),
+            (
+                Error::JournalAnchorMismatch {
+                    requested: 8,
+                    expected: 9,
+                }
+                .to_string(),
+                "attached journal anchor 8 does not match expected position 9",
+            ),
+            (
+                Error::JournalAnchorMismatch {
+                    requested: 9,
+                    expected: 9,
+                }
+                .to_string(),
+                "attached journal digest mismatch at position 9",
+            ),
+            (
+                Error::WalRecordTooLarge {
+                    bytes: 17,
+                    maximum: 16,
+                }
+                .to_string(),
+                "WAL record is too large (17 bytes; maximum 16)",
+            ),
+            (
+                Error::InvalidJournalScanLimit {
+                    reason: "row limit must be non-zero",
+                }
+                .to_string(),
+                "invalid attached journal scan limit: row limit must be non-zero",
             ),
         ];
 

@@ -3,7 +3,8 @@
 //! Layered design:
 //!
 //! - [`wal_op`] — the `WalOp` variant union for durable logical
-//!   mutations (`Insert`, `Erase`, `RenameObject`, `Batch`).
+//!   mutations (`Insert`, `Erase`, `RenameObject`, `Batch`, and attached DB
+//!   batches).
 //! - [`codec`] — binary record codec + file header. Pure
 //!   in-memory bytes ↔ `WalOp`.
 //! - [`writer`] — append-only WAL file with
@@ -14,8 +15,9 @@
 //!   committed prefix and runs `sync_data` for `wal_sync = true`
 //!   barriers.
 //! - [`reader`] — forward replay scanner with graceful
-//!   torn-tail handling. Unpacks `Batch` records into per-inner
-//!   callbacks so consumers don't need a `Batch` arm.
+//!   torn-tail handling. Unpacks batch records into per-inner callbacks for
+//!   ordinary replay and validates the retained attached-envelope suffix for
+//!   the public DB recovery API.
 //!
 //! Checkpoint (flush WAL → drain dirty → fdatasync → truncate
 //! WAL) lives in [`crate::Tree::checkpoint`] and the background
@@ -31,7 +33,7 @@ pub(crate) mod ring;
 pub mod wal_op;
 pub mod writer;
 
-pub(crate) use group_commit::Journal;
+pub(crate) use group_commit::{Journal, JournalAck, JournalAppendGuard};
 
 #[cfg(test)]
 mod tests;

@@ -30,16 +30,25 @@
 //! fsync happens only when a sync target is outstanding (sync write or
 //! checkpoint barrier), exactly like legacy group commit.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 
 use crate::api::errors::{Error, Result};
+use crate::api::journal::{
+    JournalAnchor, JournalEnvelope, JournalEnvelopePage, JournalState, MAX_JOURNAL_RECORD_BYTES,
+};
 
+use super::codec::decode_record;
+use super::reader::{
+    scan_attached_envelope_page_from, validate_attached_journal, AttachedEnvelopeResume,
+};
 use super::ring::{ReserveTicket, WalRing};
+use super::wal_op::WalOp;
 use super::writer::WalWriter;
 
 /// Production journal counters surfaced through `Tree::stats`.
@@ -56,9 +65,9 @@ pub(crate) struct JournalStats {
     pub(crate) checkpoint_debt: u64,
 }
 
-/// In-RAM ring capacity. 16 MiB absorbs large metadata bursts between
-/// checkpoints; records are ≤ ~512 KB so a single record always fits.
-const RING_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
+/// In-RAM ring capacity and public encoded-record ceiling. A maximum-size
+/// record fills the ring; smaller records share the remaining burst capacity.
+const RING_CAPACITY_BYTES: usize = MAX_JOURNAL_RECORD_BYTES;
 /// Flusher idle poll. Bounds the async RAM→page-cache window (process-crash
 /// durability) and the latency a sync waiter adds if a wake is ever missed.
 const FLUSH_POLL: Duration = Duration::from_micros(50);
@@ -104,6 +113,14 @@ struct Shared {
 
     control_tx: Sender<Control>,
     record_pool: Mutex<Vec<Vec<u8>>>,
+    path: PathBuf,
+    tail: Mutex<TailState>,
+}
+
+struct TailState {
+    checkpoint: Option<JournalAnchor>,
+    tail: Option<JournalAnchor>,
+    scan_resume: Option<AttachedEnvelopeResume>,
 }
 
 impl Shared {
@@ -270,9 +287,17 @@ pub(crate) struct Journal {
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Exclusive attached-stream append reservation held across DB preflight,
+/// walker mutation, record encoding, and ring publication.
+pub(crate) struct JournalAppendGuard<'a> {
+    journal: &'a Journal,
+    tail: MutexGuard<'a, TailState>,
+}
+
 impl Journal {
-    pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
+    pub(crate) fn open_or_create(path: &Path, tree_id: u64) -> Result<Self> {
         let writer = WalWriter::open_or_create(path, tree_id)?;
+        let attached = validate_attached_journal(path)?;
         let record_base = u64::from(writer.has_records());
         // Mirror legacy reopen seeding: a reopened non-empty WAL is queued
         // and unflushed, so the first checkpoint flushes before making
@@ -299,6 +324,12 @@ impl Journal {
             space_cv: Condvar::new(),
             control_tx,
             record_pool: Mutex::new(Vec::new()),
+            path: path.to_path_buf(),
+            tail: Mutex::new(TailState {
+                checkpoint: attached.map(JournalState::checkpoint),
+                tail: attached.map(JournalState::tail),
+                scan_resume: None,
+            }),
         });
 
         let worker_shared = Arc::clone(&shared);
@@ -316,6 +347,21 @@ impl Journal {
     /// Validate that one encoded record can be accepted without reserving ring
     /// space or changing journal counters.
     pub(crate) fn preflight_submit(&self, record_len: usize) -> Result<()> {
+        self.ensure_ordinary_writes_allowed()?;
+        self.preflight_record_len(record_len)
+    }
+
+    pub(crate) fn ensure_ordinary_writes_allowed(&self) -> Result<()> {
+        if self.shared.tail.lock().unwrap().checkpoint.is_some() {
+            Err(Error::JournalStreamUnavailable {
+                reason: "ordinary WAL records are disabled after attached stream initialization",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn preflight_record_len(&self, record_len: usize) -> Result<()> {
         if let Some(m) = self.shared.sticky_err() {
             return Err(Error::Internal(m));
         }
@@ -323,7 +369,10 @@ impl Journal {
             return Err(Error::Internal("journal record must not be empty"));
         }
         if record_len as u64 > self.shared.ring.capacity() {
-            return Err(Error::Internal("journal record exceeds WAL ring capacity"));
+            return Err(Error::WalRecordTooLarge {
+                bytes: record_len,
+                maximum: MAX_JOURNAL_RECORD_BYTES,
+            });
         }
         Ok(())
     }
@@ -332,6 +381,10 @@ impl Journal {
     /// (recycled here after the ring copies it). Sync appends return an ack.
     pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
         self.preflight_submit(bytes.len())?;
+        self.publish(bytes, sync)
+    }
+
+    fn publish(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
         // Reserve → backpressure wait → memcpy → publish. Backpressure parks on
         // the flusher advancing `flush_cursor`, so a full ring does not spin.
         let ticket = self.shared.ring.reserve(bytes.len() as u64);
@@ -360,6 +413,99 @@ impl Journal {
 
     pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
         self.shared.record_buffer(min_capacity)
+    }
+
+    pub(crate) fn initialize_anchor(&self, genesis: JournalAnchor) -> Result<()> {
+        let mut tail = self.shared.tail.lock().unwrap();
+        match tail.checkpoint {
+            Some(existing) if existing == genesis => {
+                // A prior initialization can fail after it syncs only one
+                // anchor generation. Repair the sibling before an exact retry
+                // reports success.
+                self.shared
+                    .writer
+                    .lock()
+                    .unwrap()
+                    .persist_checkpoint_anchor(genesis)?;
+                return Ok(());
+            }
+            Some(existing) => {
+                return Err(Error::JournalAnchorMismatch {
+                    requested: genesis.sequence(),
+                    expected: existing.sequence(),
+                });
+            }
+            None => {}
+        }
+        if self.needs_checkpoint() {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "WAL must be checkpoint-clean before stream initialization",
+            });
+        }
+        let mut writer = self.shared.writer.lock().unwrap();
+        writer.persist_checkpoint_anchor(genesis)?;
+        tail.checkpoint = Some(genesis);
+        tail.tail = Some(genesis);
+        tail.scan_resume = None;
+        Ok(())
+    }
+
+    pub(crate) fn state(&self) -> Option<JournalState> {
+        let tail = self.shared.tail.lock().unwrap();
+        Some(JournalState::new(tail.checkpoint?, tail.tail?))
+    }
+
+    pub(crate) fn begin_attached(
+        &self,
+        expected_previous: JournalAnchor,
+        record_len: usize,
+    ) -> Result<JournalAppendGuard<'_>> {
+        self.preflight_record_len(record_len)?;
+        let tail = self.shared.tail.lock().unwrap();
+        let Some(expected) = tail.tail else {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "stream has not been initialized",
+            });
+        };
+        if expected_previous != expected {
+            return Err(Error::JournalAnchorMismatch {
+                requested: expected_previous.sequence(),
+                expected: expected.sequence(),
+            });
+        }
+        Ok(JournalAppendGuard {
+            journal: self,
+            tail,
+        })
+    }
+
+    pub(crate) fn envelopes_after(
+        &self,
+        cursor: JournalAnchor,
+        row_limit: usize,
+        payload_byte_limit: usize,
+    ) -> Result<JournalEnvelopePage> {
+        // The DB caller holds the commit gate on its checkpoint side. Lock the
+        // attached tail before flushing so no attached writer can publish a
+        // new record between the durability barrier and the file scan.
+        let mut tail = self.shared.tail.lock().unwrap();
+        self.flush_up_to(self.queued_work())?;
+        match scan_attached_envelope_page_from(
+            &self.shared.path,
+            cursor,
+            row_limit,
+            payload_byte_limit,
+            tail.scan_resume,
+        ) {
+            Ok((page, resume)) => {
+                tail.scan_resume = Some(resume);
+                Ok(page)
+            }
+            Err(error) => {
+                tail.scan_resume = None;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn queued_work(&self) -> u64 {
@@ -417,6 +563,42 @@ impl Journal {
     }
 }
 
+impl JournalAppendGuard<'_> {
+    pub(crate) fn record_buffer(&self, min_capacity: usize) -> Vec<u8> {
+        self.journal.shared.record_buffer(min_capacity)
+    }
+
+    pub(crate) fn submit(
+        mut self,
+        record: Vec<u8>,
+        envelope: &JournalEnvelope,
+        sync: bool,
+    ) -> Result<Option<JournalAck>> {
+        let decoded = decode_record(&record)?;
+        let WalOp::DbBatchWithEnvelope {
+            envelope: encoded, ..
+        } = decoded.op
+        else {
+            return Err(Error::Internal("attached submit requires WAL tag 13"));
+        };
+        if &encoded != envelope {
+            return Err(Error::Internal(
+                "attached submit envelope differs from encoded WAL record",
+            ));
+        }
+        let expected = self.tail.tail.expect("begin_attached initialized tail");
+        if envelope.previous() != expected {
+            return Err(Error::JournalAnchorMismatch {
+                requested: envelope.previous().sequence(),
+                expected: expected.sequence(),
+            });
+        }
+        let ack = self.journal.publish(record, sync)?;
+        self.tail.tail = Some(envelope.current());
+        Ok(ack)
+    }
+}
+
 impl Drop for Journal {
     fn drop(&mut self) {
         let _ = self.shared.control_tx.send(Control::Stop);
@@ -454,13 +636,20 @@ fn do_truncate(shared: &Shared) -> Result<()> {
     if let Some(m) = shared.sticky_err() {
         return Err(Error::Internal(m));
     }
+    // The caller holds the external commit gate on its checkpoint side, so no
+    // ordinary submit can race this point. Attached writers additionally take
+    // this tail gate while still under their commit writer guard.
+    let mut tail = shared.tail.lock().unwrap();
+    let anchor = tail.tail;
     let mut w = shared.writer.lock().unwrap();
-    w.truncate()?;
+    w.checkpoint_and_truncate(anchor)?;
     drop(w);
     // The ring is fully drained (the drain above caught up; no concurrent
     // writer under the checkpoint gate). Reset byte cursors; record count is
     // preserved as the stable cross-truncation order.
     shared.ring.reset_after_drain();
+    tail.checkpoint = anchor;
+    tail.scan_resume = None;
     Ok(())
 }
 
@@ -554,9 +743,13 @@ mod tests {
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
         assert!(journal.submit(Vec::new(), false).is_err());
-        assert!(journal
-            .submit(vec![0; RING_CAPACITY_BYTES + 1], false)
-            .is_err());
+        assert!(matches!(
+            journal.submit(vec![0; RING_CAPACITY_BYTES + 1], false),
+            Err(Error::WalRecordTooLarge {
+                bytes,
+                maximum: MAX_JOURNAL_RECORD_BYTES,
+            }) if bytes == MAX_JOURNAL_RECORD_BYTES + 1
+        ));
 
         journal.submit(vec![1, 2, 3, 4], false).unwrap();
         journal.flush_up_to(journal.queued_work()).unwrap();

@@ -391,6 +391,9 @@ single-node embedded library, no always-on MVCC version chains.
 
 ### P1 — WAL tail / change feed with explicit retention
 
+- Holt 0.9 exposes a local checkpoint-bounded recovery suffix through
+  `DB::journal_envelopes_after`. This is a crash-recovery primitive for
+  one file store, not a live subscription or shared change feed.
 - Expose a change-feed API only after WAL retention is designed.
   Today's checkpoint path truncates WAL, so `subscribe(from_seq)`
   cannot pretend old history is always available.

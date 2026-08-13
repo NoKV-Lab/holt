@@ -33,6 +33,7 @@
 
 use super::wal_op::WalOp;
 use crate::api::errors::{Error, Result};
+use crate::api::journal::{JournalAnchor, JournalEnvelope, JOURNAL_DIGEST_BYTES};
 
 /// Start-of-record magic — `"RECR"` little-endian.
 pub const RECORD_MAGIC: u32 = 0x5243_4552;
@@ -50,11 +51,16 @@ pub const RECORD_FOOTER_SIZE: usize = 4;
 /// one of our WAL files".
 pub const FILE_MAGIC: u32 = 0x414C_4157;
 
-/// Format version stored in the file header. New format revisions
-/// bump this and grow the header (in the reserved tail) rather
-/// than moving existing fields.
+/// Previous public format accepted by the replay reader.
 ///
-/// v0.3.0 ships format `3`: dropped the dead `prev_value` field
+/// Format 3 contains only the original logical redo tags. It is replay-only
+/// under a format-4 writer: callers must checkpoint it with a format-3 Holt
+/// binary before reopening for new writes.
+pub const LEGACY_FORMAT_VERSION: u32 = 3;
+
+/// Format version emitted by new WAL writers.
+///
+/// Format `3` dropped the dead `prev_value` field
 /// from `WalOp::Insert` and the dead `value` field from
 /// `WalOp::Erase`. Both were "for replay reversibility" but
 /// replay never undoes — it's an idempotent forward redo that
@@ -69,33 +75,61 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// first so the WAL is truncated before opening it with v0.3.0.
 /// The v0.2 → v0.3.0 public upgrade follows the same
 /// "checkpoint before upgrade" rule.
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// Format `4` adds `DbBatchWithEnvelope` (tag 13). Its application recovery
+/// bytes and logical DB operations are covered by one record CRC.
+pub const FORMAT_VERSION: u32 = 4;
 
-/// File-header byte size. The record stream starts at this offset.
-pub const FILE_HEADER_SIZE: usize = 32;
+/// Legacy format-3 header byte size and record-stream offset.
+pub const LEGACY_FILE_HEADER_SIZE: usize = 32;
 
-/// Top-of-file layout:
+/// Format-4 page header byte size and record-stream offset.
+///
+/// Keeping records page-aligned leaves room for two independently checksummed
+/// checkpoint-anchor slots without rewriting the append stream.
+pub const FILE_HEADER_SIZE: usize = 4096;
+
+const ANCHOR_SLOT_MAGIC: u32 = 0x5248_4341; // "ACHR" little-endian.
+const ANCHOR_SLOT_VERSION: u32 = 1;
+pub(crate) const ANCHOR_SLOT_SIZE: usize = 128;
+pub(crate) const ANCHOR_SLOT_OFFSETS: [usize; 2] = [64, 64 + ANCHOR_SLOT_SIZE];
+const ANCHOR_SLOT_CHECKSUM_OFFSET: usize = 64;
+const ANCHOR_SLOT_FLAG_INITIALIZED: u64 = 1;
+
+/// Format-4 top-of-file layout:
 ///
 /// ```text
-/// +------+------+------+--------+--------+
-/// | MAGIC|  VER | TREE | CREATED|  RSVD  |
-/// |  u32 |  u32 |  u64 |   u64  |  u64   |
-/// +------+------+------+--------+--------+
+/// base[32] | padding[32] | anchor_slot_a[128] | anchor_slot_b[128]
+///           |                         zero padding to 4096 bytes            |
+///
+/// base = MAGIC:u32 | VER:u32 | TREE:u64 | CREATED:u64 | HEADER_SIZE:u64
+/// slot = MAGIC:u32 | VER:u32 | GENERATION:u64 | FLAGS:u64
+///        | SEQUENCE:u64 | DIGEST:[u8;32] | CRC32:u32 | padding[60]
 /// ```
 ///
 /// - `MAGIC` = [`FILE_MAGIC`] (`"WALA"` LE).
-/// - `VER`   = [`FORMAT_VERSION`].
+/// - `VER`   = [`FORMAT_VERSION`] for new files; replay also accepts
+///   [`LEGACY_FORMAT_VERSION`].
 /// - `TREE`  = tree owner identifier; `0` for the single-tree API.
 /// - `CREATED` = unix epoch seconds; `0` when the writer chose
 ///   not to stamp a time (e.g. tests).
-/// - `RSVD`  = reserved for a future version bump, must be `0`.
+/// - `HEADER_SIZE` = [`FILE_HEADER_SIZE`].
+/// - Each initialized anchor slot has an independent generation and CRC.
+///   Decode selects the highest valid generation. Checkpoint updates write and
+///   sync both slots in sequence before they truncate the record stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeader {
+    /// On-disk WAL format version.
+    pub version: u32,
     /// Tree owner identifier.
     pub tree_id: u64,
     /// Unix-epoch seconds when the file was created. `0` if the
     /// writer didn't stamp one.
     pub created_at: u64,
+    /// Latest checkpoint anchor recovered from the two format-4 slots.
+    pub checkpoint_anchor: Option<JournalAnchor>,
+    /// Generation of `checkpoint_anchor`; zero when uninitialized.
+    pub anchor_generation: u64,
 }
 
 impl FileHeader {
@@ -106,8 +140,21 @@ impl FileHeader {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         Self {
+            version: FORMAT_VERSION,
             tree_id,
             created_at,
+            checkpoint_anchor: None,
+            anchor_generation: 0,
+        }
+    }
+
+    /// Byte offset at which this format's record stream starts.
+    #[must_use]
+    pub const fn record_offset(self) -> usize {
+        if self.version == LEGACY_FORMAT_VERSION {
+            LEGACY_FILE_HEADER_SIZE
+        } else {
+            FILE_HEADER_SIZE
         }
     }
 }
@@ -115,19 +162,34 @@ impl FileHeader {
 /// Encode the file header into the first [`FILE_HEADER_SIZE`] bytes
 /// of `out` (the buffer is resized as needed).
 pub fn encode_file_header(h: &FileHeader, out: &mut Vec<u8>) {
+    let start = out.len();
     out.extend_from_slice(&FILE_MAGIC.to_le_bytes());
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&h.version.to_le_bytes());
     out.extend_from_slice(&h.tree_id.to_le_bytes());
     out.extend_from_slice(&h.created_at.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes());
-    debug_assert_eq!(out.len(), FILE_HEADER_SIZE);
+    if h.version == LEGACY_FORMAT_VERSION {
+        out.extend_from_slice(&0u64.to_le_bytes());
+        debug_assert_eq!(out.len() - start, LEGACY_FILE_HEADER_SIZE);
+        return;
+    }
+
+    out.extend_from_slice(&(FILE_HEADER_SIZE as u64).to_le_bytes());
+    out.resize(start + FILE_HEADER_SIZE, 0);
+    if let Some(anchor) = h.checkpoint_anchor {
+        debug_assert_ne!(h.anchor_generation, 0);
+        let slot_index = ((h.anchor_generation - 1) & 1) as usize;
+        let slot = encode_anchor_slot(anchor, h.anchor_generation);
+        let offset = start + ANCHOR_SLOT_OFFSETS[slot_index];
+        out[offset..offset + ANCHOR_SLOT_SIZE].copy_from_slice(&slot);
+    }
+    debug_assert_eq!(out.len() - start, FILE_HEADER_SIZE);
 }
 
 /// Decode a file header from the first [`FILE_HEADER_SIZE`] bytes
 /// of `buf`. Returns the header on success and a sanity-failed
 /// error (with `record_offset = 0`) on mismatch.
 pub fn decode_file_header(buf: &[u8]) -> Result<FileHeader> {
-    if buf.len() < FILE_HEADER_SIZE {
+    if buf.len() < LEGACY_FILE_HEADER_SIZE {
         return Err(sanity("WAL file header truncated"));
     }
     let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -135,19 +197,128 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeader> {
         return Err(sanity("WAL file magic mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != LEGACY_FORMAT_VERSION && version != FORMAT_VERSION {
         return Err(sanity("WAL file format version unsupported"));
+    }
+    let required = if version == LEGACY_FORMAT_VERSION {
+        LEGACY_FILE_HEADER_SIZE
+    } else {
+        FILE_HEADER_SIZE
+    };
+    if buf.len() < required {
+        return Err(sanity("WAL file header truncated"));
     }
     let tree_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let created_at = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    // bytes 24..32 reserved; ignore for forward-compatibility.
+    if version == FORMAT_VERSION {
+        let encoded_size = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        if encoded_size != FILE_HEADER_SIZE as u64 {
+            return Err(sanity("WAL format-4 header size mismatch"));
+        }
+    }
+    let (checkpoint_anchor, anchor_generation) = if version == FORMAT_VERSION {
+        decode_checkpoint_anchor(buf)?
+    } else {
+        (None, 0)
+    };
     Ok(FileHeader {
+        version,
         tree_id,
         created_at,
+        checkpoint_anchor,
+        anchor_generation,
     })
 }
 
-// On-disk variant tags. Stable for format v3; only ever add new
+/// Return the header size named by the prefix, without requiring the full
+/// format-4 page to be present yet.
+pub(crate) fn file_header_size_from_prefix(prefix: &[u8]) -> Result<usize> {
+    if prefix.len() < 8 {
+        return Err(sanity("WAL file header truncated"));
+    }
+    let magic = u32::from_le_bytes(prefix[0..4].try_into().unwrap());
+    if magic != FILE_MAGIC {
+        return Err(sanity("WAL file magic mismatch"));
+    }
+    match u32::from_le_bytes(prefix[4..8].try_into().unwrap()) {
+        LEGACY_FORMAT_VERSION => Ok(LEGACY_FILE_HEADER_SIZE),
+        FORMAT_VERSION => Ok(FILE_HEADER_SIZE),
+        _ => Err(sanity("WAL file format version unsupported")),
+    }
+}
+
+pub(crate) fn encode_anchor_slot(anchor: JournalAnchor, generation: u64) -> [u8; ANCHOR_SLOT_SIZE] {
+    debug_assert_ne!(generation, 0);
+    let mut slot = [0u8; ANCHOR_SLOT_SIZE];
+    slot[0..4].copy_from_slice(&ANCHOR_SLOT_MAGIC.to_le_bytes());
+    slot[4..8].copy_from_slice(&ANCHOR_SLOT_VERSION.to_le_bytes());
+    slot[8..16].copy_from_slice(&generation.to_le_bytes());
+    slot[16..24].copy_from_slice(&ANCHOR_SLOT_FLAG_INITIALIZED.to_le_bytes());
+    slot[24..32].copy_from_slice(&anchor.sequence().to_le_bytes());
+    slot[32..64].copy_from_slice(&anchor.digest());
+    let checksum = crc32(&slot[..ANCHOR_SLOT_CHECKSUM_OFFSET]);
+    slot[ANCHOR_SLOT_CHECKSUM_OFFSET..ANCHOR_SLOT_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+    slot
+}
+
+fn decode_checkpoint_anchor(buf: &[u8]) -> Result<(Option<JournalAnchor>, u64)> {
+    let mut valid = Vec::with_capacity(2);
+    let mut nonzero_slots = 0;
+    for &offset in &ANCHOR_SLOT_OFFSETS {
+        let slot = &buf[offset..offset + ANCHOR_SLOT_SIZE];
+        if slot.iter().any(|byte| *byte != 0) {
+            nonzero_slots += 1;
+        }
+        if let Some(decoded) = decode_anchor_slot(slot) {
+            valid.push(decoded);
+        }
+    }
+    if valid.is_empty() {
+        // One non-zero invalid slot can only be a torn first initialization;
+        // the all-zero sibling is still the authoritative uninitialized state.
+        if nonzero_slots > 1 {
+            return Err(sanity("WAL checkpoint anchor slots corrupt"));
+        }
+        return Ok((None, 0));
+    }
+    valid.sort_unstable_by_key(|(_, generation)| *generation);
+    if valid.len() == 2 && valid[0].1 == valid[1].1 && valid[0].0 != valid[1].0 {
+        return Err(sanity("WAL checkpoint anchor generations conflict"));
+    }
+    let (anchor, generation) = *valid.last().unwrap();
+    Ok((Some(anchor), generation))
+}
+
+fn decode_anchor_slot(slot: &[u8]) -> Option<(JournalAnchor, u64)> {
+    if slot.len() != ANCHOR_SLOT_SIZE {
+        return None;
+    }
+    let magic = u32::from_le_bytes(slot[0..4].try_into().ok()?);
+    let version = u32::from_le_bytes(slot[4..8].try_into().ok()?);
+    let generation = u64::from_le_bytes(slot[8..16].try_into().ok()?);
+    let flags = u64::from_le_bytes(slot[16..24].try_into().ok()?);
+    if magic != ANCHOR_SLOT_MAGIC
+        || version != ANCHOR_SLOT_VERSION
+        || generation == 0
+        || flags != ANCHOR_SLOT_FLAG_INITIALIZED
+    {
+        return None;
+    }
+    let expected = u32::from_le_bytes(
+        slot[ANCHOR_SLOT_CHECKSUM_OFFSET..ANCHOR_SLOT_CHECKSUM_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    );
+    if crc32(&slot[..ANCHOR_SLOT_CHECKSUM_OFFSET]) != expected {
+        return None;
+    }
+    let sequence = u64::from_le_bytes(slot[24..32].try_into().ok()?);
+    let digest = slot[32..64].try_into().ok()?;
+    Some((JournalAnchor::new(sequence, digest), generation))
+}
+
+// On-disk variant tags. Stable through format v4; only ever add new
 // tags, never renumber existing ones. Tags 2..4 and 6..9 are
 // intentionally unassigned in production: an internal v0.3 draft
 // had non-emitted structural / multi-tree variants there, but
@@ -159,6 +330,10 @@ const TY_RENAME_OBJECT: u8 = 5;
 const TY_BATCH: u8 = 10;
 const TY_BATCH_INSERT_RUN: u8 = 11;
 const TY_BATCH_INSERT_PREFIX_RUN: u8 = 12;
+const TY_DB_BATCH_WITH_ENVELOPE: u8 = 13;
+
+/// Version of the envelope sub-frame carried by tag 13.
+const JOURNAL_ENVELOPE_WIRE_VERSION: u8 = 1;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
@@ -288,8 +463,10 @@ pub(crate) const fn encoded_rename_object_record_len(
 ///
 /// Lifecycle:
 ///
-/// 1. [`BatchEncoder::begin`] writes the record header and the
-///    batch body prefix (`tree_id` + zero-placeholder inner-count).
+/// 1. [`BatchEncoder::begin`] or [`BatchEncoder::begin_with_envelope`]
+///    writes the record header and batch body prefix (`tree_id` plus a
+///    zero-placeholder inner count). The attached form then writes its
+///    validated application envelope before the operation stream.
 /// 2. The caller interleaves walker mutations with
 ///    [`Self::push_insert`] / [`Self::push_insert_run`] /
 ///    [`Self::push_erase`] / [`Self::push_rename_object`] calls.
@@ -325,17 +502,57 @@ impl<'buf> BatchEncoder<'buf> {
     /// (tree_id, zero-placeholder count) are written immediately;
     /// subsequent `push_*` calls extend the body.
     pub fn begin(out: &'buf mut Vec<u8>, seq: u64, tree_id: u64) -> Self {
-        out.reserve(RECORD_HEADER_SIZE + 8 + 4 + RECORD_FOOTER_SIZE);
+        Self::begin_record(out, seq, tree_id, TY_BATCH, None)
+    }
+
+    /// Open a format-4 DB `Batch` record with one recovery envelope attached.
+    ///
+    /// The body layout is:
+    ///
+    /// ```text
+    /// tree_id:u64 | count:u32 | envelope_version:u8
+    /// previous_sequence:u64 | previous_digest:[u8;32]
+    /// current_sequence:u64  | current_digest:[u8;32]
+    /// payload_len:u32 | payload:[u8;payload_len] | inner_ops...
+    /// ```
+    ///
+    /// `finish` computes one CRC over the record header, the full envelope,
+    /// and all inner operations. The application payload remains opaque.
+    // This is the format-4 producer seam. The DB API calls it in the next
+    // integration slice; keeping the allow local avoids masking other dead code.
+    #[allow(dead_code)]
+    pub fn begin_with_envelope(
+        out: &'buf mut Vec<u8>,
+        seq: u64,
+        tree_id: u64,
+        envelope: &JournalEnvelope,
+    ) -> Self {
+        Self::begin_record(out, seq, tree_id, TY_DB_BATCH_WITH_ENVELOPE, Some(envelope))
+    }
+
+    fn begin_record(
+        out: &'buf mut Vec<u8>,
+        seq: u64,
+        tree_id: u64,
+        ty: u8,
+        envelope: Option<&JournalEnvelope>,
+    ) -> Self {
+        let envelope_len =
+            envelope.map_or(0, |value| encoded_journal_envelope_len(value.payload()));
+        out.reserve(RECORD_HEADER_SIZE + 8 + 4 + envelope_len + RECORD_FOOTER_SIZE);
         let start = out.len();
         out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
         let len_pos = out.len();
         out.extend_from_slice(&[0u8; 4]);
         out.extend_from_slice(&seq.to_le_bytes());
-        out.push(TY_BATCH);
+        out.push(ty);
         let body_start = out.len();
         out.extend_from_slice(&tree_id.to_le_bytes());
         let count_pos = out.len();
         out.extend_from_slice(&[0u8; 4]);
+        if let Some(envelope) = envelope {
+            encode_journal_envelope(envelope, out);
+        }
         Self {
             out,
             start,
@@ -504,6 +721,7 @@ fn variant_tag(op: &WalOp) -> u8 {
         WalOp::Erase { .. } => TY_ERASE,
         WalOp::RenameObject { .. } => TY_RENAME_OBJECT,
         WalOp::Batch { .. } => TY_BATCH,
+        WalOp::DbBatchWithEnvelope { .. } => TY_DB_BATCH_WITH_ENVELOPE,
     }
 }
 
@@ -541,14 +759,44 @@ fn encode_body(op: &WalOp, out: &mut Vec<u8>) {
             for inner in ops {
                 let inner_ty = variant_tag(inner);
                 assert!(
-                    inner_ty != TY_BATCH,
+                    inner_ty != TY_BATCH && inner_ty != TY_DB_BATCH_WITH_ENVELOPE,
                     "nested Batch is rejected — Tree::atomic must flatten",
                 );
                 out.push(inner_ty);
                 encode_body(inner, out);
             }
         }
+        WalOp::DbBatchWithEnvelope { envelope, ops } => {
+            out.extend_from_slice(&0u64.to_le_bytes());
+            let count = u32::try_from(ops.len()).expect("batch ops fit in u32");
+            out.extend_from_slice(&count.to_le_bytes());
+            encode_journal_envelope(envelope, out);
+            for inner in ops {
+                let inner_ty = variant_tag(inner);
+                assert!(
+                    inner_ty != TY_BATCH && inner_ty != TY_DB_BATCH_WITH_ENVELOPE,
+                    "nested Batch is rejected — DB::atomic must flatten",
+                );
+                out.push(inner_ty);
+                encode_body(inner, out);
+            }
+        }
     }
+}
+
+fn encoded_journal_envelope_len(payload: &[u8]) -> usize {
+    1 + 8 + JOURNAL_DIGEST_BYTES + 8 + JOURNAL_DIGEST_BYTES + 4 + payload.len()
+}
+
+fn encode_journal_envelope(envelope: &JournalEnvelope, out: &mut Vec<u8>) {
+    out.push(JOURNAL_ENVELOPE_WIRE_VERSION);
+    let previous = envelope.previous();
+    out.extend_from_slice(&previous.sequence().to_le_bytes());
+    out.extend_from_slice(&previous.digest());
+    let current = envelope.current();
+    out.extend_from_slice(&current.sequence().to_le_bytes());
+    out.extend_from_slice(&current.digest());
+    write_bytes(out, envelope.payload());
 }
 
 fn write_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -653,13 +901,18 @@ fn decode_body_into(ty: u8, body: &mut &[u8]) -> Result<WalOp> {
                 force,
             }
         }
-        TY_BATCH => {
+        TY_BATCH | TY_DB_BATCH_WITH_ENVELOPE => {
             let _tree_id = read_u64(body)?;
             let count = read_u32(body)? as usize;
+            let envelope = if ty == TY_DB_BATCH_WITH_ENVELOPE {
+                Some(decode_journal_envelope(body)?)
+            } else {
+                None
+            };
             let mut ops = Vec::with_capacity(count);
             while ops.len() < count {
                 let inner_ty = read_u8(body)?;
-                if inner_ty == TY_BATCH {
+                if inner_ty == TY_BATCH || inner_ty == TY_DB_BATCH_WITH_ENVELOPE {
                     return Err(sanity("nested Batch is rejected"));
                 }
                 match inner_ty {
@@ -671,11 +924,42 @@ fn decode_body_into(ty: u8, body: &mut &[u8]) -> Result<WalOp> {
                     }
                 }
             }
-            WalOp::Batch { ops }
+            if let Some(envelope) = envelope {
+                WalOp::DbBatchWithEnvelope { envelope, ops }
+            } else {
+                WalOp::Batch { ops }
+            }
         }
         _ => return Err(sanity("unknown WalOp variant tag")),
     };
     Ok(op)
+}
+
+fn decode_journal_envelope(body: &mut &[u8]) -> Result<JournalEnvelope> {
+    let wire_version = read_u8(body)?;
+    if wire_version != JOURNAL_ENVELOPE_WIRE_VERSION {
+        return Err(sanity("journal envelope wire version unsupported"));
+    }
+
+    let previous_sequence = read_u64(body)?;
+    let previous_digest = read_digest(body)?;
+    let current_sequence = read_u64(body)?;
+    let current_digest = read_digest(body)?;
+    let payload = read_bytes(body)?;
+    JournalEnvelope::new(
+        JournalAnchor::new(previous_sequence, previous_digest),
+        JournalAnchor::new(current_sequence, current_digest),
+        payload,
+    )
+    .map_err(|error| match error {
+        crate::JournalEnvelopeError::NonContiguousSequence { .. } => {
+            sanity("journal envelope sequence is not contiguous")
+        }
+        crate::JournalEnvelopeError::EmptyPayload => sanity("journal envelope payload is empty"),
+        crate::JournalEnvelopeError::PayloadTooLarge { .. } => {
+            sanity("journal envelope payload is too large")
+        }
+    })
 }
 
 fn decode_insert_run(body: &mut &[u8], batch_count: usize, ops: &mut Vec<WalOp>) -> Result<()> {
@@ -750,6 +1034,12 @@ fn read_u64(body: &mut &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(front.try_into().unwrap()))
 }
 
+fn read_digest(body: &mut &[u8]) -> Result<[u8; JOURNAL_DIGEST_BYTES]> {
+    let (front, rest) = take(body, JOURNAL_DIGEST_BYTES)?;
+    *body = rest;
+    Ok(front.try_into().unwrap())
+}
+
 fn read_bytes(body: &mut &[u8]) -> Result<Vec<u8>> {
     let len = read_u32(body)? as usize;
     let (front, rest) = take(body, len)?;
@@ -776,6 +1066,16 @@ fn sanity(context: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
+
+    fn sample_envelope() -> JournalEnvelope {
+        JournalEnvelope::new(
+            JournalAnchor::new(41, [0x11; JOURNAL_DIGEST_BYTES]),
+            JournalAnchor::new(42, [0x22; JOURNAL_DIGEST_BYTES]),
+            b"rv1".to_vec(),
+        )
+        .unwrap()
+    }
 
     fn roundtrip(op: WalOp, seq: u64) {
         let mut buf = Vec::new();
@@ -1077,6 +1377,155 @@ mod tests {
             WalOp::Batch { ops } => assert!(ops.is_empty()),
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attached_batch_streaming_and_enum_encoders_match() {
+        let envelope = sample_envelope();
+        let mut streaming = Vec::new();
+        {
+            let mut encoder =
+                BatchEncoder::begin_with_envelope(&mut streaming, 1_000, 0, &envelope);
+            encoder.push_insert(7, b"k", b"v");
+            assert_eq!(encoder.finish(), 1);
+        }
+
+        let attached = WalOp::DbBatchWithEnvelope {
+            envelope: envelope.clone(),
+            ops: vec![WalOp::Insert {
+                tree_id: 7,
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        let mut generic = Vec::new();
+        encode_record(&attached, 1_000, &mut generic);
+        assert_eq!(streaming, generic);
+
+        let decoded = decode_record(&streaming).unwrap();
+        assert_eq!(decoded.seq, 1_000);
+        assert_eq!(decoded.bytes_consumed, streaming.len());
+        match decoded.op {
+            WalOp::DbBatchWithEnvelope {
+                envelope: decoded_envelope,
+                ops,
+            } => {
+                assert_eq!(decoded_envelope, envelope);
+                assert!(matches!(
+                    ops.as_slice(),
+                    [WalOp::Insert {
+                        tree_id: 7,
+                        key,
+                        value,
+                    }] if key == b"k" && value == b"v"
+                ));
+            }
+            other => panic!("expected attached DB batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attached_batch_has_stable_format_4_golden_bytes() {
+        let envelope = sample_envelope();
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = BatchEncoder::begin_with_envelope(&mut encoded, 1_000, 0, &envelope);
+            encoder.push_insert(7, b"k", b"v");
+            encoder.finish();
+        }
+
+        let actual = encoded.iter().fold(String::new(), |mut output, byte| {
+            write!(output, "{byte:02x}").unwrap();
+            output
+        });
+        assert_eq!(
+            actual,
+            concat!(
+                "5245435277000000e8030000000000000d0000000000000000010000000129",
+                "0000000000000011111111111111111111111111111111111111111111111111",
+                "111111111111112a000000000000002222222222222222222222222222222222",
+                "2222222222222222222222222222220300000072763100070000000000000001",
+                "0000006b0100000076ca022951"
+            )
+        );
+    }
+
+    #[test]
+    fn attached_batch_crc_covers_envelope_and_inner_ops() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder =
+                BatchEncoder::begin_with_envelope(&mut encoded, 1_000, 0, &sample_envelope());
+            encoder.push_insert(7, b"k", b"v");
+            encoder.finish();
+        }
+
+        let payload_offset = encoded
+            .windows(3)
+            .position(|window| window == b"rv1")
+            .unwrap();
+        let mut envelope_corrupt = encoded.clone();
+        envelope_corrupt[payload_offset] ^= 0x01;
+        assert!(matches!(
+            decode_record(&envelope_corrupt),
+            Err(Error::ReplaySanityFailed {
+                context: "record CRC mismatch",
+                ..
+            })
+        ));
+
+        let mut op_corrupt = encoded;
+        let value_offset = op_corrupt.len() - RECORD_FOOTER_SIZE - 1;
+        op_corrupt[value_offset] ^= 0x01;
+        assert!(matches!(
+            decode_record(&op_corrupt),
+            Err(Error::ReplaySanityFailed {
+                context: "record CRC mismatch",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn attached_batch_rejects_bad_envelope_version_and_sequence() {
+        let mut encoded = Vec::new();
+        {
+            let encoder =
+                BatchEncoder::begin_with_envelope(&mut encoded, 1_000, 0, &sample_envelope());
+            encoder.finish();
+        }
+
+        let envelope_version_offset = RECORD_HEADER_SIZE + 8 + 4;
+        let mut bad_version = encoded.clone();
+        bad_version[envelope_version_offset] = 2;
+        rewrite_record_crc(&mut bad_version);
+        assert!(matches!(
+            decode_record(&bad_version),
+            Err(Error::ReplaySanityFailed {
+                context: "journal envelope wire version unsupported",
+                ..
+            })
+        ));
+
+        let current_sequence_offset = envelope_version_offset + 1 + 8 + JOURNAL_DIGEST_BYTES;
+        let mut bad_sequence = encoded;
+        bad_sequence[current_sequence_offset..current_sequence_offset + 8]
+            .copy_from_slice(&43u64.to_le_bytes());
+        rewrite_record_crc(&mut bad_sequence);
+        assert!(matches!(
+            decode_record(&bad_sequence),
+            Err(Error::ReplaySanityFailed {
+                context: "journal envelope sequence is not contiguous",
+                ..
+            })
+        ));
+    }
+
+    fn rewrite_record_crc(encoded: &mut [u8]) {
+        let body_len = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+        let body_end = RECORD_HEADER_SIZE + body_len;
+        let checksum = crc32(&encoded[..body_end]);
+        encoded[body_end..body_end + RECORD_FOOTER_SIZE].copy_from_slice(&checksum.to_le_bytes());
     }
 
     #[test]

@@ -185,6 +185,13 @@ impl Pipeline {
                     shared.truncates.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            if let Some(journal) = &shared.volatile_journal {
+                // `maintenance -> commit -> volatile journal` matches the
+                // attached-write lock order. At this point the complete
+                // in-memory store image is clean, so the stream can discard
+                // every envelope through its current tail.
+                journal.checkpoint();
+            }
             shared.bm.take_retired_orphans_bounded(256)
         };
         // A clean frontier durably publishes every current parent image.

@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod db;
 pub mod errors;
+pub mod journal;
 pub mod key;
 pub mod snapshot;
 pub mod stats;

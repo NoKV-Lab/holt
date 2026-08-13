@@ -214,10 +214,13 @@ atomically. `put` / `delete` / `get` never take `rename_lock`.
 Mutations emit encoded `WalOp` records to an append-only
 `journal.wal` file via the journal worker. The durable variants
 are the logical API mutations: `Insert`, `Erase`, `RenameObject`,
-and `Batch`. Blob-shape changes (`splitBlob`, `mergeBlob`,
-`compactBlob`) are recovered either by replaying those logical
-records or by loading checkpointed blob images; they are not
-standalone WAL records. Each record is
+`Batch`, and `DbBatchWithEnvelope`. The last variant stores one
+application recovery envelope and its guarded multi-tree mutation in one
+CRC-covered WAL record. With `Durability::Wal { sync: true }`, Holt syncs that
+record as a unit. Blob-shape changes
+(`splitBlob`, `mergeBlob`, `compactBlob`) are recovered either by
+replaying those logical records or by loading checkpointed blob
+images; they are not standalone WAL records. Each record is
 
 ```text
 MAGIC | LEN | SEQ | TY | BODY | CRC32
@@ -233,6 +236,15 @@ variant tag on each record. Torn tails (mid-write power loss)
 are recovered gracefully — the scanner reports the offset where
 it stopped; real mid-file corruption surfaces as
 `Error::ReplaySanityFailed` with the bad record's offset.
+
+WAL format 4 reserves a 4096-byte header page with two checksummed
+application-anchor slots. `DB::atomic_with_journal_envelope` appends one
+`DbBatchWithEnvelope` record. After an application initializes the stream,
+Holt rejects ordinary logical writes before mutation. A clean checkpoint
+syncs both anchor slots before it truncates the retained WAL suffix.
+`DB::journal_envelopes_after` exposes only the local suffix after that
+checkpoint floor. The API does not provide a shared log or unbounded change
+feed.
 
 ### `BufferManager` — cache + dirty/pending tracking
 
