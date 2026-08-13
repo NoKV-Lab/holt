@@ -67,7 +67,7 @@ system built for that shape.
 
 ```toml
 [dependencies]
-holt = "0.8"
+holt = "0.9"
 ```
 
 File-backed trees are Unix-only. Linux uses the `io-uring` feature by
@@ -247,7 +247,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.8.5"
+holt = "=0.9.0"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and
