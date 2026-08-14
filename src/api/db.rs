@@ -26,7 +26,7 @@ use super::tree::{
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
-use crate::journal::codec::BatchEncoder;
+use crate::journal::codec::{encode_attached_batch_record, BatchEncoder};
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::BlobStore;
@@ -1375,7 +1375,7 @@ impl DB {
                     .begin_attached(envelope.previous(), record_len)
                     .map_err(atomic_definitely_not_applied)?;
                 self.apply_batch_groups_with_attached_journal(
-                    &groups, base_seq, append, &envelope, record_len,
+                    &groups, base_seq, append, envelope, record_len,
                 )
                 .map_err(atomic_outcome_unknown)?
             };
@@ -1483,20 +1483,26 @@ impl DB {
         groups: &[DBBatchGroup],
         base_seq: u64,
         append: crate::journal::JournalAppendGuard<'_>,
-        envelope: &JournalEnvelope,
+        envelope: JournalEnvelope,
         record_len: usize,
     ) -> Result<Option<crate::journal::JournalAck>> {
-        let mut record = append.record_buffer(record_len);
-        let mut enc = BatchEncoder::begin_with_envelope(&mut record, base_seq, 0, envelope);
-        let mut group_base = base_seq;
-        for group in groups {
-            group
-                .tree
-                .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
-            group_base += count_group_wal_ops(group);
-        }
-        let _n = enc.finish();
-        append.submit(record, envelope, self.cfg.durability.wal_sync())
+        let record = encode_attached_batch_record(
+            append.record_buffer(record_len),
+            base_seq,
+            0,
+            envelope,
+            |encoder| {
+                let mut group_base = base_seq;
+                for group in groups {
+                    group
+                        .tree
+                        .apply_batch_walker_inline(&group.ops, group_base, Some(encoder))?;
+                    group_base += count_group_wal_ops(group);
+                }
+                Ok(())
+            },
+        )?;
+        append.submit(record, self.cfg.durability.wal_sync())
     }
 
     fn apply_batch_groups_in_memory(&self, groups: &[DBBatchGroup], base_seq: u64) -> Result<()> {
