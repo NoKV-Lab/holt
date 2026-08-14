@@ -489,7 +489,9 @@ impl DB {
     /// the stream only for that DB's process lifetime. In both profiles the DB
     /// must be writable and cleanly checkpointed before first initialization.
     /// An exact retry with the same anchor succeeds; a different anchor fails
-    /// closed.
+    /// closed. A file I/O error can leave initialization incomplete. In that
+    /// state Holt rejects ordinary writes, attached writes, state reads, and
+    /// scans until an exact retry durably repairs the anchor mirror.
     pub fn initialize_journal_stream(&self, genesis: JournalAnchor) -> Result<()> {
         self.ensure_writable()?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
@@ -2413,6 +2415,182 @@ mod tests {
             .unwrap());
         assert_eq!(data.get(b"new-key").unwrap(), Some(b"new-value".to_vec()));
         assert_eq!(db.journal_state().unwrap().tail(), first);
+    }
+
+    #[test]
+    fn interrupted_stream_initialization_stays_fenced_until_exact_retry() {
+        for successful_anchor_writes in [0, 1] {
+            let dir = tempdir().unwrap();
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            cfg.durability = super::super::config::Durability::Wal { sync: true };
+
+            let db = DB::open(cfg.clone()).unwrap();
+            let data = db.create_tree("data").unwrap();
+            db.checkpoint().unwrap();
+            let genesis = journal_anchor(0, 0x7a);
+            let first = journal_anchor(1, 0x7b);
+
+            crate::journal::writer::WalWriter::fail_anchor_generation_after_for_test(
+                successful_anchor_writes,
+            );
+            assert!(db.initialize_journal_stream(genesis).is_err());
+
+            assert!(matches!(
+                data.put(b"tree-outside-chain", b"visible"),
+                Err(Error::JournalStreamUnavailable { .. })
+            ));
+            assert!(data.get(b"tree-outside-chain").unwrap().is_none());
+            assert!(matches!(
+                db.atomic(|batch| batch.put("data", b"db-outside-chain", b"visible")),
+                Err(Error::Atomic {
+                    kind: AtomicErrorKind::DefinitelyNotApplied,
+                    source,
+                }) if matches!(source.as_ref(), Error::JournalStreamUnavailable { .. })
+            ));
+            assert!(data.get(b"db-outside-chain").unwrap().is_none());
+            assert!(matches!(
+                db.journal_state(),
+                Err(Error::JournalStreamUnavailable { .. })
+            ));
+            assert!(matches!(
+                db.journal_envelopes_after(genesis, 8, 4096),
+                Err(Error::JournalStreamUnavailable { .. })
+            ));
+
+            let envelope = JournalEnvelope::new(genesis, first, b"attached".to_vec()).unwrap();
+            assert!(matches!(
+                db.atomic_with_journal_envelope(envelope.clone(), |batch| {
+                    batch.put("data", b"attached", b"premature");
+                }),
+                Err(Error::Atomic {
+                    kind: AtomicErrorKind::DefinitelyNotApplied,
+                    source,
+                }) if matches!(source.as_ref(), Error::JournalStreamUnavailable { .. })
+            ));
+            assert!(data.get(b"attached").unwrap().is_none());
+
+            assert!(matches!(
+                db.initialize_journal_stream(journal_anchor(0, 0x7c)),
+                Err(Error::JournalAnchorMismatch { .. })
+            ));
+
+            // A checkpoint cannot clear an incomplete initialization fence.
+            db.checkpoint().unwrap();
+            assert!(matches!(
+                data.put(b"after-checkpoint", b"blocked"),
+                Err(Error::JournalStreamUnavailable { .. })
+            ));
+
+            // An exact retry repairs the missing generation and is the only
+            // transition that makes the attached stream ready in-process.
+            db.initialize_journal_stream(genesis).unwrap();
+            assert_eq!(
+                db.journal_state().unwrap(),
+                JournalState::new(genesis, genesis)
+            );
+            assert!(db
+                .atomic_with_journal_envelope(envelope, |batch| {
+                    batch.put("data", b"attached", b"ready");
+                })
+                .unwrap());
+            drop(data);
+            drop(db);
+
+            let reopened = DB::open(cfg).unwrap();
+            assert_eq!(reopened.journal_state().unwrap().checkpoint(), genesis);
+            let reopened_data = reopened.open_tree("data").unwrap();
+            assert!(reopened_data.get(b"tree-outside-chain").unwrap().is_none());
+            assert!(reopened_data.get(b"db-outside-chain").unwrap().is_none());
+            assert_eq!(
+                reopened_data.get(b"attached").unwrap(),
+                Some(b"ready".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_stream_reopen_uses_only_durable_anchor_slots() {
+        for successful_anchor_writes in [0, 1] {
+            let dir = tempdir().unwrap();
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            let db = DB::open(cfg.clone()).unwrap();
+            db.create_tree("data").unwrap();
+            db.checkpoint().unwrap();
+            let genesis = journal_anchor(0, 0x7d);
+
+            crate::journal::writer::WalWriter::fail_anchor_generation_after_for_test(
+                successful_anchor_writes,
+            );
+            assert!(db.initialize_journal_stream(genesis).is_err());
+            drop(db);
+
+            let reopened = DB::open(cfg).unwrap();
+            if successful_anchor_writes == 0 {
+                assert!(matches!(
+                    reopened.journal_state(),
+                    Err(Error::JournalStreamUnavailable { .. })
+                ));
+                assert!(reopened
+                    .atomic(|batch| batch.put("data", b"ordinary", b"allowed"))
+                    .unwrap());
+            } else {
+                assert_eq!(
+                    reopened.journal_state().unwrap(),
+                    JournalState::new(genesis, genesis)
+                );
+                assert!(matches!(
+                    reopened.atomic(|batch| batch.put("data", b"ordinary", b"blocked")),
+                    Err(Error::Atomic {
+                        kind: AtomicErrorKind::DefinitelyNotApplied,
+                        source,
+                    }) if matches!(source.as_ref(), Error::JournalStreamUnavailable { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn reopen_rejects_an_ordinary_record_after_an_initialized_anchor() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = super::super::config::Durability::Wal { sync: true };
+        let wal_path = cfg.wal_path().unwrap();
+
+        let db = DB::open(cfg.clone()).unwrap();
+        db.create_tree("data").unwrap();
+        db.checkpoint().unwrap();
+        db.initialize_journal_stream(journal_anchor(0, 0x7e))
+            .unwrap();
+        drop(db);
+
+        let mut writer = crate::journal::writer::WalWriter::open_existing(&wal_path).unwrap();
+        writer
+            .append(
+                &crate::journal::wal_op::WalOp::Insert {
+                    tree_id: FIRST_USER_TREE_ID,
+                    key: b"outside-chain".to_vec(),
+                    value: b"invalid".to_vec(),
+                },
+                100,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let before = std::fs::read(&wal_path).unwrap();
+
+        for reopen_cfg in [cfg.clone(), cfg.read_only()] {
+            assert!(matches!(
+                DB::open(reopen_cfg),
+                Err(Error::ReplaySanityFailed {
+                    context: "initialized attached WAL contains an ordinary record",
+                    ..
+                })
+            ));
+            assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+        }
     }
 
     #[test]

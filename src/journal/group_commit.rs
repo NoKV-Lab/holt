@@ -31,7 +31,7 @@
 //! checkpoint barrier), exactly like legacy group commit.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -114,12 +114,18 @@ struct Shared {
     control_tx: Sender<Control>,
     record_pool: Mutex<Vec<Vec<u8>>>,
     path: PathBuf,
+    /// Monotonic fence for ordinary records. Initialization sets this before
+    /// either anchor slot can become durable and never clears it in-process.
+    ordinary_fenced: AtomicBool,
     tail: Mutex<TailState>,
 }
 
 struct TailState {
     checkpoint: Option<JournalAnchor>,
     tail: Option<JournalAnchor>,
+    /// Genesis selected by an initialization attempt whose two-slot durable
+    /// write has not yet completed. Only an exact retry may resume it.
+    initializing: Option<JournalAnchor>,
     scan_resume: Option<AttachedEnvelopeResume>,
 }
 
@@ -325,9 +331,11 @@ impl Journal {
             control_tx,
             record_pool: Mutex::new(Vec::new()),
             path: path.to_path_buf(),
+            ordinary_fenced: AtomicBool::new(attached.is_some()),
             tail: Mutex::new(TailState {
                 checkpoint: attached.map(JournalState::checkpoint),
                 tail: attached.map(JournalState::tail),
+                initializing: None,
                 scan_resume: None,
             }),
         });
@@ -352,7 +360,7 @@ impl Journal {
     }
 
     pub(crate) fn ensure_ordinary_writes_allowed(&self) -> Result<()> {
-        if self.shared.tail.lock().unwrap().checkpoint.is_some() {
+        if self.shared.ordinary_fenced.load(Ordering::Acquire) {
             Err(Error::JournalStreamUnavailable {
                 reason: "ordinary WAL records are disabled after attached stream initialization",
             })
@@ -437,15 +445,32 @@ impl Journal {
             }
             None => {}
         }
-        if self.needs_checkpoint() {
-            return Err(Error::JournalStreamUnavailable {
-                reason: "WAL must be checkpoint-clean before stream initialization",
-            });
+        match tail.initializing {
+            Some(existing) if existing != genesis => {
+                return Err(Error::JournalAnchorMismatch {
+                    requested: genesis.sequence(),
+                    expected: existing.sequence(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                if self.needs_checkpoint() {
+                    return Err(Error::JournalStreamUnavailable {
+                        reason: "WAL must be checkpoint-clean before stream initialization",
+                    });
+                }
+                tail.initializing = Some(genesis);
+                // Publish the fail-closed fence before the first slot write.
+                // The maintenance gate excludes an ordinary writer that has
+                // already passed its own Acquire load.
+                self.shared.ordinary_fenced.store(true, Ordering::Release);
+            }
         }
         let mut writer = self.shared.writer.lock().unwrap();
         writer.persist_checkpoint_anchor(genesis)?;
         tail.checkpoint = Some(genesis);
         tail.tail = Some(genesis);
+        tail.initializing = None;
         tail.scan_resume = None;
         Ok(())
     }
@@ -489,6 +514,11 @@ impl Journal {
         // attached tail before flushing so no attached writer can publish a
         // new record between the durability barrier and the file scan.
         let mut tail = self.shared.tail.lock().unwrap();
+        if tail.checkpoint.is_none() || tail.initializing.is_some() {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "stream initialization has not completed",
+            });
+        }
         self.flush_up_to(self.queued_work())?;
         match scan_attached_envelope_page_from(
             &self.shared.path,
