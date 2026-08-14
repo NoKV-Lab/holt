@@ -31,7 +31,7 @@
 //! checkpoint barrier), exactly like legacy group commit.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -40,15 +40,14 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 
 use crate::api::errors::{Error, Result};
 use crate::api::journal::{
-    JournalAnchor, JournalEnvelope, JournalEnvelopePage, JournalState, MAX_JOURNAL_RECORD_BYTES,
+    JournalAnchor, JournalEnvelopePage, JournalState, MAX_JOURNAL_RECORD_BYTES,
 };
 
-use super::codec::decode_record;
+use super::codec::EncodedAttachedRecord;
 use super::reader::{
     scan_attached_envelope_page_from, validate_attached_journal, AttachedEnvelopeResume,
 };
 use super::ring::{ReserveTicket, WalRing};
-use super::wal_op::WalOp;
 use super::writer::WalWriter;
 
 /// Production journal counters surfaced through `Tree::stats`.
@@ -114,12 +113,18 @@ struct Shared {
     control_tx: Sender<Control>,
     record_pool: Mutex<Vec<Vec<u8>>>,
     path: PathBuf,
+    /// Monotonic fence for ordinary records. Initialization sets this before
+    /// either anchor slot can become durable and never clears it in-process.
+    ordinary_fenced: AtomicBool,
     tail: Mutex<TailState>,
 }
 
 struct TailState {
     checkpoint: Option<JournalAnchor>,
     tail: Option<JournalAnchor>,
+    /// Genesis selected by an initialization attempt whose two-slot durable
+    /// write has not yet completed. Only an exact retry may resume it.
+    initializing: Option<JournalAnchor>,
     scan_resume: Option<AttachedEnvelopeResume>,
 }
 
@@ -292,6 +297,7 @@ pub(crate) struct Journal {
 pub(crate) struct JournalAppendGuard<'a> {
     journal: &'a Journal,
     tail: MutexGuard<'a, TailState>,
+    preflight_record_len: usize,
 }
 
 impl Journal {
@@ -325,9 +331,11 @@ impl Journal {
             control_tx,
             record_pool: Mutex::new(Vec::new()),
             path: path.to_path_buf(),
+            ordinary_fenced: AtomicBool::new(attached.is_some()),
             tail: Mutex::new(TailState {
                 checkpoint: attached.map(JournalState::checkpoint),
                 tail: attached.map(JournalState::tail),
+                initializing: None,
                 scan_resume: None,
             }),
         });
@@ -352,7 +360,7 @@ impl Journal {
     }
 
     pub(crate) fn ensure_ordinary_writes_allowed(&self) -> Result<()> {
-        if self.shared.tail.lock().unwrap().checkpoint.is_some() {
+        if self.shared.ordinary_fenced.load(Ordering::Acquire) {
             Err(Error::JournalStreamUnavailable {
                 reason: "ordinary WAL records are disabled after attached stream initialization",
             })
@@ -437,15 +445,32 @@ impl Journal {
             }
             None => {}
         }
-        if self.needs_checkpoint() {
-            return Err(Error::JournalStreamUnavailable {
-                reason: "WAL must be checkpoint-clean before stream initialization",
-            });
+        match tail.initializing {
+            Some(existing) if existing != genesis => {
+                return Err(Error::JournalAnchorMismatch {
+                    requested: genesis.sequence(),
+                    expected: existing.sequence(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                if self.needs_checkpoint() {
+                    return Err(Error::JournalStreamUnavailable {
+                        reason: "WAL must be checkpoint-clean before stream initialization",
+                    });
+                }
+                tail.initializing = Some(genesis);
+                // Publish the fail-closed fence before the first slot write.
+                // The maintenance gate excludes an ordinary writer that has
+                // already passed its own Acquire load.
+                self.shared.ordinary_fenced.store(true, Ordering::Release);
+            }
         }
         let mut writer = self.shared.writer.lock().unwrap();
         writer.persist_checkpoint_anchor(genesis)?;
         tail.checkpoint = Some(genesis);
         tail.tail = Some(genesis);
+        tail.initializing = None;
         tail.scan_resume = None;
         Ok(())
     }
@@ -476,6 +501,7 @@ impl Journal {
         Ok(JournalAppendGuard {
             journal: self,
             tail,
+            preflight_record_len: record_len,
         })
     }
 
@@ -489,6 +515,11 @@ impl Journal {
         // attached tail before flushing so no attached writer can publish a
         // new record between the durability barrier and the file scan.
         let mut tail = self.shared.tail.lock().unwrap();
+        if tail.checkpoint.is_none() || tail.initializing.is_some() {
+            return Err(Error::JournalStreamUnavailable {
+                reason: "stream initialization has not completed",
+            });
+        }
         self.flush_up_to(self.queued_work())?;
         match scan_attached_envelope_page_from(
             &self.shared.path,
@@ -570,22 +601,15 @@ impl JournalAppendGuard<'_> {
 
     pub(crate) fn submit(
         mut self,
-        record: Vec<u8>,
-        envelope: &JournalEnvelope,
+        record: EncodedAttachedRecord,
         sync: bool,
     ) -> Result<Option<JournalAck>> {
-        let decoded = decode_record(&record)?;
-        let WalOp::DbBatchWithEnvelope {
-            envelope: encoded, ..
-        } = decoded.op
-        else {
-            return Err(Error::Internal("attached submit requires WAL tag 13"));
-        };
-        if &encoded != envelope {
+        if record.len() > self.preflight_record_len {
             return Err(Error::Internal(
-                "attached submit envelope differs from encoded WAL record",
+                "attached record exceeded its preflight length",
             ));
         }
+        let (bytes, envelope) = record.into_parts();
         let expected = self.tail.tail.expect("begin_attached initialized tail");
         if envelope.previous() != expected {
             return Err(Error::JournalAnchorMismatch {
@@ -593,7 +617,7 @@ impl JournalAppendGuard<'_> {
                 expected: expected.sequence(),
             });
         }
-        let ack = self.journal.publish(record, sync)?;
+        let ack = self.journal.publish(bytes, sync)?;
         self.tail.tail = Some(envelope.current());
         Ok(ack)
     }
@@ -656,7 +680,12 @@ fn do_truncate(shared: &Shared) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::codec::FILE_HEADER_SIZE;
+    use crate::journal::codec::{encode_attached_batch_record, FILE_HEADER_SIZE};
+    use crate::JournalEnvelope;
+
+    fn test_anchor(sequence: u64, byte: u8) -> JournalAnchor {
+        JournalAnchor::new(sequence, [byte; 32])
+    }
 
     // The 6 legacy contract tests, retargeted at the ring-backed Journal.
 
@@ -754,6 +783,66 @@ mod tests {
         journal.submit(vec![1, 2, 3, 4], false).unwrap();
         journal.flush_up_to(journal.queued_work()).unwrap();
         assert_eq!(journal.stats().appends, 1);
+    }
+
+    #[test]
+    fn sealed_attached_submit_checks_preflight_bound_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
+        let genesis = test_anchor(0, 0x10);
+        journal.initialize_anchor(genesis).unwrap();
+
+        let make_record = |envelope: JournalEnvelope| {
+            encode_attached_batch_record(Vec::new(), 1, 0, envelope, |encoder| {
+                encoder.push_insert(7, b"key", b"value");
+                Ok(())
+            })
+            .unwrap()
+        };
+
+        let first = test_anchor(1, 0x11);
+        let record = make_record(JournalEnvelope::new(genesis, first, b"first".to_vec()).unwrap());
+        let record_len = record.len();
+        let appends_before = journal.stats().appends;
+        assert!(matches!(
+            journal
+                .begin_attached(genesis, record_len - 1)
+                .unwrap()
+                .submit(record, false),
+            Err(Error::Internal(
+                "attached record exceeded its preflight length"
+            ))
+        ));
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(journal.state().unwrap().tail(), genesis);
+
+        let wrong_previous = test_anchor(0, 0x12);
+        let record =
+            make_record(JournalEnvelope::new(wrong_previous, first, b"wrong".to_vec()).unwrap());
+        let record_len = record.len();
+        assert!(matches!(
+            journal
+                .begin_attached(genesis, record_len)
+                .unwrap()
+                .submit(record, false),
+            Err(Error::JournalAnchorMismatch {
+                requested: 0,
+                expected: 0,
+            })
+        ));
+        assert_eq!(journal.stats().appends, appends_before);
+        assert_eq!(journal.state().unwrap().tail(), genesis);
+
+        let record =
+            make_record(JournalEnvelope::new(genesis, first, b"accepted".to_vec()).unwrap());
+        let record_len = record.len();
+        journal
+            .begin_attached(genesis, record_len)
+            .unwrap()
+            .submit(record, false)
+            .unwrap();
+        assert_eq!(journal.stats().appends, appends_before + 1);
+        assert_eq!(journal.state().unwrap().tail(), first);
     }
 
     #[test]

@@ -497,6 +497,49 @@ pub struct BatchEncoder<'buf> {
     finished: bool,
 }
 
+/// Fully encoded attached batch whose envelope identity cannot diverge from
+/// the bytes submitted to the journal.
+pub(crate) struct EncodedAttachedRecord {
+    bytes: Vec<u8>,
+    envelope: JournalEnvelope,
+}
+
+impl EncodedAttachedRecord {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, JournalEnvelope) {
+        (self.bytes, self.envelope)
+    }
+}
+
+/// Encode and seal one attached DB batch.
+///
+/// The owned envelope is both the source of the encoded envelope bytes and
+/// the tail transition consumed by the append coordinator. Callers cannot
+/// pair a record with different recovery metadata after encoding.
+pub(crate) fn encode_attached_batch_record<F>(
+    mut bytes: Vec<u8>,
+    seq: u64,
+    tree_id: u64,
+    envelope: JournalEnvelope,
+    encode_ops: F,
+) -> Result<EncodedAttachedRecord>
+where
+    F: FnOnce(&mut BatchEncoder<'_>) -> Result<()>,
+{
+    if !bytes.is_empty() {
+        return Err(Error::Internal(
+            "attached record buffer must be empty before encoding",
+        ));
+    }
+    let mut encoder = BatchEncoder::begin_with_envelope(&mut bytes, seq, tree_id, &envelope);
+    encode_ops(&mut encoder)?;
+    encoder.finish();
+    Ok(EncodedAttachedRecord { bytes, envelope })
+}
+
 impl<'buf> BatchEncoder<'buf> {
     /// Open a new `Batch` record on `out`. The header + body prefix
     /// (tree_id, zero-placeholder count) are written immediately;
@@ -1066,6 +1109,7 @@ fn sanity(context: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fmt::Write;
 
     fn sample_envelope() -> JournalEnvelope {
@@ -1421,6 +1465,112 @@ mod tests {
                 ));
             }
             other => panic!("expected attached DB batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sealed_attached_record_matches_generic_encoder_and_decoder() {
+        let envelope = sample_envelope();
+        let expected = WalOp::DbBatchWithEnvelope {
+            envelope: envelope.clone(),
+            ops: vec![
+                WalOp::Insert {
+                    tree_id: 7,
+                    key: b"new".to_vec(),
+                    value: b"value".to_vec(),
+                },
+                WalOp::Erase {
+                    tree_id: 7,
+                    key: b"old".to_vec(),
+                },
+                WalOp::RenameObject {
+                    tree_id: 7,
+                    src_key: b"from".to_vec(),
+                    dst_key: b"to".to_vec(),
+                    force: true,
+                },
+            ],
+        };
+        let sealed =
+            encode_attached_batch_record(Vec::new(), 1_000, 0, envelope.clone(), |encoder| {
+                encoder.push_insert(7, b"new", b"value");
+                encoder.push_erase(7, b"old");
+                encoder.push_rename_object(7, b"from", b"to", true);
+                Ok(())
+            })
+            .unwrap();
+        let (bytes, carried_envelope) = sealed.into_parts();
+        assert_eq!(carried_envelope, envelope);
+
+        let mut generic = Vec::new();
+        encode_record(&expected, 1_000, &mut generic);
+        assert_eq!(bytes, generic);
+
+        let decoded = decode_record(&bytes).unwrap();
+        assert_eq!(decoded.seq, 1_000);
+        assert_eq!(decoded.bytes_consumed, bytes.len());
+        assert_eq!(format!("{:?}", decoded.op), format!("{expected:?}"));
+    }
+
+    proptest! {
+        #[test]
+        fn sealed_attached_record_property_roundtrips(
+            sequence in 0u64..u64::MAX,
+            tree_id in any::<u64>(),
+            payload in prop::collection::vec(any::<u8>(), 1..1024),
+            key in prop::collection::vec(any::<u8>(), 0..64),
+            value in prop::collection::vec(any::<u8>(), 0..128),
+            erased in prop::collection::vec(any::<u8>(), 0..64),
+            src in prop::collection::vec(any::<u8>(), 0..64),
+            dst in prop::collection::vec(any::<u8>(), 0..64),
+            force in any::<bool>(),
+        ) {
+            let previous = JournalAnchor::new(sequence, [0x33; JOURNAL_DIGEST_BYTES]);
+            let current = JournalAnchor::new(sequence + 1, [0x44; JOURNAL_DIGEST_BYTES]);
+            let envelope = JournalEnvelope::new(previous, current, payload).unwrap();
+            let expected = WalOp::DbBatchWithEnvelope {
+                envelope: envelope.clone(),
+                ops: vec![
+                    WalOp::Insert {
+                        tree_id,
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    WalOp::Erase {
+                        tree_id,
+                        key: erased.clone(),
+                    },
+                    WalOp::RenameObject {
+                        tree_id,
+                        src_key: src.clone(),
+                        dst_key: dst.clone(),
+                        force,
+                    },
+                ],
+            };
+            let sealed = encode_attached_batch_record(
+                Vec::new(),
+                sequence,
+                0,
+                envelope.clone(),
+                |encoder| {
+                    encoder.push_insert(tree_id, &key, &value);
+                    encoder.push_erase(tree_id, &erased);
+                    encoder.push_rename_object(tree_id, &src, &dst, force);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let (bytes, carried_envelope) = sealed.into_parts();
+            prop_assert_eq!(carried_envelope, envelope);
+
+            let decoded = decode_record(&bytes).unwrap();
+            prop_assert_eq!(decoded.seq, sequence);
+            prop_assert_eq!(decoded.bytes_consumed, bytes.len());
+            prop_assert_eq!(format!("{:?}", decoded.op), format!("{expected:?}"));
+            let footer = bytes.len() - RECORD_FOOTER_SIZE;
+            let stored_crc = u32::from_le_bytes(bytes[footer..].try_into().unwrap());
+            prop_assert_eq!(stored_crc, crc32(&bytes[..footer]));
         }
     }
 

@@ -246,6 +246,13 @@ syncs both anchor slots before it truncates the retained WAL suffix.
 checkpoint floor. The API does not provide a shared log or unbounded change
 feed.
 
+Initialization fences ordinary records before writing either anchor slot. If
+an anchor write fails, the in-process stream remains incomplete and accepts
+only an exact retry with the same genesis. State reads, scans, and attached
+writes remain unavailable until the retry repairs the anchor mirror. On open,
+an initialized header followed by an ordinary logical WAL record is rejected
+as a recovery-chain gap.
+
 ### `BufferManager` — cache + dirty/pending tracking
 
 `BufferManager` wraps any `BlobStore` and itself implements

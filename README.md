@@ -213,6 +213,11 @@ persist the stream anchor and retained suffix in the local WAL. Memory
 databases provide the same ordering and paging contract only for the process
 lifetime.
 
+If file-backed initialization returns an I/O error, do not resume ordinary
+writes. Holt keeps the database fenced and accepts only an exact retry with the
+same genesis anchor. State reads, scans, and attached writes remain unavailable
+until that retry repairs both anchor slots.
+
 A checkpoint advances the local retention floor. Older cursors return
 `Error::JournalPositionExpired`. This API provides local recovery records. It
 does not provide a shared or remote log.
@@ -247,7 +252,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.9.0"
+holt = "=0.9.1"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and

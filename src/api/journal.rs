@@ -5,6 +5,7 @@
 //! the same checksummed WAL record as the batch that mutates the database.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use super::errors::{Error, Result};
@@ -268,6 +269,7 @@ impl JournalEnvelope {
 /// semantics as the file-backed stream. It deliberately provides no reopen or
 /// crash durability: dropping the memory DB drops both its data and envelopes.
 pub(crate) struct VolatileJournal {
+    ordinary_fenced: AtomicBool,
     state: Mutex<VolatileJournalState>,
 }
 
@@ -285,6 +287,7 @@ pub(crate) struct VolatileJournalAppendGuard<'a> {
 impl VolatileJournal {
     pub(crate) fn new() -> Self {
         Self {
+            ordinary_fenced: AtomicBool::new(false),
             state: Mutex::new(VolatileJournalState::default()),
         }
     }
@@ -298,6 +301,7 @@ impl VolatileJournal {
                 expected: existing.sequence(),
             }),
             None => {
+                self.ordinary_fenced.store(true, Ordering::Release);
                 state.checkpoint = Some(genesis);
                 state.tail = Some(genesis);
                 Ok(())
@@ -311,7 +315,7 @@ impl VolatileJournal {
     }
 
     pub(crate) fn ensure_ordinary_writes_allowed(&self) -> Result<()> {
-        if self.state.lock().unwrap().checkpoint.is_some() {
+        if self.ordinary_fenced.load(Ordering::Acquire) {
             Err(Error::JournalStreamUnavailable {
                 reason: "ordinary writes are disabled after attached stream initialization",
             })

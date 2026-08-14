@@ -93,7 +93,7 @@ where
 /// state. A header-only format-3 file remains eligible for the writer's
 /// in-place format-4 header upgrade.
 pub(crate) fn preflight_writable_wal(path: &Path) -> Result<()> {
-    let records = StreamingRecords::open(path)?;
+    let mut records = StreamingRecords::open(path)?;
     if records.header.version == LEGACY_FORMAT_VERSION
         && records.file_len != LEGACY_FILE_HEADER_SIZE as u64
     {
@@ -101,6 +101,9 @@ pub(crate) fn preflight_writable_wal(path: &Path) -> Result<()> {
             context: "nonempty WAL format 3 is replay-only; checkpoint it with a format-3 Holt binary before v4 writes",
             record_offset: 0,
         });
+    }
+    if records.header.checkpoint_anchor.is_some() {
+        while records.next_record()?.is_some() {}
     }
     Ok(())
 }
@@ -136,6 +139,7 @@ where
                         record_offset: offset as u64,
                     });
                 }
+                validate_record_mode(&header, &r.op, offset as u64)?;
 
                 // Flatten both batch variants transparently: the callback sees
                 // the inner primitive ops with derived seqs (`base + i`). The
@@ -584,6 +588,7 @@ impl StreamingRecords {
         self.reader.read_exact(&mut bytes[RECORD_HEADER_SIZE..])?;
         let decoded =
             decode_record(&bytes).map_err(|error| patch_offset(error, record_offset as usize))?;
+        validate_record_mode(&self.header, &decoded.op, record_offset)?;
         #[cfg(test)]
         STREAMING_RECORDS_DECODED.with(|count| count.set(count.get() + 1));
         self.offset = self
@@ -595,6 +600,16 @@ impl StreamingRecords {
             offset: record_offset,
         }))
     }
+}
+
+fn validate_record_mode(header: &FileHeader, op: &WalOp, record_offset: u64) -> Result<()> {
+    if header.checkpoint_anchor.is_some() && !matches!(op, WalOp::DbBatchWithEnvelope { .. }) {
+        return Err(Error::ReplaySanityFailed {
+            context: "initialized attached WAL contains an ordinary record",
+            record_offset,
+        });
+    }
+    Ok(())
 }
 
 fn is_torn_tail(context: &'static str) -> bool {
@@ -630,6 +645,9 @@ mod attached_streaming_tests {
     };
     use crate::journal::writer::WalWriter;
 
+    const ORDINARY_RECORD_IN_ATTACHED_WAL: &str =
+        "initialized attached WAL contains an ordinary record";
+
     fn anchor(sequence: u64) -> JournalAnchor {
         let mut digest = [0u8; 32];
         digest[..8].copy_from_slice(&sequence.to_le_bytes());
@@ -661,6 +679,176 @@ mod attached_streaming_tests {
         }
         writer.flush().unwrap();
         (dir, path, offsets)
+    }
+
+    fn write_initialized_ordinary_record(op: &WalOp) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let mut writer = WalWriter::create(&path, 0).unwrap();
+        writer.append(op, 1).unwrap();
+        writer.flush().unwrap();
+        writer.persist_checkpoint_anchor(anchor(0)).unwrap();
+        drop(writer);
+        (dir, path)
+    }
+
+    fn assert_ordinary_record_rejected<T>(result: Result<T>, record_offset: u64) {
+        match result {
+            Err(Error::ReplaySanityFailed {
+                context: ORDINARY_RECORD_IN_ATTACHED_WAL,
+                record_offset: actual,
+            }) if actual == record_offset => {}
+            Err(error) => panic!("expected ordinary-record rejection, got {error:?}"),
+            Ok(_) => panic!("expected ordinary-record rejection"),
+        }
+    }
+
+    #[test]
+    fn initialized_wal_rejects_insert_before_each_reader_accepts_it() {
+        let insert = WalOp::Insert {
+            tree_id: 0,
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        };
+        let (_dir, path) = write_initialized_ordinary_record(&insert);
+        let bytes = fs::read(&path).unwrap();
+        let record_offset = FILE_HEADER_SIZE as u64;
+
+        let raw_callbacks = std::cell::Cell::new(0usize);
+        let mut raw_callback = |_: &WalOp, _: u64, _: u64| {
+            raw_callbacks.set(raw_callbacks.get() + 1);
+            Ok(())
+        };
+        assert_ordinary_record_rejected(replay_bytes(&bytes, &mut raw_callback), record_offset);
+        assert_eq!(raw_callbacks.get(), 0);
+
+        let file_callbacks = std::cell::Cell::new(0usize);
+        assert_ordinary_record_rejected(
+            replay(&path, |_, _, _| {
+                file_callbacks.set(file_callbacks.get() + 1);
+                Ok(())
+            }),
+            record_offset,
+        );
+        assert_eq!(file_callbacks.get(), 0);
+
+        assert_ordinary_record_rejected(validate_attached_journal(&path), record_offset);
+        assert_ordinary_record_rejected(
+            scan_attached_envelope_page(&path, anchor(0), 1, usize::MAX),
+            record_offset,
+        );
+        assert_ordinary_record_rejected(
+            scan_attached_envelope_page_from(&path, anchor(0), 1, usize::MAX, None),
+            record_offset,
+        );
+        assert_ordinary_record_rejected(scan_attached_envelopes(&path), record_offset);
+        assert_ordinary_record_rejected(preflight_writable_wal(&path), record_offset);
+    }
+
+    #[test]
+    fn initialized_wal_rejects_an_ordinary_batch_before_flattening() {
+        let batch = WalOp::Batch {
+            ops: vec![WalOp::Insert {
+                tree_id: 0,
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }],
+        };
+        let (_dir, path) = write_initialized_ordinary_record(&batch);
+        let bytes = fs::read(&path).unwrap();
+        let callbacks = std::cell::Cell::new(0usize);
+        let mut callback = |_: &WalOp, _: u64, _: u64| {
+            callbacks.set(callbacks.get() + 1);
+            Ok(())
+        };
+
+        assert_ordinary_record_rejected(
+            replay_bytes(&bytes, &mut callback),
+            FILE_HEADER_SIZE as u64,
+        );
+        assert_eq!(callbacks.get(), 0);
+        assert_ordinary_record_rejected(preflight_writable_wal(&path), FILE_HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn uninitialized_wal_keeps_ordinary_records_valid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let mut writer = WalWriter::create(&path, 0).unwrap();
+        writer
+            .append(
+                &WalOp::Insert {
+                    tree_id: 0,
+                    key: b"first".to_vec(),
+                    value: b"value".to_vec(),
+                },
+                1,
+            )
+            .unwrap();
+        writer
+            .append(
+                &WalOp::Batch {
+                    ops: vec![WalOp::Insert {
+                        tree_id: 0,
+                        key: b"second".to_vec(),
+                        value: b"value".to_vec(),
+                    }],
+                },
+                2,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        preflight_writable_wal(&path).unwrap();
+        let mut callbacks = 0usize;
+        let (_, stats) = replay(&path, |_, _, _| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(callbacks, 2);
+        assert_eq!(stats.records_seen, 2);
+        assert_eq!(validate_attached_journal(&path).unwrap(), None);
+        assert!(matches!(
+            scan_attached_envelope_page(&path, anchor(0), 1, usize::MAX),
+            Err(Error::JournalStreamUnavailable {
+                reason: "stream has not been initialized",
+            })
+        ));
+        let scan = scan_attached_envelopes(&path).unwrap();
+        assert_eq!(scan.checkpoint, None);
+        assert_eq!(scan.tail, None);
+        assert!(scan.envelopes.is_empty());
+    }
+
+    #[test]
+    fn initialized_wal_keeps_attached_records_valid() {
+        let (_dir, path, _offsets) = write_envelopes(1, 16);
+
+        preflight_writable_wal(&path).unwrap();
+        let state = validate_attached_journal(&path).unwrap().unwrap();
+        assert_eq!(state.checkpoint(), anchor(0));
+        assert_eq!(state.tail(), anchor(1));
+
+        let mut callbacks = 0usize;
+        let (_, stats) = replay(&path, |_, _, _| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(callbacks, 0);
+        assert_eq!(stats.records_seen, 1);
+
+        let page = scan_attached_envelope_page(&path, anchor(0), 1, usize::MAX).unwrap();
+        assert_eq!(page.envelopes().len(), 1);
+        assert_eq!(page.next(), anchor(1));
+        assert!(!page.has_more());
+
+        let scan = scan_attached_envelopes(&path).unwrap();
+        assert_eq!(scan.checkpoint, Some(anchor(0)));
+        assert_eq!(scan.tail, Some(anchor(1)));
+        assert_eq!(scan.envelopes.len(), 1);
     }
 
     #[test]

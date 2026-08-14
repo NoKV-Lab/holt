@@ -9,6 +9,37 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-08-14
+
+### Fixed
+
+- Journal stream initialization now fences ordinary writes before either
+  persistent anchor slot can become durable. An interrupted initialization
+  keeps the fence active and accepts only an exact retry with the same genesis
+  anchor.
+- Open, replay, and recovery scans now reject an ordinary logical WAL record
+  after an attached-stream checkpoint anchor. This detects a surviving Holt
+  0.9.0 interrupted-initialization gap instead of accepting it as part of the
+  recovery stream.
+
+### Changed
+
+- Ordinary writes now use an atomic stream fence instead of locking the
+  journal tail while no attached stream is active.
+- Attached submissions now use encoder-sealed record metadata. They no longer
+  decode and copy a record before queueing it. Replay and recovery scans still
+  decode records and validate their CRCs.
+
+### Upgrade notes
+
+- Holt 0.9.1 uses the same format-4 WAL as 0.9.0. Existing stores do not need a
+  format migration.
+- If Holt 0.9.0 returned an error from `initialize_journal_stream` and the
+  process then accepted ordinary writes or ran a checkpoint, rebuild from
+  authoritative application state before using the attached stream. Holt
+  0.9.1 rejects mixed records that remain in the WAL, but it cannot reconstruct
+  or detect a recovery gap already folded into a checkpoint.
+
 ## [0.9.0] — 2026-08-14
 
 ### Added
