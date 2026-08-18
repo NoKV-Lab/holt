@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use super::atomic::{Record, RecordVersion};
+use super::atomic::{PrefixRecord, Record, RecordVersion};
 use super::errors::{Error, Result};
 use super::tree::{count_scan_limit, prefix_count_from_seen};
 use crate::concurrency::Gate;
@@ -80,6 +80,22 @@ impl View {
     pub fn get_record(&self, key: &[u8]) -> Result<Option<Record>> {
         self.ensure_in_scope(key)?;
         self.lookup_record(key)
+    }
+
+    /// Return the longest captured key that is a byte prefix of `query`.
+    ///
+    /// The match is restricted to this view's scope and comes from the same
+    /// immutable snapshot as every other view read.
+    pub fn longest_prefix_record(&self, query: &[u8]) -> Result<Option<PrefixRecord>> {
+        self.ensure_in_scope(query)?;
+        engine::longest_prefix_multi(&self.store, &self.root_pin, query, false).map(|hit| {
+            hit.filter(|hit| hit.key.starts_with(&self.scope))
+                .map(|hit| PrefixRecord {
+                    key: hit.key,
+                    value: hit.value,
+                    version: RecordVersion::new(hit.seq),
+                })
+        })
     }
 
     /// Return the captured version token for `key`.

@@ -424,6 +424,188 @@ fn get_record_returns_value_and_version_together() {
 }
 
 #[test]
+fn longest_prefix_record_returns_deepest_key_and_version() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"", b"root").unwrap();
+    tree.put(b"tenant", b"tenant").unwrap();
+    tree.put(b"tenant/model", b"model").unwrap();
+    tree.put(b"tenant/model/prefix", b"capsule").unwrap();
+    tree.put(b"tenant/other", b"other").unwrap();
+
+    let matched = tree
+        .longest_prefix_record(b"tenant/model/prefix/suffix")
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.key, b"tenant/model/prefix");
+    assert_eq!(matched.value, b"capsule");
+    assert_eq!(
+        matched.version,
+        tree.get_record(&matched.key).unwrap().unwrap().version
+    );
+
+    let shorter = tree
+        .longest_prefix_record(b"tenant/model/missing")
+        .unwrap()
+        .unwrap();
+    assert_eq!(shorter.key, b"tenant/model");
+    assert_eq!(shorter.value, b"model");
+
+    let root = tree.longest_prefix_record(b"absent").unwrap().unwrap();
+    assert!(root.key.is_empty());
+    assert_eq!(root.value, b"root");
+}
+
+#[test]
+fn longest_prefix_record_handles_binary_keys() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(&[1], b"one").unwrap();
+    tree.put(&[1, 2], b"one-two").unwrap();
+    tree.put(&[1, 2, 255], b"one-two-ff").unwrap();
+
+    let matched = tree
+        .longest_prefix_record(&[1, 2, 255, 3])
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.key, [1, 2, 255]);
+    assert_eq!(matched.value, b"one-two-ff");
+}
+
+#[test]
+fn longest_prefix_record_observes_updates_and_deletes() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"a", b"a").unwrap();
+    tree.put(b"a/b", b"old").unwrap();
+    tree.put(b"a/b", b"new").unwrap();
+
+    let updated = tree.longest_prefix_record(b"a/b/c").unwrap().unwrap();
+    assert_eq!(updated.key, b"a/b");
+    assert_eq!(updated.value, b"new");
+
+    assert!(tree.delete(b"a/b").unwrap());
+    let fallback = tree.longest_prefix_record(b"a/b/c").unwrap().unwrap();
+    assert_eq!(fallback.key, b"a");
+    assert_eq!(fallback.value, b"a");
+}
+
+#[test]
+fn view_longest_prefix_record_is_snapshot_stable_and_scope_safe() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"tenant", b"outside-scope").unwrap();
+    tree.put(b"tenant/a", b"captured").unwrap();
+    let snapshot = tree.snapshot(b"tenant/").unwrap();
+
+    tree.put(b"tenant/a", b"live-update").unwrap();
+    tree.put(b"tenant/a/deeper", b"live-deeper").unwrap();
+
+    let captured = snapshot
+        .longest_prefix_record(b"tenant/a/deeper/suffix")
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured.key, b"tenant/a");
+    assert_eq!(captured.value, b"captured");
+
+    assert!(
+        snapshot
+            .longest_prefix_record(b"tenant/missing")
+            .unwrap()
+            .is_none(),
+        "the scoped view must not return the ancestor key outside its scope"
+    );
+}
+
+#[test]
+fn longest_prefix_record_matches_naive_oracle() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let mut keys = Vec::new();
+    for first in 1..=8u8 {
+        for depth in 1..=6usize {
+            let key = (0..depth)
+                .map(|index| {
+                    first.wrapping_add(
+                        u8::try_from(index * 17).expect("bounded test index fits in u8"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            tree.put(&key, &key).unwrap();
+            keys.push(key);
+        }
+    }
+
+    for first in 0..=9u8 {
+        for suffix in 0..64u8 {
+            let query = vec![
+                first,
+                first.wrapping_add(17),
+                first.wrapping_add(34),
+                suffix,
+                0xfe,
+            ];
+            let expected = keys
+                .iter()
+                .filter(|key| query.starts_with(key))
+                .max_by_key(|key| key.len());
+            let actual = tree.longest_prefix_record(&query).unwrap();
+            assert_eq!(
+                actual.as_ref().map(|record| &record.key),
+                expected,
+                "query={query:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_longest_prefix_readers_observe_complete_versions() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let tree = Arc::new(Tree::open(TreeConfig::memory()).unwrap());
+    tree.put(b"prefix", b"base").unwrap();
+    tree.put(b"prefix/deep", b"version-a").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let writer_tree = Arc::clone(&tree);
+    let writer_stop = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        for iteration in 0..2_000 {
+            let value = if iteration % 2 == 0 {
+                b"version-a".as_slice()
+            } else {
+                b"version-b".as_slice()
+            };
+            writer_tree.put(b"prefix/deep", value).unwrap();
+        }
+        writer_stop.store(true, Ordering::Release);
+    });
+
+    let readers = (0..4)
+        .map(|_| {
+            let tree = Arc::clone(&tree);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let record = tree
+                        .longest_prefix_record(b"prefix/deep/suffix")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(record.key, b"prefix/deep");
+                    assert!(
+                        record.value == b"version-a" || record.value == b"version-b",
+                        "reader observed an invalid value: {:?}",
+                        record.value
+                    );
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    writer.join().unwrap();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+}
+
+#[test]
 fn conditional_delete_uses_record_versions() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"k", b"v1").unwrap();
@@ -776,6 +958,30 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
         "expected auto-spillover to allocate at least 1 child blob, got {} total blob(s)",
         blobs.len(),
     );
+}
+
+#[test]
+fn longest_prefix_record_crosses_spilled_blobs() {
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_blob_store(store)
+        .unwrap();
+    let value = vec![0xAB; 200];
+    for i in 0..5000u32 {
+        tree.put(format!("prefix/{i:08}").as_bytes(), &value)
+            .unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "test precondition: workload must spill across blobs"
+    );
+
+    let matched = tree
+        .longest_prefix_record(b"prefix/00004999/suffix")
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.key, b"prefix/00004999");
+    assert_eq!(matched.value, value);
 }
 
 #[test]

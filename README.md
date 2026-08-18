@@ -129,6 +129,14 @@ assert!(ok);
 
 let deleted = tree.delete_if_version(b"bucket/a.jpg", record.version)?;
 assert!(!deleted); // version changed above
+
+tree.put(b"bucket", b"bucket-meta")?;
+tree.put(b"bucket/a", b"prefix-meta")?;
+let prefix = tree
+    .longest_prefix_record(b"bucket/a/images/01.jpg")?
+    .unwrap();
+assert_eq!(prefix.key, b"bucket/a");
+assert_eq!(prefix.value, b"prefix-meta");
 ```
 
 Prefix listing:

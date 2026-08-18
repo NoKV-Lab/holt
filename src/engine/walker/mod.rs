@@ -66,7 +66,7 @@ pub use insert::{insert_multi, insert_multi_conditional};
 pub(crate) use insert::{insert_multi_batch_conditional, InsertBatchItem};
 pub(crate) use key::SearchKey;
 pub use lookup::lookup_multi_with;
-pub(crate) use lookup::lookup_multi_with_snapshot;
+pub(crate) use lookup::{longest_prefix_multi, lookup_multi_with_snapshot};
 pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, blob_would_route, compact_blob};
 pub(crate) use range::PrefixListCache;
