@@ -260,7 +260,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.9.1"
+holt = "=0.9.2"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and
