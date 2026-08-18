@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-08-18
+
 ### Added
 
 - Added `Tree::longest_prefix_record` and
@@ -21,6 +23,15 @@ fine-grained per-commit history is in `git log`.
 
 - Added an atomic zero-debt check for deferred WAL state so read-only
   longest-prefix lookups avoid the write-delta mutex in steady state.
+- Updated the Linux `io-uring` dependency to 0.7.14 and the Node binding's
+  N-API dependency to 3.12.1.
+
+### Upgrade notes
+
+- Holt 0.9.2 uses the same data and format-4 WAL layouts as 0.9.1. Existing
+  stores do not need a format migration.
+- The longest-prefix operation is available through the Rust API. C and Node
+  bindings remain unchanged.
 
 ## [0.9.1] — 2026-08-14
 
