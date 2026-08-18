@@ -84,6 +84,16 @@ cargo bench --manifest-path benches/Cargo.toml --bench main -- _create_delete
 cargo bench --manifest-path benches/Cargo.toml --bench main -- _rename
 cargo bench --manifest-path benches/Cargo.toml --bench main -- _metadata_mix
 
+# Longest-prefix lookup versus deepest-to-shallowest exact lookup.
+cargo bench --manifest-path benches/Cargo.toml \
+  --no-default-features --bench longest_prefix -- --quick --noplot
+
+# Multi-threaded OrbitKV-shaped longest-prefix lookup.
+HOLT_LPM_OPS_PER_THREAD=100000 \
+taskset -c 0,2,4,6,8,10,12,14 \
+cargo bench --manifest-path benches/Cargo.toml \
+  --no-default-features --bench longest_prefix_concurrent
+
 # Large-tree stress harness: fixed 20M preload, million-scale ops.
 # Run this explicitly; it is intentionally not part of Criterion.
 HOLT_STRESS_N=20000000 \
