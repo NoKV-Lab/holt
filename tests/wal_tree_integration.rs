@@ -714,6 +714,26 @@ fn batched_mode_with_checkpoint_persists_everything() {
 }
 
 #[test]
+fn longest_prefix_record_merges_deferred_wal_state_before_lookup() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let tree = Tree::open(cfg).unwrap();
+    tree.put(b"capsule", b"base").unwrap();
+    tree.put(b"capsule/deep", b"latest").unwrap();
+
+    let matched = tree
+        .longest_prefix_record(b"capsule/deep/suffix")
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.key, b"capsule/deep");
+    assert_eq!(matched.value, b"latest");
+    assert_eq!(
+        matched.version,
+        tree.get_record(b"capsule/deep").unwrap().unwrap().version
+    );
+}
+
+#[test]
 fn next_seq_resumes_past_replayed_records() {
     let dir = tempdir().unwrap();
     let cfg = durable_cfg(dir.path());

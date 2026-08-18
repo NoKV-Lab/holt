@@ -2294,6 +2294,10 @@ impl BufferManager {
         self.write_delta.len()
     }
 
+    pub(crate) fn has_any_write_delta(&self) -> bool {
+        self.write_delta.has_any()
+    }
+
     pub(crate) fn write_delta_count_for_tree(&self, tree_id: u64) -> usize {
         self.write_delta.tree_len(tree_id)
     }

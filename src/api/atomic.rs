@@ -22,6 +22,17 @@ pub struct Record {
     pub version: RecordVersion,
 }
 
+/// Longest-prefix lookup result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixRecord {
+    /// Longest live user key that prefixes the query.
+    pub key: Vec<u8>,
+    /// Value stored under `key`.
+    pub value: Vec<u8>,
+    /// Current compare-and-set token for the matching record.
+    pub version: RecordVersion,
+}
+
 /// Opaque per-record version returned by
 /// [`Tree::get_version`](super::tree::Tree::get_version).
 ///

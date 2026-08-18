@@ -46,3 +46,13 @@ path = "stress.rs"
 name = "concurrent"
 harness = false
 path = "concurrent.rs"
+
+[[bench]]
+name = "longest_prefix"
+harness = false
+path = "longest_prefix.rs"
+
+[[bench]]
+name = "longest_prefix_concurrent"
+harness = false
+path = "longest_prefix_concurrent.rs"

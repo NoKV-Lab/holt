@@ -29,6 +29,17 @@ pub struct LookupHit<'a> {
     pub seq: u64,
 }
 
+/// Owned longest-prefix match returned across blob pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LongestPrefixHit {
+    /// User key bytes without the ART terminator.
+    pub(crate) key: Vec<u8>,
+    /// Value bytes copied from the matching leaf.
+    pub(crate) value: Vec<u8>,
+    /// Leaf sequence attached to the matching record.
+    pub(crate) seq: u64,
+}
+
 /// Where a single-blob walker descent stopped at a BlobNode.
 #[derive(Debug, Clone, Copy)]
 pub struct BlobNodeCrossing {

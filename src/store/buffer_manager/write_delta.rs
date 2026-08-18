@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::layout::BlobGuid;
@@ -26,6 +27,7 @@ pub(crate) struct DeltaOp {
 #[derive(Default)]
 pub(crate) struct WriteDelta {
     inner: Mutex<DeltaMaps>,
+    has_any: AtomicBool,
 }
 
 #[derive(Default)]
@@ -56,7 +58,9 @@ impl WriteDelta {
                 creates_key,
             },
         };
-        self.inner.lock().unwrap().insert_pending(op);
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert_pending(op);
+        self.has_any.store(true, Ordering::Release);
     }
 
     pub(crate) fn stage_delete(&self, tree_id: u64, root_guid: BlobGuid, key: &[u8], seq: u64) {
@@ -66,7 +70,9 @@ impl WriteDelta {
             key: key.to_vec(),
             entry: DeltaEntry::Delete { seq },
         };
-        self.inner.lock().unwrap().insert_pending(op);
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert_pending(op);
+        self.has_any.store(true, Ordering::Release);
     }
 
     pub(crate) fn get(&self, tree_id: u64, key: &[u8]) -> Option<DeltaEntry> {
@@ -75,6 +81,10 @@ impl WriteDelta {
 
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+
+    pub(crate) fn has_any(&self) -> bool {
+        self.has_any.load(Ordering::Acquire)
     }
 
     pub(crate) fn tree_len(&self, tree_id: u64) -> usize {
@@ -117,6 +127,9 @@ impl WriteDelta {
         for op in ops {
             guard.remove_flushing(op);
         }
+        if guard.len() == 0 {
+            self.has_any.store(false, Ordering::Release);
+        }
     }
 
     pub(crate) fn abort_flush(&self, ops: Vec<DeltaOp>) {
@@ -128,6 +141,7 @@ impl WriteDelta {
             guard.remove_flushing(&op);
             guard.insert_pending(op);
         }
+        self.has_any.store(true, Ordering::Release);
     }
 }
 
@@ -361,6 +375,24 @@ mod tests {
         assert_eq!(delta.tree_key_set_len(7), 1);
         delta.finish_flush(&ops);
         assert_eq!(delta.tree_key_set_len(7), 0);
+    }
+
+    #[test]
+    fn zero_debt_flag_tracks_finish_and_abort() {
+        let delta = WriteDelta::default();
+        assert!(!delta.has_any());
+
+        delta.stage_put(7, [1; 16], b"a", b"v", 1, false);
+        assert!(delta.has_any());
+        let ops = delta.begin_flush_tree(7);
+        assert!(delta.has_any(), "flushing debt is still visible");
+        delta.finish_flush(&ops);
+        assert!(!delta.has_any());
+
+        delta.stage_delete(7, [1; 16], b"a", 2);
+        let ops = delta.begin_flush_tree(7);
+        delta.abort_flush(ops);
+        assert!(delta.has_any(), "aborted debt returns to pending");
     }
 
     #[test]

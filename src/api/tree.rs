@@ -47,7 +47,7 @@ use crate::store::{
 
 const AUTO_GC_BATCH_SIZE: usize = 256;
 
-use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
+use super::atomic::{AtomicBatch, BatchOp, PrefixRecord, Record, RecordVersion};
 
 const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
@@ -806,6 +806,37 @@ impl Tree {
     pub fn get_record(&self, key: &[u8]) -> Result<Option<Record>> {
         self.ensure_live()?;
         self.lookup_record_unlocked(key)
+    }
+
+    /// Return the longest live key that is a byte prefix of `query`.
+    ///
+    /// The key, value, and conditional-write version are returned from one
+    /// linearized tree state. Deferred WAL writes are merged before the ART
+    /// path walk. Concurrent blob mutations are detected by optimistic
+    /// version validation and restart from the root; readers do not fence one
+    /// another.
+    ///
+    /// This differs from [`Self::scan`]: the matched record may be any
+    /// ancestor key of `query`, and the ART is traversed once rather than
+    /// issuing one exact lookup for every candidate prefix length.
+    pub fn longest_prefix_record(&self, query: &[u8]) -> Result<Option<PrefixRecord>> {
+        loop {
+            self.ensure_live()?;
+            if self.store.has_any_write_delta() {
+                self.flush_write_delta_for_tree()?;
+            }
+            let hit = engine::longest_prefix_multi(&self.store, &self.root_pin, query, true)?;
+            if self.store.has_any_write_delta()
+                && self.store.write_delta_count_for_tree(self.tree_id) != 0
+            {
+                continue;
+            }
+            return Ok(hit.map(|hit| PrefixRecord {
+                key: hit.key,
+                value: hit.value,
+                version: RecordVersion::new(hit.seq),
+            }));
+        }
     }
 
     /// Return the current version token for `key`.

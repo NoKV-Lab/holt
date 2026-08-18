@@ -9,6 +9,19 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Added `Tree::longest_prefix_record` and
+  `View::longest_prefix_record`. One optimistic ART traversal returns the
+  longest live ancestor key together with its value and record version. This
+  release slice exposes the operation through the Rust API; C and Node
+  bindings are unchanged.
+
+### Changed
+
+- Added an atomic zero-debt check for deferred WAL state so read-only
+  longest-prefix lookups avoid the write-delta mutex in steady state.
+
 ## [0.9.1] — 2026-08-14
 
 ### Fixed

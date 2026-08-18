@@ -181,7 +181,7 @@ pub use api::stats::{
 };
 
 // Single-record atomic batches.
-pub use api::atomic::{AtomicBatch, Record, RecordVersion};
+pub use api::atomic::{AtomicBatch, PrefixRecord, Record, RecordVersion};
 
 // Background checkpointer policy. The `Checkpointer` handle itself
 // is crate-internal; users tune or disable it via this config.

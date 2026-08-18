@@ -24,7 +24,7 @@ use crate::store::{
 use super::cast;
 use super::readers::{child_offset, resolve_typed, root_child_offset};
 use super::route::{pin_route_parent, validate_route_edge};
-use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
+use super::types::{BlobNodeCrossing, LongestPrefixHit, LookupHit, LookupResult};
 use super::SearchKey;
 
 /// Look up `key` in the tree whose root is the encoded offset
@@ -123,6 +123,428 @@ where
     F: FnMut(LookupHit<'_>) -> R,
 {
     lookup_multi_with_gc_policy(bm, root_pin, route_cache, key, &mut consume, false)
+}
+
+/// Return the longest live user key that prefixes `query`.
+///
+/// Unlike exact lookup, this path intentionally pins every crossed blob
+/// because a negative exact-read-index answer cannot prove that no shorter
+/// terminator child matched earlier in the query path. Every visited blob
+/// version is validated before publishing the result; concurrent mutation
+/// restarts the walk from the root.
+pub(crate) fn longest_prefix_multi(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    query: &[u8],
+    restart_on_gc: bool,
+) -> Result<Option<LongestPrefixHit>> {
+    'restart: loop {
+        let mut child_pin = None;
+        let mut depth = 0;
+        let mut state = LongestPrefixState {
+            bm,
+            key: SearchKey::user(query),
+            best: None,
+            root_version: None,
+            visited: Vec::new(),
+            unstable: false,
+            gc_epoch: restart_on_gc.then(|| bm.gc_read_epoch()),
+        };
+        loop {
+            let pin = child_pin.as_ref().unwrap_or(root_pin);
+            let version = pin.content_version();
+            let guard = pin.read_optimistic();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let root_slot = frame.header().root_slot;
+            let step = root_child_offset(root_slot, "longest_prefix: root child")
+                .and_then(|root| longest_prefix_at(frame, root, depth, &mut state));
+            if state.unstable || !guard.validate() || !pin.validate_content_version(version) {
+                bm.note_optimistic_restart();
+                continue 'restart;
+            }
+            let step = step?;
+            drop(guard);
+            if let Some(pin) = child_pin.take() {
+                state.visited.push((pin, version));
+            } else {
+                state.root_version = Some(version);
+            }
+            match step {
+                LongestPrefixStep::Done => {
+                    if state
+                        .root_version
+                        .is_some_and(|root_version| root_pin.validate_content_version(root_version))
+                        && state.visited.iter().all(|(visited_pin, visited_version)| {
+                            visited_pin.validate_content_version(*visited_version)
+                        })
+                    {
+                        return Ok(state.best);
+                    }
+                    bm.note_optimistic_restart();
+                    continue 'restart;
+                }
+                LongestPrefixStep::Crossing(crossing) => {
+                    let Some(pin) = pin_longest_prefix_child(&mut state, crossing.child_guid)?
+                    else {
+                        bm.note_optimistic_restart();
+                        continue 'restart;
+                    };
+                    child_pin = Some(pin);
+                    depth = crossing.child_depth;
+                }
+            }
+        }
+    }
+}
+
+struct LongestPrefixState<'bm, 'key> {
+    bm: &'bm BufferManager,
+    key: SearchKey<'key>,
+    best: Option<LongestPrefixHit>,
+    root_version: Option<u64>,
+    visited: Vec<(Arc<CachedBlob>, u64)>,
+    unstable: bool,
+    gc_epoch: Option<u64>,
+}
+
+enum LongestPrefixStep {
+    Done,
+    Crossing(BlobNodeCrossing),
+}
+
+fn longest_prefix_at(
+    frame: BlobFrameRef<'_>,
+    mut off: u32,
+    mut depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<LongestPrefixStep> {
+    loop {
+        let (ntype, body) = resolve_typed(frame, off)?;
+        match ntype {
+            NodeType::Invalid => {
+                return Err(Error::node_corrupt(
+                    "walker::longest_prefix: hit NodeType::Invalid",
+                ));
+            }
+            NodeType::EmptyRoot => return Ok(LongestPrefixStep::Done),
+            NodeType::Leaf => {
+                update_longest_prefix_leaf(body, state)?;
+                return Ok(LongestPrefixStep::Done);
+            }
+            NodeType::Prefix => {
+                let Some((next, next_depth)) =
+                    longest_prefix_through_prefix(body, state.key, depth)?
+                else {
+                    return Ok(LongestPrefixStep::Done);
+                };
+                off = next;
+                depth = next_depth;
+            }
+            NodeType::Node4 => {
+                let Some(next) = longest_prefix_through_node4(frame, body, depth, state)? else {
+                    return Ok(LongestPrefixStep::Done);
+                };
+                off = next;
+                depth += 1;
+            }
+            NodeType::Node16 => {
+                let Some(next) = longest_prefix_through_node16(frame, body, depth, state)? else {
+                    return Ok(LongestPrefixStep::Done);
+                };
+                off = next;
+                depth += 1;
+            }
+            NodeType::Node48 => {
+                let Some(next) = longest_prefix_through_node48(frame, body, depth, state)? else {
+                    return Ok(LongestPrefixStep::Done);
+                };
+                off = next;
+                depth += 1;
+            }
+            NodeType::Node256 => {
+                let Some(next) = longest_prefix_through_node256(frame, body, depth, state)? else {
+                    return Ok(LongestPrefixStep::Done);
+                };
+                off = next;
+                depth += 1;
+            }
+            NodeType::Blob => {
+                let blob = cast::<BlobNode>(body);
+                let prefix_len = usize::from(blob.prefix_len);
+                if prefix_len > BLOB_MAX_INLINE
+                    || !state.key.range_eq(depth, &blob.bytes[..prefix_len])
+                {
+                    return Ok(LongestPrefixStep::Done);
+                }
+                return Ok(LongestPrefixStep::Crossing(BlobNodeCrossing {
+                    child_guid: blob.child_blob_guid,
+                    child_depth: depth + prefix_len,
+                }));
+            }
+        }
+    }
+}
+
+fn longest_prefix_through_prefix(
+    body: &[u8],
+    key: SearchKey<'_>,
+    depth: usize,
+) -> Result<Option<(u32, usize)>> {
+    let prefix = cast::<Prefix>(body);
+    let prefix_len = usize::from(prefix.prefix_len);
+    if prefix_len > prefix.bytes.len() {
+        return Err(Error::node_corrupt(
+            "longest_prefix: prefix_len exceeds inline buffer",
+        ));
+    }
+    Ok(key
+        .range_eq(depth, &prefix.bytes[..prefix_len])
+        .then(|| (child_offset(prefix.child as u16), depth + prefix_len)))
+}
+
+fn longest_prefix_through_node4(
+    frame: BlobFrameRef<'_>,
+    body: &[u8],
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<Option<u32>> {
+    let node = cast::<Node4>(body);
+    let count = usize::from(node.count).min(4);
+    update_inner_terminator_candidate(
+        frame,
+        node.keys[..count].iter().zip(&node.children),
+        depth,
+        state,
+    )?;
+    let Some(byte) = query_byte_at(state.key, depth) else {
+        return Ok(None);
+    };
+    Ok(node.keys[..count]
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map(|index| child_offset(node.children[index])))
+}
+
+fn longest_prefix_through_node16(
+    frame: BlobFrameRef<'_>,
+    body: &[u8],
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<Option<u32>> {
+    let node = cast::<Node16>(body);
+    let count = usize::from(node.count).min(16);
+    update_inner_terminator_candidate(
+        frame,
+        node.keys[..count].iter().zip(&node.children),
+        depth,
+        state,
+    )?;
+    Ok(query_byte_at(state.key, depth)
+        .and_then(|byte| simd::node16_find_byte(&node.keys, node.count, byte))
+        .map(|index| child_offset(node.children[usize::from(index)])))
+}
+
+fn longest_prefix_through_node48(
+    frame: BlobFrameRef<'_>,
+    body: &[u8],
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<Option<u32>> {
+    let node = cast::<Node48>(body);
+    update_indexed_terminator_candidate(frame, node.index[0], &node.children, depth, state)?;
+    let Some(index) = query_byte_at(state.key, depth).map(|byte| node.index[usize::from(byte)])
+    else {
+        return Ok(None);
+    };
+    if index == 0 {
+        return Ok(None);
+    }
+    let child_index = usize::from(index - 1);
+    if child_index >= node.children.len() {
+        return Err(Error::node_corrupt(
+            "longest_prefix: node48 index out of range",
+        ));
+    }
+    Ok(Some(child_offset(node.children[child_index])))
+}
+
+fn longest_prefix_through_node256(
+    frame: BlobFrameRef<'_>,
+    body: &[u8],
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<Option<u32>> {
+    let node = cast::<Node256>(body);
+    if node.children[0] != 0 {
+        update_terminator_candidate_at(frame, child_offset(node.children[0]), depth, state)?;
+    }
+    Ok(query_byte_at(state.key, depth).and_then(|byte| {
+        let child = node.children[usize::from(byte)];
+        (child != 0).then(|| child_offset(child))
+    }))
+}
+
+fn query_byte_at(key: SearchKey<'_>, depth: usize) -> Option<u8> {
+    key.user_bytes().and_then(|bytes| bytes.get(depth)).copied()
+}
+
+fn update_inner_terminator_candidate<'a>(
+    frame: BlobFrameRef<'_>,
+    children: impl Iterator<Item = (&'a u8, &'a u16)>,
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<()> {
+    if let Some((_, child)) = children.into_iter().find(|(byte, _)| **byte == 0) {
+        update_terminator_candidate_at(frame, child_offset(*child), depth, state)?;
+    }
+    Ok(())
+}
+
+fn update_indexed_terminator_candidate(
+    frame: BlobFrameRef<'_>,
+    index: u8,
+    children: &[u16],
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<()> {
+    if index == 0 {
+        return Ok(());
+    }
+    let child_index = usize::from(index - 1);
+    if child_index >= children.len() {
+        return Err(Error::node_corrupt(
+            "longest_prefix: node48 terminator index out of range",
+        ));
+    }
+    update_terminator_candidate_at(frame, child_offset(children[child_index]), depth, state)
+}
+
+fn update_terminator_candidate_at(
+    frame: BlobFrameRef<'_>,
+    off: u32,
+    depth: usize,
+    state: &mut LongestPrefixState<'_, '_>,
+) -> Result<()> {
+    let key = state.key;
+    let Some(query) = key.user_bytes() else {
+        return Err(Error::Internal("longest_prefix requires a user search key"));
+    };
+    if depth > query.len() {
+        return Ok(());
+    }
+    let candidate = SearchKey::user(&query[..depth]);
+    let hit = match descend(frame, off, candidate, depth + 1)? {
+        LookupResult::Found(hit) => Some(LongestPrefixHit {
+            key: query[..depth].to_vec(),
+            value: hit.value.to_vec(),
+            seq: hit.seq,
+        }),
+        LookupResult::NotFound => None,
+        LookupResult::Crossing(crossing) => {
+            exact_lookup_from_crossing(state, candidate, crossing, &query[..depth])?
+        }
+    };
+    if let Some(hit) = hit {
+        if state
+            .best
+            .as_ref()
+            .is_none_or(|current| current.key.len() < hit.key.len())
+        {
+            state.best = Some(hit);
+        }
+    }
+    Ok(())
+}
+
+fn exact_lookup_from_crossing(
+    state: &mut LongestPrefixState<'_, '_>,
+    key: SearchKey<'_>,
+    mut crossing: BlobNodeCrossing,
+    user_key: &[u8],
+) -> Result<Option<LongestPrefixHit>> {
+    loop {
+        let Some(pin) = pin_longest_prefix_child(state, crossing.child_guid)? else {
+            return Ok(None);
+        };
+        let version = pin.content_version();
+        let guard = pin.read_optimistic();
+        let frame = BlobFrameRef::wrap(guard.as_slice());
+        let result = lookup_at(frame, frame.header().root_slot, key, crossing.child_depth);
+        if !guard.validate() || !pin.validate_content_version(version) {
+            state.unstable = true;
+            return Ok(None);
+        }
+        let result = result?;
+        drop(guard);
+        state.visited.push((Arc::clone(&pin), version));
+        match result {
+            LookupResult::Found(hit) => {
+                return Ok(Some(LongestPrefixHit {
+                    key: user_key.to_vec(),
+                    value: hit.value.to_vec(),
+                    seq: hit.seq,
+                }));
+            }
+            LookupResult::NotFound => return Ok(None),
+            LookupResult::Crossing(next) => crossing = next,
+        }
+    }
+}
+
+fn pin_longest_prefix_child(
+    state: &mut LongestPrefixState<'_, '_>,
+    child_guid: BlobGuid,
+) -> Result<Option<Arc<CachedBlob>>> {
+    match state.bm.pin(child_guid) {
+        Ok(pin) => Ok(Some(pin)),
+        Err(error)
+            if is_blob_store_not_found(&error)
+                && missing_child_is_retryable(state.bm, child_guid, state.gc_epoch) =>
+        {
+            state.unstable = true;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn update_longest_prefix_leaf(body: &[u8], state: &mut LongestPrefixState<'_, '_>) -> Result<()> {
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
+    if leaf.tombstone != 0 {
+        return Ok(());
+    }
+    let key_len = usize::from(leaf.key_len);
+    let value_len = usize::from(leaf.value_len);
+    let key_end = size_of::<Leaf>()
+        .checked_add(key_len)
+        .ok_or(Error::node_corrupt("longest_prefix: key length overflow"))?;
+    let value_end = key_end
+        .checked_add(value_len)
+        .ok_or(Error::node_corrupt("longest_prefix: value length overflow"))?;
+    if value_end > body.len() {
+        return Err(Error::node_corrupt(
+            "longest_prefix: leaf key/value out of range",
+        ));
+    }
+    let stored_key = &body[size_of::<Leaf>()..key_end];
+    let user_key = stored_key.strip_suffix(&[0]).unwrap_or(stored_key);
+    let Some(query_bytes) = state.key.user_bytes() else {
+        return Err(Error::Internal("longest_prefix requires a user search key"));
+    };
+    if !query_bytes.starts_with(user_key)
+        || state
+            .best
+            .as_ref()
+            .is_some_and(|candidate| candidate.key.len() >= user_key.len())
+    {
+        return Ok(());
+    }
+    state.best = Some(LongestPrefixHit {
+        key: user_key.to_vec(),
+        value: body[key_end..value_end].to_vec(),
+        seq: leaf.seq,
+    });
+    Ok(())
 }
 
 fn lookup_multi_with_gc_policy<R, F>(
