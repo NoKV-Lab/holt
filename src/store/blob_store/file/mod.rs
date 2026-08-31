@@ -195,7 +195,11 @@ pub struct FileBlobStore {
     data_dir: PathBuf,
     /// Shared read or exclusive write advisory lock on `data_dir`.
     /// The kernel releases the lock when this handle closes.
-    _dir_lock: File,
+    dir_lock: File,
+    /// Process that opened this instance. `flock` ownership is shared
+    /// across `fork`, so writes verify the pid to keep a forked child
+    /// from becoming a second live manifest writer.
+    owner_pid: u32,
     access: FileAccess,
     data_file: File,
     read_index_file: File,
@@ -282,7 +286,7 @@ struct ManifestEntry {
     slot: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ReusableSlots {
     singles: Vec<u64>,
     ranges: Vec<FreeSlotRange>,
@@ -511,7 +515,8 @@ impl FileBlobStore {
 
         Ok(Self {
             data_dir,
-            _dir_lock: dir_lock,
+            dir_lock,
+            owner_pid: std::process::id(),
             access,
             data_file,
             read_index_file,
@@ -580,7 +585,8 @@ impl FileBlobStore {
 
         Ok(Self {
             data_dir,
-            _dir_lock: dir_lock,
+            dir_lock,
+            owner_pid: std::process::id(),
             access,
             data_file,
             read_index_file,
@@ -757,6 +763,7 @@ impl FileBlobStore {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
+        self.verify_exclusive_writer()?;
         let entries = self.reserve_write_entries(writes.iter().map(|(guid, _)| *guid));
         if let Some(required_slots) = entries
             .iter()
@@ -942,7 +949,49 @@ impl FileBlobStore {
         Ok(())
     }
 
+    /// Refuse writes when this instance's exclusive claim to the store can
+    /// no longer be trusted: the process forked (the advisory lock is
+    /// shared across `fork`), or `store.lock` on disk is no longer the
+    /// inode this instance locked (the file was removed or replaced, so a
+    /// second opener may hold an exclusive lock on a different inode).
+    /// Either way a second live writer could interleave its delta batches
+    /// into `manifest.log`; replay cannot untangle two self-consistent
+    /// writers and eventually fails closed with a duplicate slot.
+    fn verify_exclusive_writer(&self) -> Result<()> {
+        if self.access.is_read_only() {
+            return Ok(());
+        }
+        let current_pid = std::process::id();
+        if current_pid != self.owner_pid {
+            return Err(Error::BlobStoreIo(io::Error::other(format!(
+                "blob store at {} was opened by process {} but written from \
+                 process {}; a forked child must open its own store handle",
+                self.data_dir.display(),
+                self.owner_pid,
+                current_pid,
+            ))));
+        }
+        use std::os::unix::fs::MetadataExt;
+        let held = self.dir_lock.metadata().map_err(Error::BlobStoreIo)?;
+        let lock_path = self.data_dir.join(LOCK_FILENAME);
+        let on_disk = std::fs::metadata(&lock_path).map_err(|error| {
+            Error::BlobStoreIo(io::Error::other(format!(
+                "store lock {} disappeared while held: {error}",
+                lock_path.display(),
+            )))
+        })?;
+        if held.dev() != on_disk.dev() || held.ino() != on_disk.ino() {
+            return Err(Error::BlobStoreIo(io::Error::other(format!(
+                "store lock {} was replaced while held; another writer may \
+                 own the store",
+                lock_path.display(),
+            ))));
+        }
+        Ok(())
+    }
+
     fn flush_locked(&self) -> Result<()> {
+        self.verify_exclusive_writer()?;
         // Order matters: data must be on disk before the manifest
         // promotes any new slot. Otherwise a crash could leave the
         // manifest pointing at a slot whose data is still in NVMe's
@@ -1607,6 +1656,7 @@ impl BlobStore for FileBlobStore {
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         self.ensure_writable()?;
+        self.verify_exclusive_writer()?;
         let _io = self.data_io_lock.lock().unwrap();
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
@@ -1704,13 +1754,35 @@ impl BlobStore for FileBlobStore {
 
         let (slots_trimmed, next_slot, free_ranges) = {
             let mut m = self.manifest.write().unwrap();
+            // Relocation rewrites live guid->slot mappings and frees the old
+            // slots in memory WITHOUT queueing deltas; only the snapshot
+            // below makes that durable. If the snapshot fails, the durable
+            // log still maps every moved guid to its old slot, so continuing
+            // with the relocated in-memory state would hand out slots the
+            // log believes are live (free-without-durable-delta). Restore
+            // the pre-relocation state on failure. A truncate_log failure
+            // after a durable snapshot remains a narrower known window
+            // (stale relocation-era records replayed over the new snapshot)
+            // tracked as follow-up work.
+            let relocation_backup = if plan.is_empty() {
+                None
+            } else {
+                Some((m.entries.clone(), m.next_slot, m.reusable_slots.clone()))
+            };
             let slots_trimmed = if plan.is_empty() {
                 m.trim_trailing_free_slots()
             } else {
                 m.apply_relocation_plan(&plan)?
             };
             if slots_trimmed != 0 || !plan.is_empty() {
-                m.persist_snapshot(&self.data_dir)?;
+                if let Err(error) = m.persist_snapshot(&self.data_dir) {
+                    if let Some((entries, next_slot, reusable_slots)) = relocation_backup {
+                        m.entries = entries;
+                        m.next_slot = next_slot;
+                        m.reusable_slots = reusable_slots;
+                    }
+                    return Err(error);
+                }
                 m.truncate_log()?;
                 m.pending_log.clear();
                 self.manifest_dirty.store(false, Ordering::Release);
@@ -2040,6 +2112,19 @@ impl Manifest {
         f.read_to_end(&mut buf)?;
         let mut offset = 0usize;
         let mut valid_offset = 0usize;
+        // Live slot ownership WITHIN this log's own record sequence. A
+        // single serialized writer appends the delta that frees a slot
+        // strictly before any record that reuses it, so inside one log a
+        // `Set` landing on a slot held by a DIFFERENT live guid can only
+        // come from a second concurrent writer braiding its batches into
+        // the file (a forked child, or an opener admitted through a
+        // replaced `store.lock` inode). Fail closed at the first
+        // conflicting record instead of serving cross-written state.
+        // Snapshot-seeded entries deliberately do NOT participate: a crash
+        // between snapshot compaction and log truncation legitimately
+        // leaves a stale log whose records disagree with the snapshot and
+        // replay over it idempotently.
+        let mut slot_owners: HashMap<u64, BlobGuid> = HashMap::new();
         while offset < buf.len() {
             let remaining = buf.len() - offset;
             if remaining < MANIFEST_LOG_HEADER_SIZE {
@@ -2080,7 +2165,22 @@ impl Manifest {
                     let mut guid = [0u8; 16];
                     guid.copy_from_slice(&body[..16]);
                     let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                    entries.insert(guid, ManifestEntry { slot });
+                    match slot_owners.get(&slot) {
+                        Some(holder) if *holder != guid => {
+                            return Err(Error::node_corrupt(
+                                "FileBlobStore::ManifestLog::slot conflict \
+                                 (a second concurrent writer is the only \
+                                 known producer of this record order)",
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if let Some(previous) = entries.insert(guid, ManifestEntry { slot }) {
+                        if previous.slot != slot {
+                            slot_owners.remove(&previous.slot);
+                        }
+                    }
+                    slot_owners.insert(slot, guid);
                     *next_slot = (*next_slot).max(slot.saturating_add(1));
                 }
                 MANIFEST_LOG_TY_DELETE => {
@@ -2091,7 +2191,9 @@ impl Manifest {
                     }
                     let mut guid = [0u8; 16];
                     guid.copy_from_slice(body);
-                    entries.remove(&guid);
+                    if let Some(previous) = entries.remove(&guid) {
+                        slot_owners.remove(&previous.slot);
+                    }
                 }
                 _ => {
                     return Err(Error::node_corrupt(
@@ -2337,6 +2439,107 @@ mod tests {
             round_up_slots(DATA_PREALLOC_LARGE_AT_SLOTS + 1),
             DATA_PREALLOC_LARGE_AT_SLOTS + DATA_PREALLOC_LARGE_CHUNK_SLOTS,
         );
+    }
+
+    #[test]
+    fn writes_refuse_a_replaced_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let guid = [0x11u8; 16];
+        b.write_blob(guid, &buf_with(1)).unwrap();
+        b.flush().unwrap();
+
+        // Replace the lock inode out from under the held flock: this is the
+        // door that admits a second exclusive writer.
+        let lock_path = dir.path().join(LOCK_FILENAME);
+        std::fs::remove_file(&lock_path).unwrap();
+        File::create(&lock_path).unwrap();
+
+        let error = b.write_blob(guid, &buf_with(2)).unwrap_err();
+        assert!(
+            error.to_string().contains("replaced"),
+            "unexpected error: {error}"
+        );
+        let error = b.flush().unwrap_err();
+        assert!(
+            error.to_string().contains("replaced"),
+            "unexpected flush error: {error}"
+        );
+    }
+
+    #[test]
+    fn writes_refuse_a_missing_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        std::fs::remove_file(dir.path().join(LOCK_FILENAME)).unwrap();
+        let error = b.write_blob([0x12u8; 16], &buf_with(1)).unwrap_err();
+        assert!(
+            error.to_string().contains("disappeared"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn writes_refuse_a_forked_process_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(mut b) = try_open(dir.path()) else {
+            return;
+        };
+        // flock ownership survives fork; the pid recorded at open is how a
+        // forked child is told to open its own handle instead of writing.
+        b.owner_pid = b.owner_pid.wrapping_add(1);
+        let error = b.write_blob([0x13u8; 16], &buf_with(1)).unwrap_err();
+        assert!(
+            error.to_string().contains("forked"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn replay_fails_closed_on_a_braided_slot_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob([0xA1u8; 16], &buf_with(1)).unwrap();
+            b.flush().unwrap();
+        }
+
+        // A second concurrent writer that opened from the same prefix would
+        // believe slot 0 is free and append its own Set for a different
+        // guid. A single serialized writer can never produce this order:
+        // the record freeing slot 0 would have to come first.
+        let mut record = Vec::new();
+        encode_manifest_delta(
+            ManifestDelta::Set {
+                guid: [0xB2u8; 16],
+                slot: 0,
+            },
+            &mut record,
+        )
+        .unwrap();
+        {
+            use std::io::Write;
+            let mut log = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(MANIFEST_LOG_FILENAME))
+                .unwrap();
+            log.write_all(&record).unwrap();
+            log.sync_data().unwrap();
+        }
+
+        match FileBlobStore::open(dir.path()) {
+            Err(error) => assert!(
+                error.to_string().contains("slot conflict"),
+                "unexpected error: {error}"
+            ),
+            Ok(_) => panic!("braided manifest log must not open"),
+        }
     }
 
     /// Skip every test in this module when O_DIRECT isn't supported
