@@ -198,6 +198,96 @@ impl std::fmt::Debug for FlushGapHook {
     }
 }
 
+// The process hooks below exist only in the lib-test binary. They let a
+// parent test stop a real Tree child at an exact durability boundary without
+// exposing failpoints in the library API or relying on scheduler timing.
+#[cfg(test)]
+const TEST_PUBLISH_ARM_ENV: &str = "HOLT_TEST_MANIFEST_PUBLISH_ARM";
+#[cfg(test)]
+const TEST_PUBLISH_READY_ENV: &str = "HOLT_TEST_MANIFEST_PUBLISH_READY";
+#[cfg(test)]
+const TEST_PUBLISH_RELEASE_ENV: &str = "HOLT_TEST_MANIFEST_PUBLISH_RELEASE";
+#[cfg(test)]
+const TEST_TORN_ARM_ENV: &str = "HOLT_TEST_MANIFEST_TORN_ARM";
+#[cfg(test)]
+const TEST_TORN_READY_ENV: &str = "HOLT_TEST_MANIFEST_TORN_READY";
+#[cfg(test)]
+const TEST_TORN_RELEASE_ENV: &str = "HOLT_TEST_MANIFEST_TORN_RELEASE";
+
+#[cfg(test)]
+fn take_process_test_arm(env_name: &str) -> bool {
+    let Some(path) = std::env::var_os(env_name).map(PathBuf::from) else {
+        return false;
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => panic!("failed to consume process-test arm: {error}"),
+    }
+}
+
+#[cfg(test)]
+fn wait_for_process_test_release(env_name: &str) {
+    let path = std::env::var_os(env_name).map_or_else(
+        || panic!("missing process-test release env {env_name}"),
+        PathBuf::from,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for process-test release {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+fn write_process_test_ready(env_name: &str, payload: impl AsRef<[u8]>) {
+    let path = std::env::var_os(env_name).map_or_else(
+        || panic!("missing process-test ready env {env_name}"),
+        PathBuf::from,
+    );
+    std::fs::write(&path, payload)
+        .unwrap_or_else(|error| panic!("failed to write ready marker {}: {error}", path.display()));
+}
+
+#[cfg(test)]
+fn run_manifest_publish_process_test_hook(manifest: &Manifest) {
+    if !take_process_test_arm(TEST_PUBLISH_ARM_ENV) {
+        return;
+    }
+    write_process_test_ready(
+        TEST_PUBLISH_READY_ENV,
+        format!(
+            "pending_deltas={}\nlog_bytes={}\n",
+            manifest.pending_log.len(),
+            manifest.log_bytes
+        ),
+    );
+    wait_for_process_test_release(TEST_PUBLISH_RELEASE_ENV);
+}
+
+#[cfg(test)]
+fn persist_torn_manifest_prefix_process_test_hook(file: &mut &File, buf: &[u8]) -> Result<bool> {
+    if !take_process_test_arm(TEST_TORN_ARM_ENV) {
+        return Ok(false);
+    }
+    assert!(buf.len() > 1, "manifest test delta must have a torn prefix");
+    let prefix_len = buf.len() - 1;
+    file.write_all(&buf[..prefix_len])?;
+    file.sync_data()?;
+    write_process_test_ready(
+        TEST_TORN_READY_ENV,
+        format!("prefix_len={prefix_len}\ntotal_len={}\n", buf.len()),
+    );
+    wait_for_process_test_release(TEST_TORN_RELEASE_ENV);
+    file.write_all(&buf[prefix_len..])?;
+    file.sync_data()?;
+    Ok(true)
+}
+
 /// Construct via [`FileBlobStore::open`]. Thread-safe; the
 /// underlying file handle is shared and `pread`/`pwrite` are
 /// atomic at the syscall boundary.
@@ -1071,12 +1161,18 @@ impl FileBlobStore {
             self.mark_data_synced(epoch);
         }
 
-        #[cfg(test)]
-        self.run_flush_gap_test_hook();
-
         let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
             let mut m = self.manifest.write().unwrap();
+            #[cfg(test)]
+            {
+                assert!(
+                    !m.pending_log.is_empty(),
+                    "a dirty manifest must have a delta to publish"
+                );
+                self.run_flush_gap_test_hook();
+                run_manifest_publish_process_test_hook(&m);
+            }
             if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
                 self.manifest_dirty.store(true, Ordering::Release);
                 return Err(e);
@@ -2117,8 +2213,14 @@ impl Manifest {
         for delta in &self.pending_log {
             encode_manifest_delta(*delta, &mut buf)?;
         }
-        f.write_all(&buf)?;
-        f.sync_data()?;
+        #[cfg(test)]
+        let written_by_test_hook = persist_torn_manifest_prefix_process_test_hook(&mut f, &buf)?;
+        #[cfg(not(test))]
+        let written_by_test_hook = false;
+        if !written_by_test_hook {
+            f.write_all(&buf)?;
+            f.sync_data()?;
+        }
         let _ = data_dir;
 
         self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
@@ -2500,11 +2602,141 @@ impl ReusableSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CheckpointConfig, Durability, Tree, TreeBuilder};
+    use std::process::{Child, Command, ExitStatus};
+
+    const DUAL_CHILD_DIR_ENV: &str = "HOLT_TEST_DUAL_CHILD_DIR";
+    const DUAL_CHILD_RESULT_ENV: &str = "HOLT_TEST_DUAL_CHILD_RESULT";
+    const TORN_CHILD_DIR_ENV: &str = "HOLT_TEST_TORN_CHILD_DIR";
+    const WRITER_A_KEY: &[u8] = b"writer-a-ack";
+    const WRITER_A_VALUE: &[u8] = b"writer-a-durable-value";
+    const WRITER_B_KEY: &[u8] = b"writer-b-ack";
+    const WRITER_B_VALUE: &[u8] = b"writer-b-durable-value";
+    const CRASH_KEY: &[u8] = b"sigkill-ack";
+    const CRASH_VALUE: &[u8] = b"survives-wal-replay-and-checkpoint";
+
+    struct KillOnDrop(Option<Child>);
+
+    impl KillOnDrop {
+        fn new(child: Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            self.0.as_mut().unwrap()
+        }
+
+        fn wait(mut self) -> ExitStatus {
+            self.0.take().unwrap().wait().unwrap()
+        }
+
+        fn kill_and_wait(mut self) -> ExitStatus {
+            let mut child = self.0.take().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap()
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn manual_tree(dir: &Path) -> crate::api::errors::Result<Tree> {
+        TreeBuilder::new(dir)
+            .durability(Durability::Wal { sync: true })
+            .checkpoint(CheckpointConfig {
+                enabled: false,
+                auto_vacuum: false,
+                ..CheckpointConfig::default()
+            })
+            .open()
+    }
+
+    fn wait_for_child_marker(child: &mut Child, path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(payload) = std::fs::read_to_string(path) {
+                if !payload.is_empty() {
+                    return payload;
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "child exited before durability marker {}: {status}",
+                    path.display()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for child marker {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn marker_metric(payload: &str, name: &str) -> u64 {
+        payload
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("marker is missing {name}: {payload:?}"))
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid {name} in marker {payload:?}: {error}"))
+    }
+
+    fn spawn_lib_test_child(test_name: &str, envs: &[(&str, &Path)]) -> KillOnDrop {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("--exact").arg(test_name).arg("--nocapture");
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        KillOnDrop::new(command.spawn().unwrap())
+    }
 
     fn buf_with(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
         b.as_mut_slice()[100] = byte_at_100;
         b
+    }
+
+    #[test]
+    fn process_child_pauses_before_manifest_publish() {
+        let Some(dir) = std::env::var_os(DUAL_CHILD_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let tree = manual_tree(&dir).unwrap();
+        tree.put(WRITER_A_KEY, WRITER_A_VALUE).unwrap();
+        let arm = std::env::var_os(TEST_PUBLISH_ARM_ENV).unwrap();
+        std::fs::write(arm, b"armed").unwrap();
+        let checkpoint = tree.checkpoint();
+        let result_path = std::env::var_os(DUAL_CHILD_RESULT_ENV).unwrap();
+        let result = match checkpoint {
+            Ok(()) => "checkpoint=ok".to_owned(),
+            Err(error) => format!("checkpoint=error:{error}"),
+        };
+        std::fs::write(result_path, result).unwrap();
+        assert_eq!(
+            tree.get(WRITER_A_KEY).unwrap().as_deref(),
+            Some(WRITER_A_VALUE)
+        );
+    }
+
+    #[test]
+    fn process_child_pauses_after_durable_torn_manifest_prefix() {
+        let Some(dir) = std::env::var_os(TORN_CHILD_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let tree = manual_tree(&dir).unwrap();
+        tree.put(CRASH_KEY, CRASH_VALUE).unwrap();
+        let arm = std::env::var_os(TEST_TORN_ARM_ENV).unwrap();
+        std::fs::write(arm, b"armed").unwrap();
+        tree.checkpoint().unwrap();
+        panic!("SIGKILL child was released instead of killed");
     }
 
     #[test]
@@ -2525,13 +2757,154 @@ mod tests {
     }
 
     #[test]
+    fn replaced_lock_cannot_admit_two_tree_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tree = manual_tree(dir.path()).unwrap();
+            tree.put(b"bootstrap", b"clean-prefix").unwrap();
+            tree.checkpoint().unwrap();
+        }
+
+        let arm = dir.path().join("publish-arm");
+        let ready = dir.path().join("publish-ready");
+        let release = dir.path().join("publish-release");
+        let writer_a_result_path = dir.path().join("writer-a-result");
+        let mut writer_a = spawn_lib_test_child(
+            "store::blob_store::file::tests::process_child_pauses_before_manifest_publish",
+            &[
+                (DUAL_CHILD_DIR_ENV, dir.path()),
+                (TEST_PUBLISH_ARM_ENV, &arm),
+                (TEST_PUBLISH_READY_ENV, &ready),
+                (TEST_PUBLISH_RELEASE_ENV, &release),
+                (DUAL_CHILD_RESULT_ENV, &writer_a_result_path),
+            ],
+        );
+        let marker = wait_for_child_marker(writer_a.child_mut(), &ready);
+        assert!(
+            marker_metric(&marker, "pending_deltas") > 0,
+            "writer A did not reach a real manifest publication: {marker:?}"
+        );
+
+        // Writer A has synced its data and holds the manifest write lock, but
+        // has not appended its mapping. Replacing the proxy lock used to let a
+        // second process replay the same prefix and report a successful write.
+        std::fs::remove_file(dir.path().join(LOCK_FILENAME)).unwrap();
+        let writer_b_error = match manual_tree(dir.path()) {
+            Ok(tree) => {
+                let put = tree.put(WRITER_B_KEY, WRITER_B_VALUE);
+                let checkpoint = put.as_ref().map(|()| tree.checkpoint());
+                drop(tree);
+                format!("second Tree opened; put={put:?}, checkpoint={checkpoint:?}")
+            }
+            Err(error) => error.to_string(),
+        };
+
+        // Always release and reap A before checking assertions so a failure
+        // cannot strand the child at the test seam.
+        std::fs::write(&release, b"continue").unwrap();
+        let writer_a_status = writer_a.wait();
+        let writer_a_result = std::fs::read_to_string(&writer_a_result_path).unwrap();
+
+        assert!(
+            writer_a_status.success(),
+            "writer A failed: {writer_a_status}"
+        );
+        assert!(
+            writer_a_result == "checkpoint=ok" || writer_a_result.contains("replaced while held"),
+            "writer A must either finish or fail closed on the replaced proxy lock: {writer_a_result}"
+        );
+        assert!(
+            writer_b_error.contains("manifest.log is held by a live writer"),
+            "writer B was not rejected by the authoritative manifest lock: {writer_b_error}"
+        );
+
+        let reopened = manual_tree(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(WRITER_A_KEY).unwrap().as_deref(),
+            Some(WRITER_A_VALUE),
+            "writer A returned success but its acknowledged value was lost"
+        );
+        assert_eq!(
+            reopened.get(WRITER_B_KEY).unwrap(),
+            None,
+            "a writer rejected at admission must not publish data"
+        );
+    }
+
+    #[test]
+    fn sigkill_after_nonempty_torn_manifest_write_recovers_acknowledged_wal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tree = manual_tree(dir.path()).unwrap();
+            tree.put(b"bootstrap", b"clean-prefix").unwrap();
+            tree.checkpoint().unwrap();
+        }
+        let manifest_log = dir.path().join(MANIFEST_LOG_FILENAME);
+        let clean_log_bytes = std::fs::metadata(&manifest_log).unwrap().len();
+
+        let arm = dir.path().join("torn-arm");
+        let ready = dir.path().join("torn-ready");
+        let release = dir.path().join("torn-release");
+        let mut child = spawn_lib_test_child(
+            "store::blob_store::file::tests::process_child_pauses_after_durable_torn_manifest_prefix",
+            &[
+                (TORN_CHILD_DIR_ENV, dir.path()),
+                (TEST_TORN_ARM_ENV, &arm),
+                (TEST_TORN_READY_ENV, &ready),
+                (TEST_TORN_RELEASE_ENV, &release),
+            ],
+        );
+        let marker = wait_for_child_marker(child.child_mut(), &ready);
+        let prefix_len = marker_metric(&marker, "prefix_len");
+        let total_len = marker_metric(&marker, "total_len");
+        assert!(
+            prefix_len > 0 && prefix_len < total_len,
+            "SIGKILL seam must contain a nonempty incomplete record: {marker:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest_log).unwrap().len(),
+            clean_log_bytes + prefix_len,
+            "ready must be emitted only after the torn prefix is durable"
+        );
+
+        let status = child.kill_and_wait();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "child was not SIGKILLed"
+        );
+
+        let recovered = manual_tree(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&manifest_log).unwrap().len(),
+            clean_log_bytes,
+            "writable reopen must truncate the durable torn tail"
+        );
+        assert_eq!(
+            recovered.get(CRASH_KEY).unwrap().as_deref(),
+            Some(CRASH_VALUE),
+            "the acknowledged write must be restored from the synced WAL"
+        );
+        recovered.checkpoint().unwrap();
+        drop(recovered);
+
+        let reopened = manual_tree(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(CRASH_KEY).unwrap().as_deref(),
+            Some(CRASH_VALUE),
+            "the recovered write must survive checkpoint and a second reopen"
+        );
+    }
+
+    #[test]
     fn lock_replacement_race_cannot_yield_two_successful_writers() {
         // The acceptance-found blocker: replace store.lock inside writer 1's
         // check-to-append window, admit a full writer-2 lifecycle, and both
         // writers report success while the braided log makes the store
         // permanently unreopenable. The contract this test pins: at most one
         // writer's durable work is accepted, and the store stays reopenable.
-        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2542,25 +2915,36 @@ mod tests {
         let g2 = [0xB2u8; 16];
         w1.write_blob(g1, &buf_with(1)).unwrap();
 
-        let second_writer_succeeded = Arc::new(AtomicBool::new(false));
-        let hook_flag = Arc::clone(&second_writer_succeeded);
+        let second_writer_result = Arc::new(Mutex::new(None));
+        let hook_result = Arc::clone(&second_writer_result);
         let hook_dir = dir.path().to_path_buf();
         w1.install_flush_gap_test_hook(move || {
             // Writer 1 has already passed its identity check for this flush.
-            let _ = std::fs::remove_file(hook_dir.join(LOCK_FILENAME));
-            if let Ok(w2) = FileBlobStore::open(&hook_dir) {
-                if w2.write_blob(g2, &buf_with(2)).is_ok() && w2.flush().is_ok() {
-                    hook_flag.store(true, Ordering::SeqCst);
-                }
-            }
+            std::fs::remove_file(hook_dir.join(LOCK_FILENAME)).unwrap();
+            let result = match FileBlobStore::open(&hook_dir) {
+                Ok(w2) => match w2.write_blob(g2, &buf_with(2)).and_then(|()| w2.flush()) {
+                    Ok(()) => "success".to_owned(),
+                    Err(error) => format!("write error: {error}"),
+                },
+                Err(error) => format!("open error: {error}"),
+            };
+            *hook_result.lock().unwrap() = Some(result);
         });
 
         let w1_flush = w1.flush();
         drop(w1);
 
         assert!(
-            !(second_writer_succeeded.load(Ordering::SeqCst) && w1_flush.is_ok()),
-            "both writers returned success across a lock replacement"
+            w1_flush.is_ok(),
+            "the admitted writer must complete its manifest publication: {w1_flush:?}"
+        );
+        let second_writer_result = second_writer_result.lock().unwrap();
+        let second_writer_result = second_writer_result
+            .as_deref()
+            .expect("writer-2 probe did not run");
+        assert!(
+            second_writer_result.contains("manifest.log is held by a live writer"),
+            "writer 2 must fail at manifest admission, got: {second_writer_result}"
         );
         let reopened = FileBlobStore::open(dir.path());
         assert!(
