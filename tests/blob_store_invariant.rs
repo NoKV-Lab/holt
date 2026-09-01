@@ -556,6 +556,7 @@ fn child_writer_entry() {
 }
 
 #[test]
+#[ignore = "timing-based SIGKILL soak; deterministic torn-write coverage runs in the file-store process E2E"]
 fn shape_e_sigkill_churn() {
     let dir = tempfile::tempdir().unwrap();
     let exe = std::env::current_exe().unwrap();

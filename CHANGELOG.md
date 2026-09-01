@@ -13,14 +13,15 @@ fine-grained per-commit history is in `git log`.
 
 ### Fixed
 
-- `FileBlobStore` now defends the manifest against a second live writer.
-  Writes verify the opening process id (the directory lock is shared across
-  `fork`) and that `store.lock` on disk is still the locked inode; manifest
-  replay fails closed at the first `Set` that lands on a slot held by a
-  different live guid, naming the concurrent-writer cause instead of
-  surfacing later as an opaque duplicate-slot error. Vacuum relocation now
-  restores its pre-relocation state when the snapshot persist fails. No
-  on-disk format change.
+- `FileBlobStore` now prevents a second live manifest writer even if
+  `store.lock` is replaced. A writable open takes an exclusive kernel lock on
+  `manifest.log` before replay and keeps that same descriptor for appends,
+  torn-tail repair, and truncation for the store lifetime. Process-id and
+  `store.lock` identity checks remain early fail-closed signals; replay also
+  diagnoses the first conflicting slot assignment instead of surfacing a
+  later opaque duplicate-slot error. Vacuum relocation now restores its
+  pre-relocation state when snapshot persistence fails. No on-disk format
+  change.
 
 ## [0.8.5] — 2026-08-11
 
