@@ -187,6 +187,17 @@ const VALUE_SEGMENT_SLOT_BYTES: usize = PAGE_SIZE as usize;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
 ///
+#[cfg(test)]
+#[derive(Default)]
+struct FlushGapHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for FlushGapHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlushGapHook")
+    }
+}
+
 /// Construct via [`FileBlobStore::open`]. Thread-safe; the
 /// underlying file handle is shared and `pread`/`pwrite` are
 /// atomic at the syscall boundary.
@@ -200,6 +211,11 @@ pub struct FileBlobStore {
     /// across `fork`, so writes verify the pid to keep a forked child
     /// from becoming a second live manifest writer.
     owner_pid: u32,
+    /// Test-only pause point between the writer-identity check and the
+    /// manifest append, the window a lock-replacement race must not be
+    /// able to exploit.
+    #[cfg(test)]
+    flush_gap_hook: FlushGapHook,
     access: FileAccess,
     data_file: File,
     read_index_file: File,
@@ -256,6 +272,12 @@ struct Manifest {
     /// holes as ranges so a sparse high-water manifest does not
     /// expand into one `u64` per free slot.
     reusable_slots: ReusableSlots,
+    /// Exclusive, kernel-locked append handle to `manifest.log`, held for
+    /// the manifest's whole lifetime by writable opens (`None` read-only).
+    /// Every append and truncation goes through this descriptor, so a
+    /// second live writer can never interleave batches into the same
+    /// inode: it fails to lock at open instead.
+    log_file: Option<File>,
     /// Slots superseded by a shadow rewrite or removed by `delete_blob`, but
     /// whose replacement/delete is not yet durable in the manifest. They
     /// become reusable only after `flush` persists the corresponding delta;
@@ -264,8 +286,6 @@ struct Manifest {
     pending_free_slots: Vec<u64>,
     /// Path to the manifest file (for tmp+rename writes).
     path: PathBuf,
-    /// Path to the append-only manifest delta log.
-    log_path: PathBuf,
     /// Bytes currently in `manifest.log`, used to decide when a
     /// full snapshot compaction is worth paying for.
     log_bytes: u64,
@@ -353,6 +373,37 @@ fn acquire_dir_lock(data_dir: &Path, access: FileAccess, timeout: Duration) -> R
                             "blob store at {} has an incompatible live access mode \
                              (waited {timeout:?})",
                             data_dir.display()
+                        ),
+                    )));
+                }
+                thread::sleep(DIR_LOCK_RETRY_INTERVAL);
+            }
+            _ => return Err(Error::BlobStoreIo(err)),
+        }
+    }
+}
+
+/// Take a non-blocking exclusive `flock` on an already-open handle, waiting
+/// up to `timeout` so a reopen racing a previous instance's drop serializes
+/// instead of failing (the same handover contract as `acquire_dir_lock`).
+fn lock_file_exclusive(file: &File, path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(Error::BlobStoreIo(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "{} is held by a live writer (waited {timeout:?}; \
+                             was store.lock removed or replaced?)",
+                            path.display()
                         ),
                     )));
                 }
@@ -517,6 +568,8 @@ impl FileBlobStore {
             data_dir,
             dir_lock,
             owner_pid: std::process::id(),
+            #[cfg(test)]
+            flush_gap_hook: FlushGapHook::default(),
             access,
             data_file,
             read_index_file,
@@ -587,6 +640,8 @@ impl FileBlobStore {
             data_dir,
             dir_lock,
             owner_pid: std::process::id(),
+            #[cfg(test)]
+            flush_gap_hook: FlushGapHook::default(),
             access,
             data_file,
             read_index_file,
@@ -990,6 +1045,21 @@ impl FileBlobStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn install_flush_gap_test_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut slot = self.flush_gap_hook.0.lock().unwrap();
+        assert!(slot.is_none(), "flush gap hook already installed");
+        *slot = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_flush_gap_test_hook(&self) {
+        let hook = self.flush_gap_hook.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn flush_locked(&self) -> Result<()> {
         self.verify_exclusive_writer()?;
         // Order matters: data must be on disk before the manifest
@@ -1000,6 +1070,9 @@ impl FileBlobStore {
             self.sync_data_file()?;
             self.mark_data_synced(epoch);
         }
+
+        #[cfg(test)]
+        self.run_flush_gap_test_hook();
 
         let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
@@ -1835,6 +1908,30 @@ struct SlotMove {
 
 impl Manifest {
     fn load_or_create(path: &Path, log_path: &Path, repair_torn_tail: bool) -> Result<Self> {
+        // A writable manifest owns ONE exclusive, kernel-locked append handle
+        // to `manifest.log` for its whole lifetime, acquired before replay.
+        // Exclusivity over the appended inode is thereby HELD, not checked:
+        // a second writer admitted through a replaced `store.lock` cannot
+        // braid batches into this log because it cannot lock this inode, and
+        // there is no check-to-append window to race.
+        let log_file = if repair_torn_tail {
+            let log_existed = log_path.exists();
+            let file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(log_path)?;
+            lock_file_exclusive(&file, log_path, DIR_LOCK_ACQUIRE_TIMEOUT)?;
+            if !log_existed {
+                if let Some(parent) = log_path.parent() {
+                    sync_dir(parent)?;
+                }
+            }
+            Some(file)
+        } else {
+            None
+        };
+
         let (mut entries, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
@@ -1842,8 +1939,11 @@ impl Manifest {
         };
 
         let replay = Self::replay_log(log_path, &mut entries, &mut next_slot)?;
-        if repair_torn_tail && replay.valid_bytes < replay.file_bytes {
-            truncate_manifest_log(log_path, replay.valid_bytes)?;
+        if replay.valid_bytes < replay.file_bytes {
+            if let Some(file) = &log_file {
+                file.set_len(replay.valid_bytes)?;
+                file.sync_data()?;
+            }
         }
         let used_slots: Vec<_> = entries.values().map(|entry| entry.slot).collect();
         let reusable_slots = ReusableSlots::reconstruct(next_slot, &used_slots)?;
@@ -1854,7 +1954,7 @@ impl Manifest {
             reusable_slots,
             pending_free_slots: Vec::new(),
             path: path.to_path_buf(),
-            log_path: log_path.to_path_buf(),
+            log_file,
             log_bytes: replay.valid_bytes,
             pending_log: Vec::new(),
         })
@@ -2008,21 +2108,18 @@ impl Manifest {
             return Ok(());
         }
 
-        let log_created = !self.log_path.exists();
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let Some(mut f) = self.log_file.as_ref() else {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "read-only manifest cannot persist deltas",
+            )));
+        };
         let mut buf = Vec::with_capacity(self.pending_log.len() * 40);
         for delta in &self.pending_log {
             encode_manifest_delta(*delta, &mut buf)?;
         }
         f.write_all(&buf)?;
         f.sync_data()?;
-        drop(f);
-        if log_created {
-            sync_dir(data_dir)?;
-        }
+        let _ = data_dir;
 
         self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
         if self.should_compact_log() {
@@ -2075,22 +2172,15 @@ impl Manifest {
     }
 
     fn truncate_log(&mut self) -> Result<()> {
-        match OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.log_path)
-        {
-            Ok(f) => {
-                f.sync_data()?;
-                self.log_bytes = 0;
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.log_bytes = 0;
-                Ok(())
-            }
-            Err(e) => Err(Error::BlobStoreIo(e)),
-        }
+        let Some(f) = self.log_file.as_ref() else {
+            return Err(Error::BlobStoreIo(io::Error::other(
+                "read-only manifest cannot truncate its log",
+            )));
+        };
+        f.set_len(0)?;
+        f.sync_data()?;
+        self.log_bytes = 0;
+        Ok(())
     }
 
     fn replay_log(
@@ -2245,13 +2335,6 @@ fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> 
 fn sync_dir(path: &Path) -> Result<()> {
     let dir = File::open(path)?;
     dir.sync_all()?;
-    Ok(())
-}
-
-fn truncate_manifest_log(path: &Path, valid_bytes: u64) -> Result<()> {
-    let f = OpenOptions::new().write(true).open(path)?;
-    f.set_len(valid_bytes)?;
-    f.sync_all()?;
     Ok(())
 }
 
@@ -2438,6 +2521,52 @@ mod tests {
         assert_eq!(
             round_up_slots(DATA_PREALLOC_LARGE_AT_SLOTS + 1),
             DATA_PREALLOC_LARGE_AT_SLOTS + DATA_PREALLOC_LARGE_CHUNK_SLOTS,
+        );
+    }
+
+    #[test]
+    fn lock_replacement_race_cannot_yield_two_successful_writers() {
+        // The acceptance-found blocker: replace store.lock inside writer 1's
+        // check-to-append window, admit a full writer-2 lifecycle, and both
+        // writers report success while the braided log makes the store
+        // permanently unreopenable. The contract this test pins: at most one
+        // writer's durable work is accepted, and the store stays reopenable.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some(w1) = try_open(dir.path()) else {
+            return;
+        };
+        let g1 = [0xA1u8; 16];
+        let g2 = [0xB2u8; 16];
+        w1.write_blob(g1, &buf_with(1)).unwrap();
+
+        let second_writer_succeeded = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&second_writer_succeeded);
+        let hook_dir = dir.path().to_path_buf();
+        w1.install_flush_gap_test_hook(move || {
+            // Writer 1 has already passed its identity check for this flush.
+            let _ = std::fs::remove_file(hook_dir.join(LOCK_FILENAME));
+            if let Ok(w2) = FileBlobStore::open(&hook_dir) {
+                if w2.write_blob(g2, &buf_with(2)).is_ok() && w2.flush().is_ok() {
+                    hook_flag.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        let w1_flush = w1.flush();
+        drop(w1);
+
+        assert!(
+            !(second_writer_succeeded.load(Ordering::SeqCst) && w1_flush.is_ok()),
+            "both writers returned success across a lock replacement"
+        );
+        let reopened = FileBlobStore::open(dir.path());
+        assert!(
+            reopened.is_ok(),
+            "store must stay reopenable after the race: {:?}",
+            reopened.err()
         );
     }
 
