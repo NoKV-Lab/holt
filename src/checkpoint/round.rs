@@ -174,6 +174,7 @@ impl Pipeline {
                 && shared.bm.pending_delete_count() == 0
                 && shared.bm.orphan_staging_count() == 0
                 && shared.bm.write_delta_count() == 0
+                && !shared.bm.has_unstaged_snapshot_epoch()
                 && !shared.bm.needs_flush();
             if !clean {
                 return Ok(());
@@ -272,7 +273,11 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     {
         let _maintenance = shared.maintenance_gate.enter_shared();
         let _commit = shared.commit_gate.enter_checkpoint();
-        if let Err(e) = shared.bm.flush_write_deltas() {
+        if let Err(e) = shared
+            .bm
+            .stage_snapshot_epoch()
+            .and_then(|()| shared.bm.flush_write_deltas())
+        {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
                 .last_round_micros
@@ -298,7 +303,11 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     } else {
         let _maintenance = shared.maintenance_gate.enter_shared();
         let _commit = shared.commit_gate.enter_checkpoint();
-        if let Err(e) = shared.bm.flush_write_deltas() {
+        if let Err(e) = shared
+            .bm
+            .stage_snapshot_epoch()
+            .and_then(|()| shared.bm.flush_write_deltas())
+        {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
                 .last_round_micros

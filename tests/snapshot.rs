@@ -578,6 +578,149 @@ fn run_crash_session(child_test: &str, dir: &std::path::Path) {
     assert!(status.success(), "crash-session child {child_test} failed");
 }
 
+/// Exit without dropping the DB after many pruned, WAL-acknowledged COW
+/// generations. Recovery must replay every generation from the old durable
+/// topology; no intermediate cache image may be required for correctness.
+#[test]
+#[ignore = "child-process body for db_pruned_cow_versions_recover_without_final_checkpoint"]
+fn pruned_cow_wal_session() {
+    let Some(dir) = std::env::var_os(CRASH_LEAK_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let db = DB::open(crash_leak_cfg(&dir)).unwrap();
+    let left = db.create_tree("left").unwrap();
+    let right = db.create_tree("right").unwrap();
+    for start in (0..1800u32).step_by(100) {
+        assert!(db
+            .atomic(|batch| {
+                for index in start..start + 100 {
+                    let key = format!("k{index:08}");
+                    batch.put("left", key.as_bytes(), &[0; 512]);
+                    batch.put("right", key.as_bytes(), &[0; 512]);
+                }
+            })
+            .unwrap());
+    }
+    db.checkpoint().unwrap();
+    assert!(left.stats().unwrap().blob_count > 1);
+    assert!(right.stats().unwrap().blob_count > 1);
+    for generation in 1..=96u8 {
+        let (old_left, old_right) = db
+            .view(&[("left", b""), ("right", b"")], |view| {
+                Ok((
+                    view.tree("left").unwrap().clone(),
+                    view.tree("right").unwrap().clone(),
+                ))
+            })
+            .unwrap();
+        assert!(db
+            .atomic(|batch| {
+                for index in (0..1800u32).step_by(100) {
+                    let key = format!("k{index:08}");
+                    batch.put("left", key.as_bytes(), &[generation; 512]);
+                    batch.put("right", key.as_bytes(), &[generation; 512]);
+                }
+            })
+            .unwrap());
+        for view in [&old_left, &old_right] {
+            assert_eq!(
+                view.get(b"k00000400").unwrap().unwrap(),
+                vec![generation - 1; 512]
+            );
+        }
+        drop((old_left, old_right));
+        assert!(
+            db.stats().bm_gc_orphan_backlog_count < 80,
+            "transient generations must be pruned without a checkpoint"
+        );
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn db_pruned_cow_versions_recover_without_final_checkpoint() {
+    let dir = tempdir().unwrap();
+    run_crash_session("pruned_cow_wal_session", dir.path());
+    let db = DB::open(crash_leak_cfg(dir.path())).unwrap();
+    for family in ["left", "right"] {
+        let tree = db.open_tree(family).unwrap();
+        for index in 0..1800u32 {
+            let expected = if index % 100 == 0 { 96 } else { 0 };
+            assert_eq!(
+                tree.get(format!("k{index:08}").as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                vec![expected; 512]
+            );
+        }
+    }
+    db.checkpoint().unwrap();
+}
+
+#[test]
+fn memory_db_cow_pruning_with_foreign_tree_snapshots_and_concurrent_checkpoints() {
+    let mut cfg = TreeConfig::memory();
+    cfg.memory_flush_on_write = false;
+    let db = DB::open(cfg).unwrap();
+    let data = db.create_tree("data").unwrap();
+    let other = db.create_tree("other").unwrap();
+    other.put(b"anchor", b"value").unwrap();
+    for index in 0..2400u32 {
+        data.put(format!("k{index:08}").as_bytes(), &[0; 512])
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+    let start = Arc::new(std::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for worker in 0..2u32 {
+        let tree = data.clone();
+        let start = Arc::clone(&start);
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            for generation in 1..=40u8 {
+                for index in (worker * 1200..worker * 1200 + 1200).step_by(60) {
+                    tree.put(format!("k{index:08}").as_bytes(), &[generation; 512])
+                        .unwrap();
+                }
+            }
+        }));
+    }
+    let snapshot_start = Arc::clone(&start);
+    let snapshots = std::thread::spawn(move || {
+        snapshot_start.wait();
+        for _ in 0..1600 {
+            let snapshot = other.snapshot(b"").unwrap();
+            assert_eq!(
+                snapshot.get(b"anchor").unwrap().as_deref(),
+                Some(b"value".as_slice())
+            );
+        }
+    });
+    let checkpoint_db = db.clone();
+    let checkpoints = std::thread::spawn(move || {
+        start.wait();
+        for _ in 0..80 {
+            checkpoint_db.checkpoint().unwrap();
+        }
+    });
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    snapshots.join().unwrap();
+    checkpoints.join().unwrap();
+    db.checkpoint().unwrap();
+    for index in 0..2400u32 {
+        let expected = if index % 60 == 0 { 40 } else { 0 };
+        assert_eq!(
+            data.get(format!("k{index:08}").as_bytes())
+                .unwrap()
+                .unwrap(),
+            vec![expected; 512]
+        );
+    }
+}
+
 /// Child body for [`crash_leaked_tree_snapshot_does_not_leave_persistent_garbage`]:
 /// snapshot + writes + checkpoint, then "crash" — forget the snapshot
 /// so it never retires. Snapshot roots are in-memory only, so reopen

@@ -741,13 +741,13 @@ fn insert_batch_in_pinned_blob(
         }
     }
 
+    if dirty && !is_top_blob {
+        bm.mark_dirty_cached(current_guid, dirty_seq, current_entry);
+    }
     drop(guard);
 
     if needs_compaction {
         bm.note_compaction_candidate(current_guid);
-    }
-    if dirty && !is_top_blob {
-        bm.mark_dirty_cached(current_guid, dirty_seq, current_entry);
     }
 
     Ok(InsertBatchOutcome {
@@ -886,12 +886,15 @@ fn lock_coupled_insert_in_blob(
                         (current_dirty, false)
                     }
                 };
+                // A snapshot on another DB tree can advance the global COW
+                // barrier while this tree is writing. Publish WAL debt before
+                // releasing the child latch so a subsequent fork inherits it.
+                if blob_dirty && !is_top_blob {
+                    bm.mark_dirty_cached(current_guid, seq, current_entry);
+                }
                 drop(guard);
                 if needs_compaction {
                     bm.note_compaction_candidate(current_guid);
-                }
-                if blob_dirty && !is_top_blob {
-                    bm.mark_dirty_cached(current_guid, seq, current_entry);
                 }
 
                 return Ok(InsertOutcome {

@@ -1,0 +1,5 @@
+__pycache__/
+results/*.tar.gz
+results/optimization-2026-10-15/environment.json
+results/optimization-2026-10-15/regression-final.log
+results/optimization-2026-10-15/soak-*.jsonl
