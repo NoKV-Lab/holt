@@ -2174,10 +2174,7 @@ impl Tree {
         prefix: &[u8],
         fence_live_writers: bool,
     ) -> Result<Snapshot> {
-        use crate::store::STRUCTURAL_SEQ;
-
-        let snap_root = engine::fresh_blob_guid();
-        let root_pin = self.store.install_snapshot_root(snap_root, &self.root_pin);
+        let (snap_root, root_pin) = self.prepare_snapshot_root();
         let epoch = match self.store.register_snapshot(snap_root, &root_pin) {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -2187,17 +2184,38 @@ impl Tree {
             }
         };
 
-        // Persist the bumped epoch on the live root so a reopened tree
-        // restores `current_epoch` above every frame's `created_epoch`.
-        {
+        Ok(self.snapshot_from_registered(prefix, snap_root, root_pin, epoch, fence_live_writers))
+    }
+
+    pub(crate) fn prepare_snapshot_root(&self) -> (BlobGuid, Arc<CachedBlob>) {
+        let guid = engine::fresh_blob_guid();
+        (guid, self.store.install_snapshot_root(guid, &self.root_pin))
+    }
+
+    pub(crate) fn snapshot_from_registered(
+        &self,
+        prefix: &[u8],
+        snap_root: BlobGuid,
+        root_pin: Arc<CachedBlob>,
+        epoch: u64,
+        fence_live_writers: bool,
+    ) -> Snapshot {
+        // Standalone open restores its clock from the live root. Named DB
+        // trees summarize their clock on the catalog root at checkpoint,
+        // rather than dirtying every captured root on every read.
+        if self.tree_id == 0 {
             let mut root = self.root_pin.write();
             crate::layout::set_frame_epoch_high_water(
                 root.as_mut_slice(),
                 self.store.current_epoch(),
             );
+            drop(root);
+            self.store.mark_dirty_cached(
+                self.root_guid,
+                crate::store::STRUCTURAL_SEQ,
+                self.root_pin.as_ref(),
+            );
         }
-        self.store
-            .mark_dirty_cached(self.root_guid, STRUCTURAL_SEQ, self.root_pin.as_ref());
 
         let snapshot_lease = crate::store::SnapshotLease::new(
             Arc::clone(&self.store),
@@ -2218,7 +2236,7 @@ impl Tree {
                 )
             }),
         );
-        Ok(Snapshot::new(view, epoch))
+        Snapshot::new(view, epoch)
     }
 
     /// Return `true` if no live key starts with `prefix`.
@@ -2563,6 +2581,7 @@ impl Tree {
     )> {
         if let Some(journal) = journal {
             let _commit = commit_gate.enter_checkpoint();
+            store.stage_snapshot_epoch()?;
             store.flush_write_deltas()?;
             let wal_up_to = journal.queued_work();
             let snap_dirty = store.snapshot_dirty();
@@ -2579,6 +2598,7 @@ impl Tree {
             }
         } else {
             let _commit = commit_gate.enter_checkpoint();
+            store.stage_snapshot_epoch()?;
             store.flush_write_deltas()?;
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
@@ -2754,6 +2774,7 @@ impl Tree {
                     && store.pending_delete_count() == 0
                     && store.orphan_staging_count() == 0
                     && store.write_delta_count() == 0
+                    && !store.has_unstaged_snapshot_epoch()
                     && !store.needs_flush()
                 {
                     journal.truncate()?;
@@ -2774,6 +2795,7 @@ impl Tree {
             && store.pending_delete_count() == 0
             && store.orphan_staging_count() == 0
             && store.write_delta_count() == 0
+            && !store.has_unstaged_snapshot_epoch()
             && !store.needs_flush()
             && journal.is_none_or(|journal| !journal.needs_checkpoint())
     }

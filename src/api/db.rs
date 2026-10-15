@@ -256,6 +256,8 @@ impl DB {
         // delta flush can serve.
         let epoch_recovery_start = std::time::Instant::now();
         db.restore_epoch_high_water()?;
+        db.store
+            .set_snapshot_epoch_root(root_guid_for_tree_id(DB_CATALOG_TREE_ID));
         db.open_stats.epoch_recovery_micros = epoch_recovery_start
             .elapsed()
             .as_micros()
@@ -652,9 +654,18 @@ impl DB {
     {
         let view = {
             let _maintenance = self.maintenance_gate.enter_shared();
-            let mut scoped = Vec::with_capacity(scopes.len());
+            let mut scoped: Vec<(u64, String, &[u8], Tree)> = Vec::with_capacity(scopes.len());
             for (name, prefix) in scopes {
                 let name_bytes = validate_tree_name(name)?;
+                // Preserve the existing last-scope-wins behavior without
+                // copying/registering roots that HashMap::insert discarded.
+                if let Some((_, _, previous, _)) = scoped
+                    .iter_mut()
+                    .find(|(_, captured, _, _)| captured == name)
+                {
+                    *previous = *prefix;
+                    continue;
+                }
                 let tree_id =
                     self.catalog_lookup_live(name_bytes)?
                         .ok_or_else(|| Error::TreeNotFound {
@@ -675,12 +686,30 @@ impl DB {
                 .map(|(_, gate)| gate.enter_exclusive())
                 .collect::<Vec<_>>();
             let _commit = self.commit_gate.enter_writer();
-            for (tree_id, _, _, _) in &scoped {
-                self.store.flush_write_deltas_for_tree(*tree_id)?;
-            }
+            self.store
+                .flush_write_deltas_for_trees(gates.iter().map(|(id, _)| *id))?;
+            let roots = scoped
+                .iter()
+                .map(|(_, _, _, tree)| tree.prepare_snapshot_root())
+                .collect::<Vec<_>>();
+            let first_epoch = match self.store.register_snapshots(&roots) {
+                Ok(first_epoch) => first_epoch,
+                Err(error) => {
+                    for (guid, pin) in roots {
+                        drop(pin);
+                        self.store.discard_snapshot_root(guid);
+                    }
+                    return Err(error);
+                }
+            };
             let mut trees = HashMap::with_capacity(scoped.len());
-            for (_, name, prefix, tree) in scoped {
-                trees.insert(name, tree.snapshot_unlocked(prefix)?);
+            for (((_, name, prefix, tree), (guid, pin)), epoch) in
+                scoped.into_iter().zip(roots).zip(first_epoch..)
+            {
+                trees.insert(
+                    name,
+                    tree.snapshot_from_registered(prefix, guid, pin, epoch, true),
+                );
             }
             DBView { trees }
         };
@@ -3349,6 +3378,81 @@ mod tests {
                 .iter()
                 .any(|(name, _)| *name == b"created-before-export"),
             "export omitted a family whose catalog commit preceded its fence"
+        );
+    }
+
+    #[test]
+    fn db_read_only_capture_clock_survives_checkpoint_reopen() {
+        let dir = tempdir().unwrap();
+        let cfg = || {
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            cfg
+        };
+        let high_water;
+        {
+            let db = DB::open(cfg()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            tree.put(b"key", b"value").unwrap();
+            db.checkpoint().unwrap();
+            for _ in 0..32 {
+                db.view(&[("objects", b"")], |_| Ok(())).unwrap();
+            }
+            high_water = db.store.current_epoch();
+            assert_eq!(db.store.dirty_count(), 0);
+            assert!(db.store.has_unstaged_snapshot_epoch());
+            db.checkpoint().unwrap();
+            assert!(!db.store.has_unstaged_snapshot_epoch());
+        }
+        let db = DB::open(cfg()).unwrap();
+        assert_eq!(db.store.current_epoch(), high_water);
+        assert_eq!(
+            db.open_tree("objects")
+                .unwrap()
+                .snapshot(b"")
+                .unwrap()
+                .epoch(),
+            high_water
+        );
+    }
+
+    #[test]
+    fn db_view_does_not_dirty_named_roots_and_duplicate_scope_keeps_last_prefix() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+        tree.put(b"first/key", b"one").unwrap();
+        tree.put(b"last/key", b"two").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.store.dirty_count(), 0);
+        let before = db.store.current_epoch();
+        let escaped = db
+            .view(&[("objects", b"first/"), ("objects", b"last/")], |view| {
+                let captured = view.tree("objects").unwrap();
+                assert_eq!(
+                    captured.get(b"last/key")?.as_deref(),
+                    Some(b"two".as_slice())
+                );
+                assert!(matches!(
+                    captured.get(b"first/key"),
+                    Err(Error::OutsideViewScope { .. })
+                ));
+                Ok(captured.clone())
+            })
+            .unwrap();
+        assert_eq!(
+            db.store.current_epoch(),
+            before + 1,
+            "one unique root capture"
+        );
+        assert_eq!(
+            db.store.dirty_count(),
+            0,
+            "read-only capture must not manufacture checkpoint debt"
+        );
+        tree.put(b"last/key", b"new").unwrap();
+        assert_eq!(
+            escaped.get(b"last/key").unwrap().as_deref(),
+            Some(b"two".as_slice())
         );
     }
 

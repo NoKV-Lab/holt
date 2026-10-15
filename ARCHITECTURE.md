@@ -396,6 +396,37 @@ objects through a bounded planner → I/O queue:
    maintenance fence still excludes topology changes. Pinned GUIDs return to
    the FIFO; crash leftovers are handled by an explicit full reachability GC.
 
+Snapshot capture does not change that persistence boundary. `DB::view` copies
+the frozen roots and registers their independent leases in one registry pass;
+the DB epoch high-water is summarized on the catalog root during checkpoint
+capture, rather than dirtying each named root on every read. Standalone trees
+retain their live-root high-water publication. Both use the same header format.
+
+A detached version is protected only by live epochs in its closed visibility
+interval (creation through detachment). It waits on the newest such epoch;
+retirement reassigns only that epoch's waiters. Snapshots created after the
+edge changed cannot extend the old version's lifetime. GC-owned root pins also
+retain epoch protection, including after the last public read handle drops.
+
+At an idle checkpoint pipeline, dirty capture takes one retirement-set image
+and omits all retired dirty versions together: an unreachable old parent must
+not be written with a child that has already been elided. With older flushing
+claims present, capture retains those versions for the older dependency graph.
+Dirty capture and transient pruning share a short exclusion; pruning waits for
+all flushing claims, not only claims on the candidate itself. Child mutations
+publish WAL debt before releasing their write latch, and structural promotion
+also transfers the detached child's debt to its rewritten parent. A nonempty
+retired queue does not repeatedly wake the planner on every view drop; its
+empty-to-nonempty transition wakes once, then normal cadence/pressure applies.
+
+There is one strictly in-memory exception to waiting for a clean frontier:
+bounded batches of retired versions absent from the inner store may be
+discarded without writing or deleting any store data. The successor inherits
+the predecessor's unflushed WAL low-watermark. A GC-generation/delete fence
+excludes checkpoint claims during cancellation, and any existing pin or
+flushing claim defers the candidate. Persisted GUIDs always retain the
+clean-frontier/full-reachability requirement above.
+
 The background checkpointer has three threads: a planner/orchestrator, an I/O
 worker that executes complete dependency-ordered epochs from a bounded
 `crossbeam-channel`, and an independent cold-blob eviction sweep. `Drop` joins
