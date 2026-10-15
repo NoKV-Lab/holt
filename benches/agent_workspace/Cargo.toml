@@ -1,0 +1,19 @@
+[package]
+name = "holt-agent-workspace-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+holt = { path = "../..", default-features = false }
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
