@@ -99,6 +99,9 @@ use std::time::{Duration, Instant};
 use crate::api::errors::{Error, Result};
 use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::{BlobGuid, PAGE_SIZE};
+use crate::store::blob_frame::clear_unpersisted_tail;
+#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+use crate::store::blob_frame::persisted_extent;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
@@ -970,7 +973,9 @@ impl FileBlobStore {
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
     fn pwrite_at(&self, offset: u64, src: &AlignedBlobBuf) -> Result<()> {
-        self.data_file.write_all_at(src.as_slice(), offset)?;
+        let frame = src.as_slice();
+        self.data_file
+            .write_all_at(&frame[..persisted_extent(frame)], offset)?;
         Ok(())
     }
 
@@ -983,10 +988,13 @@ impl FileBlobStore {
         let mut ordered: Vec<_> = writes
             .iter()
             .enumerate()
-            .map(|(order, write)| OrderedWrite {
-                offset: write.offset,
-                src: write.src.as_slice(),
-                order,
+            .map(|(order, write)| {
+                let frame = write.src.as_slice();
+                OrderedWrite {
+                    offset: write.offset,
+                    src: &frame[..persisted_extent(frame)],
+                    order,
+                }
             })
             .collect();
         ordered.sort_by(|a, b| a.offset.cmp(&b.offset).then(a.order.cmp(&b.order)));
@@ -1495,6 +1503,7 @@ impl BlobStore for FileBlobStore {
         let _slot = self.enter_slot_read();
         let offset = self.offset_of(guid)?;
         self.pread_at(offset, dst)?;
+        clear_unpersisted_tail(dst.as_mut_slice());
         Ok(())
     }
 
@@ -1530,6 +1539,13 @@ impl BlobStore for FileBlobStore {
             ring.pread_many_at(&mut batch)
         };
         drop(batch);
+        if batch_result.is_ok() {
+            for (off, dst) in offsets.iter().zip(dsts.iter_mut()) {
+                if off.is_ok() {
+                    clear_unpersisted_tail(dst.as_mut_slice());
+                }
+            }
+        }
 
         offsets
             .into_iter()
@@ -3149,6 +3165,60 @@ mod tests {
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 7);
+    }
+
+    /// A frame image whose data area ends at `space_used`, with every other
+    /// byte set to `fill` so persisted and cleared bytes are distinguishable.
+    fn frame_with_extent(space_used: u32, fill: u8) -> AlignedBlobBuf {
+        let mut frame = AlignedBlobBuf::zeroed();
+        frame.as_mut_slice().fill(fill);
+        crate::store::blob_frame::BlobFrame::wrap(frame.as_mut_slice())
+            .header_mut()
+            .space_used = space_used;
+        frame
+    }
+
+    #[test]
+    fn a_reused_slot_persists_and_reads_back_only_the_new_frame_extent() {
+        use crate::layout::DATA_AREA_START;
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let old: BlobGuid = [0x41; 16];
+        let new: BlobGuid = [0x42; 16];
+        // A full frame takes a slot, then moves to a shadow slot and
+        // releases the first one.
+        b.write_blob(old, &frame_with_extent(PAGE_SIZE, 0xab))
+            .unwrap();
+        let released = b.entry_of(old).unwrap().slot;
+        b.write_blob(old, &frame_with_extent(PAGE_SIZE, 0xab))
+            .unwrap();
+        b.flush().unwrap();
+
+        let small = frame_with_extent(DATA_AREA_START + 5_000, 0xcd);
+        b.write_blob(new, &small).unwrap();
+        assert_eq!(b.entry_of(new).unwrap().slot, released);
+        let extent = (DATA_AREA_START + 2 * 4096) as usize;
+
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(new, &mut dst).unwrap();
+        assert_eq!(&dst.as_slice()[..extent], &small.as_slice()[..extent]);
+        assert!(dst.as_slice()[extent..].iter().all(|&byte| byte == 0));
+        let mut batch = [AlignedBlobBuf::zeroed(), AlignedBlobBuf::zeroed()];
+        for result in b.read_blobs(&[new, new], &mut batch) {
+            result.unwrap();
+        }
+        assert!(batch.iter().all(|frame| frame.as_slice() == dst.as_slice()));
+
+        // Only the extent was written: the slot still holds the old
+        // frame's bytes past it.
+        // A ranged read needs a 4 KB-aligned buffer for O_DIRECT.
+        let mut tail = AlignedBlobBuf::zeroed();
+        b.read_blob_range(new, extent as u64, &mut tail.as_mut_slice()[..4096])
+            .unwrap();
+        assert!(tail.as_slice()[..4096].iter().all(|&byte| byte == 0xab));
     }
 
     #[test]

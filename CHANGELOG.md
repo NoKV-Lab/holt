@@ -13,6 +13,13 @@ fine-grained per-commit history is in `git log`.
 
 ### Changed
 
+- `FileBlobStore` writes only a frame's persisted extent: the header, the
+  slot table, and the data area up to `space_used`, rounded up to 4 KB
+  pages. A full-frame read clears the rest of the frame, which a reused slot
+  may still hold from another blob. A checkpoint of sparse blobs, such as
+  trees of random keys, writes several times fewer bytes. Slot layout and the
+  shadow-slot publication order are unchanged, and existing stores open
+  unchanged.
 - `DB::atomic` releases the touched trees' mutation gates before it waits
   for the synchronous WAL fsync. Concurrent atomic batches on the same trees
   now share one fsync through the existing journal group commit instead of

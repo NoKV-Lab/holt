@@ -62,6 +62,29 @@ pub const fn page_align_up(off: u32) -> u32 {
     (off + (PAGE_4K - 1)) & !(PAGE_4K - 1)
 }
 
+/// Bytes of a frame image that carry state: the header and slot table plus
+/// the data area up to `space_used`, rounded up to whole 4 KB pages.
+///
+/// Every live node sits below `space_used`, a routed blob's leaf region
+/// included, so the file store persists only this prefix of a slot.
+#[must_use]
+pub fn persisted_extent(frame: &[u8]) -> usize {
+    let used = BlobFrameRef::wrap(frame)
+        .header()
+        .space_used
+        .clamp(DATA_AREA_START, PAGE_SIZE);
+    page_align_up(used) as usize
+}
+
+/// Zero a frame past its persisted extent.
+///
+/// A slot is reused across blobs and only its persisted extent is
+/// rewritten, so a read must not carry another blob's bytes past it.
+pub fn clear_unpersisted_tail(frame: &mut [u8]) {
+    let extent = persisted_extent(frame);
+    frame[extent..].fill(0);
+}
+
 /// Encode a node body's absolute `byte_offset` into the biased `u16`
 /// stored in a child field (`children[N]`, `Prefix.child`,
 /// `header.root`).
@@ -863,6 +886,33 @@ mod tests {
 
     fn fresh() -> Vec<u8> {
         vec![0u8; PAGE_SIZE as usize]
+    }
+
+    #[test]
+    fn persisted_extent_covers_the_used_data_area_in_whole_pages() {
+        let mut buf = fresh();
+        // A zeroed header still persists the header and slot table.
+        assert_eq!(persisted_extent(&buf), DATA_AREA_START as usize);
+        for (space_used, extent) in [
+            (DATA_AREA_START, DATA_AREA_START),
+            (DATA_AREA_START + 1, DATA_AREA_START + PAGE_4K),
+            (DATA_AREA_START + PAGE_4K, DATA_AREA_START + PAGE_4K),
+            (PAGE_SIZE - 1, PAGE_SIZE),
+            (PAGE_SIZE, PAGE_SIZE),
+            (u32::MAX, PAGE_SIZE),
+        ] {
+            BlobFrame::wrap(&mut buf).header_mut().space_used = space_used;
+            assert_eq!(persisted_extent(&buf), extent as usize, "{space_used:#x}");
+        }
+
+        BlobFrame::wrap(&mut buf).header_mut().space_used = DATA_AREA_START + 1;
+        buf[DATA_AREA_START as usize..].fill(0x5a);
+        clear_unpersisted_tail(&mut buf);
+        let extent = (DATA_AREA_START + PAGE_4K) as usize;
+        assert!(buf[DATA_AREA_START as usize..extent]
+            .iter()
+            .all(|&byte| byte == 0x5a));
+        assert!(buf[extent..].iter().all(|&byte| byte == 0));
     }
 
     #[test]
