@@ -9,6 +9,28 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-10-16
+
+### Changed
+
+- `DB::atomic` releases the touched trees' mutation gates before it waits
+  for the synchronous WAL fsync. Concurrent atomic batches on the same trees
+  now share one fsync through the existing journal group commit instead of
+  serializing one fsync each. The call still returns only after its batch is
+  durable. Other threads may observe an applied batch while its fsync is in
+  flight, as they already could through ungated point reads. No on-disk
+  format change.
+
+### Added
+
+- `DB::atomic_submit` applies a batch and returns `AtomicSubmission`
+  without waiting for durability; `PendingDurability::wait` acknowledges it.
+  Waiting outside a caller-held lock lets callers that serialize their own
+  commits still share fsyncs.
+- `DB::pending_durability` and `DB::durability_barrier` cover every batch
+  applied before the call, so a caller can avoid exposing state observed from
+  an unacknowledged batch.
+
 ## [0.8.6] — 2026-09-01
 
 ### Fixed

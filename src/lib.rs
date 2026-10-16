@@ -157,7 +157,7 @@ pub mod metrics;
 pub use api::builder::TreeBuilder;
 pub use api::checkpoint::CheckpointImage;
 pub use api::config::{AccessMode, Durability, Storage, TreeConfig};
-pub use api::db::{DBAtomicBatch, DBView, DB};
+pub use api::db::{AtomicSubmission, DBAtomicBatch, DBView, PendingDurability, DB};
 pub use api::errors::{AtomicErrorKind, Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::snapshot::Snapshot;
