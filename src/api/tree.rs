@@ -4183,7 +4183,7 @@ mod tests {
             .into_iter()
             .filter_map(|entry| (entry.depth >= 2).then_some(entry.guid))
             .collect::<Vec<_>>();
-        assert!(!deep_guids.is_empty());
+        assert_ne!(deep_guids, Vec::<[u8; 16]>::new());
         for guid in &deep_guids {
             assert!(
                 tree.store.evict_from_cache_for_test(*guid),

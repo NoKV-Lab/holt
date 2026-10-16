@@ -1308,7 +1308,7 @@ mod tests {
             enc.push_insert(0, b"k", b"v");
             let _ = enc.finish();
         }
-        assert!(!buf.is_empty());
+        assert_ne!(buf, Vec::<u8>::new());
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, 5);
     }

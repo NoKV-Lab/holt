@@ -730,6 +730,9 @@ impl BufferManager {
         // MAX can never be emitted by a successful registration. A checked
         // atomic update prevents MAX from wrapping to zero and clearing the
         // fork barrier while an exhausted snapshot remains live.
+        // Rust 1.99 renames `fetch_update` to `try_update`, which the 1.82
+        // MSRV does not have.
+        #[allow(deprecated)]
         let epoch = self
             .current_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -4399,7 +4402,7 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(bm.gc_read_epoch(), 4);
         assert_eq!(bm.gc_read_epoch() & 1, 0);
-        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(inner.list_blobs().unwrap(), Vec::<[u8; 16]>::new());
     }
 
     #[test]
@@ -4425,7 +4428,7 @@ mod tests {
         let second = bm.gc_sweep_unreachable_bounded(&HashSet::new(), 1).unwrap();
         assert_eq!(second.freed, 1);
         assert!(second.complete);
-        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(inner.list_blobs().unwrap(), Vec::<[u8; 16]>::new());
         assert_eq!(bm.stats().gc_last_full_sweep_deferred_count, 0);
     }
 
@@ -4444,7 +4447,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.freed, 64);
         assert!(outcome.complete);
-        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(inner.list_blobs().unwrap(), Vec::<[u8; 16]>::new());
         assert_eq!(
             bm.read_index_tokens.len(),
             0,

@@ -898,7 +898,7 @@ mod tests {
         assert!(matches!(error, Error::Internal(_)));
         assert_eq!(buf.as_slice(), before);
         assert_eq!(bm.dirty_count(), 0);
-        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(inner.list_blobs().unwrap(), Vec::<[u8; 16]>::new());
     }
 
     #[test]

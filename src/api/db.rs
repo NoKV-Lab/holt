@@ -2407,7 +2407,7 @@ mod tests {
         // epoch metadata so the normal recovery sweep can finish it.
         {
             let db = DB::open(cfg()).unwrap();
-            assert!(db.list_trees().unwrap().is_empty());
+            assert_eq!(db.list_trees().unwrap(), Vec::<String>::new());
 
             // An unrelated live snapshot must not make the incomplete
             // Dropping closure canonical again. Snapshot roots are protected
@@ -2441,7 +2441,7 @@ mod tests {
         }
 
         let db = DB::open(cfg()).unwrap();
-        assert!(db.list_trees().unwrap().is_empty());
+        assert_eq!(db.list_trees().unwrap(), Vec::<String>::new());
         assert!(!db
             .store
             .store_has_blob(root_guid_for_tree_id(tree_id))
