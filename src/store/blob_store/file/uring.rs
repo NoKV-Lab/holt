@@ -49,6 +49,7 @@ use std::os::unix::io::AsRawFd;
 
 use io_uring::{opcode, squeue, types, IoUring};
 
+use crate::store::blob_frame::persisted_extent;
 use crate::store::blob_store::{AlignedBlobBuf, BlobBufPool};
 
 /// Number of SQEs / CQEs the ring is sized for. Each checkpoint
@@ -72,6 +73,8 @@ pub(super) struct UringContext {
 struct OrderedWrite<'a> {
     offset: u64,
     buf: &'a AlignedBlobBuf,
+    /// Persisted extent of `buf`, a whole number of 4 KB pages.
+    len: usize,
     order: usize,
 }
 
@@ -125,6 +128,7 @@ impl UringContext {
         let write = [OrderedWrite {
             offset,
             buf,
+            len: persisted_extent(buf.as_slice()),
             order: 0,
         }];
         self.submit_write_batch(&write)
@@ -311,9 +315,7 @@ impl UringContext {
         debug_assert!(chunk.len() <= RING_DEPTH_USIZE);
 
         for (idx, write) in chunk.iter().enumerate() {
-            let entry = self
-                .write_entry(write.offset, write.buf)
-                .user_data(idx as u64);
+            let entry = self.write_entry(write).user_data(idx as u64);
 
             // SAFETY: every SQE references a slice borrowed from
             // `chunk`; this function synchronously waits for all
@@ -368,9 +370,7 @@ impl UringContext {
             if first_err.is_none() {
                 while next < writes.len() && in_flight < RING_DEPTH_USIZE {
                     let write = writes[next];
-                    let entry = self
-                        .write_entry(write.offset, write.buf)
-                        .user_data(next as u64);
+                    let entry = self.write_entry(&write).user_data(next as u64);
 
                     // SAFETY: each SQE borrows from `writes`; this
                     // function synchronously drains every submitted
@@ -432,21 +432,22 @@ impl UringContext {
         Ok(())
     }
 
-    fn write_entry(&self, offset: u64, buf: &AlignedBlobBuf) -> squeue::Entry {
+    fn write_entry(&self, write: &OrderedWrite<'_>) -> squeue::Entry {
+        let len = write.len as u32;
         if self.fixed_buffers {
-            if let Some(buffer_index) = buf.fixed_buffer_index() {
+            if let Some(buffer_index) = write.buf.fixed_buffer_index() {
                 return opcode::WriteFixed::new(
                     self.fixed_fd,
-                    buf.as_ptr(),
-                    buf.len() as u32,
+                    write.buf.as_ptr(),
+                    len,
                     buffer_index,
                 )
-                .offset(offset)
+                .offset(write.offset)
                 .build();
             }
         }
-        opcode::Write::new(self.fixed_fd, buf.as_ptr(), buf.len() as u32)
-            .offset(offset)
+        opcode::Write::new(self.fixed_fd, write.buf.as_ptr(), len)
+            .offset(write.offset)
             .build()
     }
 
@@ -509,7 +510,7 @@ impl UringContext {
                 record_err(&mut first_err, io::Error::from_raw_os_error(-n));
                 continue;
             }
-            let expected = chunk[idx].buf.len();
+            let expected = chunk[idx].len;
             if (n as usize) != expected {
                 record_err(
                     &mut first_err,
@@ -611,7 +612,7 @@ impl UringContext {
                 record_err(first_err, io::Error::from_raw_os_error(-n));
                 continue;
             }
-            let expected = writes[idx].buf.len();
+            let expected = writes[idx].len;
             if (n as usize) != expected {
                 record_err(
                     first_err,
@@ -645,6 +646,7 @@ fn ordered_writes<'a>(writes: &'a [(u64, &'a AlignedBlobBuf)]) -> Vec<OrderedWri
         .map(|(order, (offset, buf))| OrderedWrite {
             offset: *offset,
             buf,
+            len: persisted_extent(buf.as_slice()),
             order,
         })
         .collect();

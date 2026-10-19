@@ -24,6 +24,7 @@ use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
+use crate::journal::group_commit::JournalAck;
 use crate::journal::Journal;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::BlobStore;
@@ -450,14 +451,65 @@ impl DB {
     where
         F: FnOnce(&mut DBAtomicBatch),
     {
+        match self.atomic_submit(build)? {
+            AtomicSubmission::Rejected => Ok(false),
+            AtomicSubmission::Applied(pending) => {
+                pending.wait()?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Apply mutations across named trees under one WAL record without
+    /// waiting for that record to become durable.
+    ///
+    /// Guards and errors follow [`Self::atomic`]. On
+    /// [`AtomicSubmission::Applied`] the batch is visible to later reads and
+    /// batches, and its WAL record is ordered after every earlier batch. The
+    /// batch is acknowledged only after [`PendingDurability::wait`] succeeds.
+    /// Waiting outside a caller-held lock lets concurrent synchronous batches
+    /// share one WAL fsync. A crash before the wait succeeds may lose this
+    /// batch and every later batch, so a caller must not expose an applied
+    /// batch as acknowledged before its wait (or a later
+    /// [`Self::durability_barrier`]) succeeds.
+    pub fn atomic_submit<F>(&self, build: F) -> Result<AtomicSubmission>
+    where
+        F: FnOnce(&mut DBAtomicBatch),
+    {
         self.ensure_writable()
             .map_err(atomic_definitely_not_applied)?;
         let mut batch = DBAtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
-            return Ok(true);
+            return Ok(AtomicSubmission::Applied(PendingDurability { ack: None }));
         }
-        self.apply_atomic(batch.pending)
+        Ok(match self.submit_atomic(batch.pending)? {
+            Some(pending) => AtomicSubmission::Applied(pending),
+            None => AtomicSubmission::Rejected,
+        })
+    }
+
+    /// Block until every batch applied before this call is durable.
+    ///
+    /// Use it before exposing state that a read may have observed from a
+    /// batch whose [`PendingDurability`] has not been waited on yet. It
+    /// returns immediately when no WAL record is pending, and is a no-op for
+    /// trees without a WAL.
+    pub fn durability_barrier(&self) -> Result<()> {
+        self.pending_durability().wait()
+    }
+
+    /// Capture, without blocking, a durability handle covering every batch
+    /// applied before this call. Waiting on it is equivalent to
+    /// [`Self::durability_barrier`] at the capture point, so a caller can
+    /// capture under its own lock and wait after releasing it.
+    pub fn pending_durability(&self) -> PendingDurability {
+        PendingDurability {
+            ack: self
+                .journal
+                .as_ref()
+                .map(|journal| journal.ack_for_queued()),
+        }
     }
 
     /// Run a read-only transaction over explicit tree/prefix scopes.
@@ -1069,7 +1121,10 @@ impl DB {
         )
     }
 
-    fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
+    /// Validate, apply and queue one batch. `None` means a guard rejected it.
+    /// Tree gates are released before the caller waits for durability, so
+    /// concurrent synchronous batches can share one WAL fsync.
+    fn submit_atomic(&self, pending: Vec<DBBatchOp>) -> Result<Option<PendingDurability>> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let groups = self
             .group_batch_ops(pending)
@@ -1104,19 +1159,21 @@ impl DB {
         if !Self::preflight_batch_groups(&groups, base_seq)
             .map_err(atomic_definitely_not_applied)?
         {
-            return Ok(false);
+            return Ok(None);
         }
         if count == 0 {
-            return Ok(true);
+            return Ok(Some(PendingDurability { ack: None }));
         }
 
-        let apply = if let Some(journal) = &self.journal {
-            self.apply_batch_groups_with_journal(&groups, base_seq, journal)
+        let ack = if let Some(journal) = &self.journal {
+            self.submit_batch_groups_with_journal(&groups, base_seq, journal)
+                .map_err(atomic_outcome_unknown)?
         } else {
             self.apply_batch_groups_in_memory(&groups, base_seq)
+                .map_err(atomic_outcome_unknown)?;
+            None
         };
-        apply.map_err(atomic_outcome_unknown)?;
-        Ok(true)
+        Ok(Some(PendingDurability { ack }))
     }
 
     fn group_batch_ops(&self, pending: Vec<DBBatchOp>) -> Result<Vec<DBBatchGroup>> {
@@ -1165,6 +1222,18 @@ impl DB {
         base_seq: u64,
         journal: &Arc<Journal>,
     ) -> Result<()> {
+        if let Some(ack) = self.submit_batch_groups_with_journal(groups, base_seq, journal)? {
+            ack.wait()?;
+        }
+        Ok(())
+    }
+
+    fn submit_batch_groups_with_journal(
+        &self,
+        groups: &[DBBatchGroup],
+        base_seq: u64,
+        journal: &Arc<Journal>,
+    ) -> Result<Option<JournalAck>> {
         let ack = {
             let _commit = self.commit_gate.enter_writer();
             let mut record = journal.record_buffer(encoded_db_batch_record_len(groups));
@@ -1179,10 +1248,7 @@ impl DB {
             let _n = enc.finish();
             journal.submit(record, self.cfg.durability.wal_sync())?
         };
-        if let Some(ack) = ack {
-            ack.wait()?;
-        }
-        Ok(())
+        Ok(ack)
     }
 
     fn apply_batch_groups_in_memory(&self, groups: &[DBBatchGroup], base_seq: u64) -> Result<()> {
@@ -1240,6 +1306,44 @@ impl DB {
             self.apply_batch_groups_in_memory(&groups, base_seq)?;
         }
         Ok(base_seq)
+    }
+}
+
+/// Outcome of [`DB::atomic_submit`].
+#[must_use]
+#[derive(Debug)]
+pub enum AtomicSubmission {
+    /// A guard failed. No mutation ran and no WAL record was queued.
+    Rejected,
+    /// The batch was applied and its WAL record queued; durability is pending.
+    Applied(PendingDurability),
+}
+
+/// Durability handle for one applied batch.
+#[must_use = "an applied batch is acknowledged only after `wait` succeeds"]
+pub struct PendingDurability {
+    ack: Option<JournalAck>,
+}
+
+impl std::fmt::Debug for PendingDurability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingDurability")
+            .field("journaled", &self.ack.is_some())
+            .finish()
+    }
+}
+
+impl PendingDurability {
+    /// Block until this batch's WAL record is fsync-durable. Returns at once
+    /// for asynchronous or WAL-less trees. A failure is
+    /// [`AtomicErrorKind::OutcomeUnknown`]: the batch was applied in memory
+    /// but may not survive a crash.
+    pub fn wait(self) -> Result<()> {
+        match self.ack {
+            Some(ack) => ack.wait().map_err(atomic_outcome_unknown),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1603,6 +1707,136 @@ mod tests {
         fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
             self.inner.has_blob(guid)
         }
+    }
+
+    fn sync_file_db(dir: &std::path::Path) -> DB {
+        let mut cfg = TreeConfig::new(dir);
+        cfg.durability = crate::Durability::Wal { sync: true };
+        cfg.checkpoint.enabled = false;
+        DB::open(cfg).unwrap()
+    }
+
+    fn applied(submission: AtomicSubmission) -> PendingDurability {
+        match submission {
+            AtomicSubmission::Applied(pending) => pending,
+            AtomicSubmission::Rejected => panic!("unguarded batch must apply"),
+        }
+    }
+
+    #[test]
+    fn submitted_sync_batches_share_one_wal_fsync() {
+        let dir = tempdir().unwrap();
+        let db = sync_file_db(dir.path());
+        drop(db.create_tree("a").unwrap());
+        drop(db.create_tree("b").unwrap());
+        let before = db.stats().journal.unwrap();
+
+        let first = applied(
+            db.atomic_submit(|batch| {
+                batch.put("a", b"k1", b"v1");
+                batch.put("b", b"k1", b"v1");
+            })
+            .unwrap(),
+        );
+        // The second batch touches the same trees and must not wait for the
+        // first batch's fsync.
+        let second = applied(
+            db.atomic_submit(|batch| {
+                batch.put("a", b"k2", b"v2");
+                batch.put("b", b"k2", b"v2");
+            })
+            .unwrap(),
+        );
+        let a = db.open_tree("a").unwrap();
+        assert_eq!(a.get(b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(a.get(b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(db.stats().journal.unwrap().pending_work, 2);
+
+        second.wait().unwrap();
+        first.wait().unwrap();
+        let after = db.stats().journal.unwrap();
+        assert_eq!(after.syncs - before.syncs, 1);
+        assert_eq!(after.pending_work, 0);
+        assert_eq!(after.queued_work - before.queued_work, 2);
+    }
+
+    #[test]
+    fn rejected_submission_applies_nothing_and_queues_no_wal_record() {
+        let dir = tempdir().unwrap();
+        let db = sync_file_db(dir.path());
+        drop(db.create_tree("a").unwrap());
+        assert!(db.atomic(|batch| batch.put("a", b"k", b"v")).unwrap());
+        let queued = db.stats().journal.unwrap().queued_work;
+
+        let outcome = db
+            .atomic_submit(|batch| {
+                batch.assert_absent("a", b"k");
+                batch.put("a", b"other", b"v");
+            })
+            .unwrap();
+        assert!(matches!(outcome, AtomicSubmission::Rejected));
+        assert_eq!(db.stats().journal.unwrap().queued_work, queued);
+        assert!(db.open_tree("a").unwrap().get(b"other").unwrap().is_none());
+    }
+
+    #[test]
+    fn durability_barrier_makes_unwaited_submissions_durable() {
+        let dir = tempdir().unwrap();
+        {
+            let db = sync_file_db(dir.path());
+            drop(db.create_tree("a").unwrap());
+            let pending = applied(
+                db.atomic_submit(|batch| batch.put("a", b"k", b"v"))
+                    .unwrap(),
+            );
+            assert_eq!(db.stats().journal.unwrap().pending_work, 1);
+            db.durability_barrier().unwrap();
+            assert_eq!(db.stats().journal.unwrap().pending_work, 0);
+            pending.wait().unwrap();
+            // With nothing pending the barrier returns without another fsync.
+            let syncs = db.stats().journal.unwrap().syncs;
+            db.durability_barrier().unwrap();
+            assert_eq!(db.stats().journal.unwrap().syncs, syncs);
+        }
+        let db = sync_file_db(dir.path());
+        assert_eq!(
+            db.open_tree("a").unwrap().get(b"k").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+
+    #[test]
+    fn view_captures_a_submitted_batch_while_its_fsync_is_pending() {
+        let dir = tempdir().unwrap();
+        let db = sync_file_db(dir.path());
+        drop(db.create_tree("a").unwrap());
+        let pending = applied(
+            db.atomic_submit(|batch| batch.put("a", b"k", b"v"))
+                .unwrap(),
+        );
+        // Tree gates are released before the durability wait, so a view on the
+        // same tree does not block behind it.
+        let seen = db
+            .view(&[("a", b"")], |view| view.tree("a").unwrap().get(b"k"))
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some(&b"v"[..]));
+        pending.wait().unwrap();
+    }
+
+    #[test]
+    fn memory_submission_is_durable_without_waiting() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        drop(db.create_tree("a").unwrap());
+        let pending = applied(
+            db.atomic_submit(|batch| batch.put("a", b"k", b"v"))
+                .unwrap(),
+        );
+        pending.wait().unwrap();
+        db.durability_barrier().unwrap();
+        assert_eq!(
+            db.open_tree("a").unwrap().get(b"k").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
 
     #[test]
@@ -2173,7 +2407,7 @@ mod tests {
         // epoch metadata so the normal recovery sweep can finish it.
         {
             let db = DB::open(cfg()).unwrap();
-            assert!(db.list_trees().unwrap().is_empty());
+            assert_eq!(db.list_trees().unwrap(), Vec::<String>::new());
 
             // An unrelated live snapshot must not make the incomplete
             // Dropping closure canonical again. Snapshot roots are protected
@@ -2207,7 +2441,7 @@ mod tests {
         }
 
         let db = DB::open(cfg()).unwrap();
-        assert!(db.list_trees().unwrap().is_empty());
+        assert_eq!(db.list_trees().unwrap(), Vec::<String>::new());
         assert!(!db
             .store
             .store_has_blob(root_guid_for_tree_id(tree_id))

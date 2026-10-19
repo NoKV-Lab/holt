@@ -370,6 +370,14 @@ impl Journal {
         self.shared.flush_to(observed)
     }
 
+    /// Durability handle for every record submitted before this call.
+    pub(crate) fn ack_for_queued(&self) -> JournalAck {
+        JournalAck {
+            shared: Arc::clone(&self.shared),
+            target: self.shared.queued.load(Ordering::Acquire),
+        }
+    }
+
     pub(crate) fn truncate(&self) -> Result<()> {
         let observed = self.shared.queued.load(Ordering::Acquire);
         if observed == self.shared.checkpointed.load(Ordering::Acquire) {
