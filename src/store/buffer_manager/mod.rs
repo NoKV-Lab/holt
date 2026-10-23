@@ -817,6 +817,10 @@ impl BufferManager {
         let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
         // MAX-1 is an exhausted durable high-water; never emit MAX or wrap.
         // Reserving the whole interval first makes exhaustion all-or-nothing.
+        // `fetch_update` is deprecated in favor of `try_update` on
+        // recent toolchains, but the rename does not exist on the
+        // MSRV (1.82); keep the old name until the MSRV catches up.
+        #[allow(deprecated)]
         let first = self
             .current_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

@@ -121,7 +121,11 @@
     clippy::doc_markdown,
     // Mixing items / statements is fine in small fns; refusing
     // it forces hoisting of locally-scoped const helpers.
-    clippy::items_after_statements
+    clippy::items_after_statements,
+    // `assert!(x.is_empty())` / `assert!(!x.is_empty())` reads
+    // fine and is pervasive in this crate's tests; the suggested
+    // rewrite adds no failure-message value for byte buffers.
+    clippy::assert_is_empty
 )]
 
 // Hard scope gate — see the "Platform support" section in the
