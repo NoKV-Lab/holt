@@ -454,12 +454,14 @@ fn lock_coupled_erase_in_blob(
         child_touched
     };
 
+    // Match insert's COW inheritance boundary: no later fork may copy these
+    // bytes before their WAL low-watermark is visible in dirty bookkeeping.
+    if child_touched && !is_top_blob {
+        bm.mark_dirty_cached(current_guid, seq, current_entry);
+    }
     drop(guard);
     if child_touched {
         bm.note_compaction_candidate(current_guid);
-        if !is_top_blob {
-            bm.mark_dirty_cached(current_guid, seq, current_entry);
-        }
     }
 
     Ok(EraseOutcome {

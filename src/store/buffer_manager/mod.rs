@@ -49,8 +49,10 @@
 //!
 //! Invariants:
 //!
-//! - **I1**: a `(guid, _)` entry exists in `dirty` iff the cached
-//!   image of `guid` is newer than the store image.
+//! - **I1**: a `(guid, _)` entry exists in `dirty` iff the authoritative cached
+//!   image of `guid` is newer than the store image. Retired unreachable images
+//!   can be cancelled together at an idle capture after their WAL debt has
+//!   transferred to the live replacement; they are no longer authoritative.
 //! - **I2**: WAL `trim_id <= min(dirty.values()) - 1` (or
 //!   `next_seq - 1` if `dirty` is empty).
 //! - **I3**: [`BufferManager::snapshot_dirty`] drains the map
@@ -184,28 +186,13 @@ struct SnapshotState {
     /// be upgraded under the registry lock so GC holds a stable root while
     /// a last derived view/cursor concurrently releases its epoch lease.
     live: BTreeMap<u64, SnapshotRoot>,
-    /// COW detachments grouped by the parent whose edge was repointed.
-    /// A child stays non-reclaimable here until that exact parent publishes
-    /// dirty/flushing debt; this closes the last-lease-drop window between
-    /// edge mutation and `mark_dirty(parent)`.
-    cow_pending: HashMap<BlobGuid, Vec<(BlobGuid, u64)>>,
-    /// Frames forked away from the live tree, tagged with the
-    /// `created_epoch` of the forked-away version. Once the fork barrier
-    /// drops below the tag no live snapshot can reference it. Retirement only
-    /// moves the exact GUID into the reclaim FIFO; physical deletion waits for
-    /// a clean durable checkpoint frontier or a full reachability sweep.
-    orphans: Vec<(BlobGuid, u64)>,
-    /// Structural detachments grouped by their rewritten parent. These do
-    /// not install a visibility fence because a stable snapshot may still
-    /// lazily pin the old child. Parent dirty publication promotes them to
-    /// `structural_orphans` or the reclaim FIFO.
-    structural_pending: HashMap<BlobGuid, HashSet<BlobGuid>>,
-    /// Children detached by structural merge while at least one snapshot
-    /// lease is live. Unlike a COW fork, a merge has no per-snapshot epoch
-    /// tag: any copied root may still point at the detached child. Hold the
-    /// exact GUID until the last lease retires, then move it to the same
-    /// post-checkpoint FIFO as ordinary retired COW frames.
-    structural_orphans: HashSet<BlobGuid>,
+    /// Detachments stay staged until the exact rewritten parent publishes
+    /// dirty/flushing debt, closing the final-lease-drop publication window.
+    pending: HashMap<BlobGuid, Vec<SnapshotOrphan>>,
+    /// Each orphan waits on the newest live epoch in its visibility interval.
+    /// Newer snapshots cannot see a detached frame and must not retain it.
+    /// Retirement touches only that epoch's waiters, not the entire backlog.
+    waiting: BTreeMap<u64, Vec<SnapshotOrphan>>,
     /// Copy-on-write and structural frames eligible for exact reclaim after
     /// their final snapshot epoch has retired. A clean checkpoint drains this
     /// FIFO in bounded batches without an all-store reachability walk; pinned
@@ -217,6 +204,39 @@ struct SnapshotState {
 struct SnapshotRoot {
     guid: BlobGuid,
     pin: Weak<CachedBlob>,
+    /// The public lease plus any GC walks that have captured this root.
+    holders: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotOrphan {
+    guid: BlobGuid,
+    first_epoch: u64,
+    last_epoch: u64,
+    dirty_seq: u64,
+}
+
+impl SnapshotState {
+    /// Return whether this enqueue added immediately eligible reclaim work.
+    fn queue_orphan(&mut self, orphan: SnapshotOrphan) -> bool {
+        let protector = (orphan.first_epoch <= orphan.last_epoch)
+            .then(|| {
+                self.live
+                    .range(orphan.first_epoch..=orphan.last_epoch)
+                    .next_back()
+            })
+            .flatten()
+            .map(|(&epoch, _)| epoch);
+        if let Some(epoch) = protector {
+            self.waiting.entry(epoch).or_default().push(orphan);
+            false
+        } else if self.retired_orphan_set.insert(orphan.guid) {
+            self.retired_orphans.push_back(orphan.guid);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Shared lifetime token for one copy-on-write snapshot epoch.
@@ -261,6 +281,7 @@ impl Drop for SnapshotLease {
 /// Strong snapshot-root pin owned by one GC reachability pass.
 pub(crate) struct PinnedSnapshotRoot {
     store: Arc<BufferManager>,
+    epoch: u64,
     guid: BlobGuid,
     pin: Option<Arc<CachedBlob>>,
 }
@@ -274,6 +295,7 @@ impl PinnedSnapshotRoot {
 
 impl Drop for PinnedSnapshotRoot {
     fn drop(&mut self) {
+        self.store.retire_snapshot(self.epoch);
         drop(self.pin.take());
         self.store.discard_snapshot_root(self.guid);
     }
@@ -517,6 +539,11 @@ pub struct BufferManager {
     /// snapshot knows whether it must fork the frame instead of
     /// overwriting it in place.
     current_epoch: AtomicU64,
+    /// DB clock summary is staged once per checkpoint instead of dirtying
+    /// every captured named root. Standalone trees keep their original root
+    /// high-water publication. The on-disk header layout is unchanged.
+    snapshot_epoch_root: Mutex<Option<BlobGuid>>,
+    staged_snapshot_epoch: AtomicU64,
     /// Highest epoch held by any LIVE snapshot — the copy-on-write
     /// fork barrier. A frame whose `created_epoch <= fork_barrier`
     /// may be visible to a snapshot and so must be forked before an
@@ -528,6 +555,10 @@ pub struct BufferManager {
     /// inline. Physical deletion requires a clean durable checkpoint frontier
     /// or a full reachability sweep.
     snapshots: Mutex<SnapshotState>,
+    /// Serialize transient-image cancellation with a complete dirty capture.
+    /// An older checkpoint may still own a parent image pointing at a retired
+    /// child; pruning is disabled until every such flushing claim is gone.
+    cow_prune_capture: Mutex<()>,
     /// Even while idle and odd while physical GC deletion is active.
     /// Optimistic readers use this sequence to distinguish a concurrent
     /// reachability sweep from a stable missing-child corruption.
@@ -607,6 +638,39 @@ impl BufferManager {
         self.current_epoch.store(epoch.max(1), Ordering::Release);
     }
 
+    pub(crate) fn set_snapshot_epoch_root(&self, root: BlobGuid) {
+        *self.snapshot_epoch_root.lock().unwrap() = Some(root);
+    }
+
+    pub(crate) fn has_unstaged_snapshot_epoch(&self) -> bool {
+        self.current_epoch() > self.staged_snapshot_epoch.load(Ordering::Acquire)
+            && self.snapshot_epoch_root.lock().unwrap().is_some()
+    }
+
+    /// Called under checkpoint-exclusive admission, before dirty capture.
+    /// The clock summary becomes ordinary structural dirty debt, retaining
+    /// retries and the existing WAL/data/manifest ordering on every failure.
+    pub(crate) fn stage_snapshot_epoch(&self) -> Result<()> {
+        if !self.has_unstaged_snapshot_epoch() {
+            return Ok(());
+        }
+        let guid = self
+            .snapshot_epoch_root
+            .lock()
+            .unwrap()
+            .expect("DB epoch root");
+        let epoch = self.current_epoch();
+        let root = self.pin_silent(guid)?;
+        {
+            let mut bytes = root.write();
+            let high_water = crate::layout::frame_epoch_high_water(bytes.as_slice());
+            crate::layout::set_frame_epoch_high_water(bytes.as_mut_slice(), high_water.max(epoch));
+        }
+        self.mark_dirty_cached(guid, STRUCTURAL_SEQ, &root);
+        self.staged_snapshot_epoch.store(epoch, Ordering::Release);
+        Ok(())
+    }
+
     /// The copy-on-write fork barrier: the highest epoch any live
     /// snapshot holds. A frame with `created_epoch <= fork_barrier`
     /// may be referenced by a snapshot and must be forked before an
@@ -683,9 +747,24 @@ impl BufferManager {
         new_guid: BlobGuid,
         seq: u64,
     ) -> Result<Arc<CachedBlob>> {
-        let mut buf = self.alloc_blob_buf_zeroed();
+        // The full frame is overwritten before any byte is read.
+        let mut buf = self.alloc_blob_buf_uninit();
         buf.as_mut_slice().copy_from_slice(src_bytes);
         crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
+        // A transient predecessor may be discarded before checkpoint. Its
+        // successor must retain all unflushed WAL debt, not just the WAL seq
+        // of the next user write. Otherwise pruning could raise the trim
+        // watermark above mutations present only in this copied image.
+        let source_guid = BlobFrameRef::wrap(src_bytes).header().blob_guid;
+        let seq = self
+            .mutation_shard(source_guid)
+            .lock()
+            .unwrap()
+            .dirty
+            .get(&source_guid)
+            .copied()
+            .unwrap_or(seq)
+            .min(seq);
         self.install_new_blob(new_guid, buf, seq);
         self.pin(new_guid)
     }
@@ -708,7 +787,8 @@ impl BufferManager {
         src: &CachedBlob,
     ) -> Arc<CachedBlob> {
         let guard = src.read();
-        let mut buf = self.alloc_blob_buf_zeroed();
+        // Unlike a newly initialized ART frame, this is a complete overwrite.
+        let mut buf = self.alloc_blob_buf_uninit();
         buf.as_mut_slice().copy_from_slice(guard.as_slice());
         crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
         self.insert_owned_into_cache(new_guid, buf, PinAccess::Silent)
@@ -723,28 +803,43 @@ impl BufferManager {
         root_guid: BlobGuid,
         root_pin: &Arc<CachedBlob>,
     ) -> Result<u64> {
+        self.register_snapshots(&[(root_guid, Arc::clone(root_pin))])
+    }
+
+    /// Atomically register a coordinated capture, retaining an independent
+    /// lease per root. The owning tree gates remain exclusive throughout root
+    /// copying and this publication; other trees may keep writing normally.
+    pub(crate) fn register_snapshots(&self, roots: &[(BlobGuid, Arc<CachedBlob>)]) -> Result<u64> {
+        if roots.is_empty() {
+            return Ok(self.current_epoch());
+        }
+        let count = u64::try_from(roots.len()).map_err(|_| Error::SnapshotEpochExhausted)?;
         let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
-        // The returned pre-bump value is this snapshot's barrier; the
-        // post-bump value is persisted as the root high-water and stamps new
-        // frames. MAX-1 is a valid but exhausted durable high-water, while
-        // MAX can never be emitted by a successful registration. A checked
-        // atomic update prevents MAX from wrapping to zero and clearing the
-        // fork barrier while an exhausted snapshot remains live.
-        let epoch = self
+        // MAX-1 is an exhausted durable high-water; never emit MAX or wrap.
+        // Reserving the whole interval first makes exhaustion all-or-nothing.
+        // `fetch_update` is deprecated in favor of `try_update` on
+        // recent toolchains, but the rename does not exist on the
+        // MSRV (1.82); keep the old name until the MSRV catches up.
+        #[allow(deprecated)]
+        let first = self
             .current_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < u64::MAX - 1).then_some(current + 1)
+                current.checked_add(count).filter(|next| *next < u64::MAX)
             })
             .map_err(|_| Error::SnapshotEpochExhausted)?;
-        snaps.live.insert(
-            epoch,
-            SnapshotRoot {
-                guid: root_guid,
-                pin: Arc::downgrade(root_pin),
-            },
-        );
-        self.fork_barrier.store(epoch, Ordering::Release);
-        Ok(epoch)
+        for ((guid, pin), epoch) in roots.iter().zip(first..) {
+            snaps.live.insert(
+                epoch,
+                SnapshotRoot {
+                    guid: *guid,
+                    pin: Arc::downgrade(pin),
+                    holders: 1,
+                },
+            );
+        }
+        self.fork_barrier
+            .store(first + count - 1, Ordering::Release);
+        Ok(first)
     }
 
     /// Stage a frame forked away from the live tree until its rewritten parent
@@ -757,11 +852,7 @@ impl BufferManager {
         guid: BlobGuid,
         created_epoch: u64,
     ) {
-        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
-        let pending = snapshots.cow_pending.entry(parent_guid).or_default();
-        if !pending.iter().any(|(candidate, _)| *candidate == guid) {
-            pending.push((guid, created_epoch));
-        }
+        self.stage_snapshot_orphan(parent_guid, guid, created_epoch);
     }
 
     /// Stage a child detached by structural merge under the parent whose
@@ -769,12 +860,32 @@ impl BufferManager {
     /// `mark_dirty(parent)` promotes it only after the new parent image is
     /// protected by dirty/flushing checkpoint debt.
     pub(crate) fn stage_structural_reclaim(&self, parent_guid: BlobGuid, child_guid: BlobGuid) {
+        // Conservative lower bound: structural rewrites may move older
+        // contents into a newer frame, so do not infer their first visibility
+        // from the detached frame's creation stamp.
+        self.stage_snapshot_orphan(parent_guid, child_guid, 0);
+    }
+
+    fn stage_snapshot_orphan(&self, parent: BlobGuid, guid: BlobGuid, first_epoch: u64) {
+        let dirty_seq = self
+            .mutation_shard(guid)
+            .lock()
+            .unwrap()
+            .dirty
+            .get(&guid)
+            .copied()
+            .unwrap_or(STRUCTURAL_SEQ);
         let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
-        snapshots
-            .structural_pending
-            .entry(parent_guid)
-            .or_default()
-            .insert(child_guid);
+        let last_epoch = snapshots.live.keys().next_back().copied().unwrap_or(0);
+        let pending = snapshots.pending.entry(parent).or_default();
+        if !pending.iter().any(|candidate| candidate.guid == guid) {
+            pending.push(SnapshotOrphan {
+                guid,
+                first_epoch,
+                last_epoch,
+                dirty_seq,
+            });
+        }
     }
 
     /// Promote every COW/structural detachment owned by `parent_guid` after
@@ -782,37 +893,36 @@ impl BufferManager {
     /// snapshot retirement can only make a staged child eligible here,
     /// after dirty/flushing state already closes the clean frontier.
     fn publish_parent_orphans(&self, parent_guid: BlobGuid) {
+        let pending = self
+            .snapshots
+            .lock()
+            .expect("snapshot registry poisoned")
+            .pending
+            .remove(&parent_guid)
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        // Structural merge moves child contents into this parent; COW also
+        // conservatively carries the debt through its rewritten edge. Once a
+        // retired dirty image is omitted from checkpoint, its replacement
+        // must still cover the oldest WAL mutation copied out of that image.
+        let dirty_seq = pending
+            .iter()
+            .map(|orphan| orphan.dirty_seq)
+            .min()
+            .unwrap_or(STRUCTURAL_SEQ);
+        if dirty_seq != STRUCTURAL_SEQ {
+            let cached = self.get_cached_with_access(parent_guid, PinAccess::Silent);
+            self.mark_dirty_with_hint(parent_guid, dirty_seq, cached.as_deref());
+        }
         let wake = {
             let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
-            let cow = snapshots
-                .cow_pending
-                .remove(&parent_guid)
-                .unwrap_or_default();
-            let structural = snapshots
-                .structural_pending
-                .remove(&parent_guid)
-                .unwrap_or_default();
-            let barrier = snapshots.live.keys().next_back().copied().unwrap_or(0);
-            let mut wake = false;
-            for (guid, created_epoch) in cow {
-                if barrier != 0 && created_epoch <= barrier {
-                    snapshots.orphans.push((guid, created_epoch));
-                } else if snapshots.retired_orphan_set.insert(guid) {
-                    snapshots.retired_orphans.push_back(guid);
-                    wake = true;
-                }
+            let was_empty = snapshots.retired_orphans.is_empty();
+            for orphan in pending {
+                snapshots.queue_orphan(orphan);
             }
-            for guid in structural {
-                if snapshots.live.is_empty() {
-                    if snapshots.retired_orphan_set.insert(guid) {
-                        snapshots.retired_orphans.push_back(guid);
-                        wake = true;
-                    }
-                } else {
-                    snapshots.structural_orphans.insert(guid);
-                }
-            }
-            wake
+            was_empty && !snapshots.retired_orphans.is_empty()
         };
         if wake {
             self.wake_checkpointer();
@@ -821,8 +931,8 @@ impl BufferManager {
 
     /// Retire the snapshot at `epoch`: lower the fork barrier to the
     /// highest remaining live snapshot epoch (or `0`), evict the
-    /// snapshot's root frame, and stop tracking every orphan whose
-    /// forked-away version is now newer than the barrier.
+    /// snapshot's root frame, and reconsider only the orphans waiting on this
+    /// exact epoch. Snapshots created after detachment cannot prolong a frame.
     ///
     /// Persisted blobs are deliberately retained. The live parent that
     /// stopped referencing a copy-on-write child may still have its older
@@ -831,39 +941,109 @@ impl BufferManager {
     /// requires a clean durable checkpoint frontier or a full reachability
     /// sweep. Idempotent for an unknown epoch.
     pub(crate) fn retire_snapshot(&self, epoch: u64) {
-        let (root, wake) = {
+        let (root, wake, prune) = {
             let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
+            let Some(root) = snaps.live.get_mut(&epoch) else {
+                return;
+            };
+            if root.holders > 1 {
+                root.holders -= 1;
+                return;
+            }
             let root = snaps.live.remove(&epoch);
             let barrier = snaps.live.keys().next_back().copied().unwrap_or(0);
             self.fork_barrier.store(barrier, Ordering::Release);
-            let mut active = Vec::with_capacity(snaps.orphans.len());
-            for (guid, created_epoch) in std::mem::take(&mut snaps.orphans) {
-                if barrier != 0 && created_epoch <= barrier {
-                    active.push((guid, created_epoch));
-                } else if snaps.retired_orphan_set.insert(guid) {
-                    snaps.retired_orphans.push_back(guid);
-                }
+            let was_empty = snaps.retired_orphans.is_empty();
+            for orphan in snaps.waiting.remove(&epoch).unwrap_or_default() {
+                snaps.queue_orphan(orphan);
             }
-            snaps.orphans = active;
-            if barrier == 0 {
-                let structural = std::mem::take(&mut snaps.structural_orphans);
-                for guid in structural {
-                    if snaps.retired_orphan_set.insert(guid) {
-                        snaps.retired_orphans.push_back(guid);
-                    }
-                }
-            }
-            (root, !snaps.retired_orphans.is_empty())
+            (
+                root,
+                was_empty && !snaps.retired_orphans.is_empty(),
+                snaps.retired_orphans.len() >= 32,
+            )
         };
         if let Some(root) = root {
             self.discard_snapshot_root(root.guid);
         }
+        if prune {
+            self.prune_unpersisted_orphans(64);
+        }
         if wake {
             self.wake_checkpointer();
         }
-        // Persistent detachments deliberately keep their cache and dirty
-        // bookkeeping. A clean checkpoint may reclaim their exact FIFO GUIDs;
-        // a full GC additionally handles crash leftovers by reachability.
+        // Persisted detachments retain their cache/dirty bookkeeping until a
+        // clean checkpoint or full reachability GC proves durable detachment.
+    }
+
+    /// Discard only unreachable versions that have never entered the inner
+    /// store. No data/manifest write or delete is performed. Checkpoint claims
+    /// and pins are fail-closed; their candidates return to the normal FIFO.
+    /// The COW successor inherits dirty WAL debt in `fork_frame` before the
+    /// predecessor becomes eligible here.
+    fn prune_unpersisted_orphans(&self, limit: usize) -> usize {
+        let _capture = self.cow_prune_capture.lock().unwrap();
+        if self.flushing_count() != 0 {
+            return 0;
+        }
+        let candidates = self.take_retired_orphans_bounded(limit);
+        if candidates.is_empty() {
+            return 0;
+        }
+        let _epoch = self.begin_gc_epoch();
+        let mut retry = Vec::new();
+        let mut freed = 0;
+        for guid in candidates {
+            {
+                let mut state = self.mutation_shard(guid).lock().unwrap();
+                if state.checkpoint_owned_or_pending(&guid) {
+                    retry.push(guid);
+                    continue;
+                }
+                // `snapshot_dirty` leaves fenced entries unclaimed. This
+                // closes the has_blob -> cache removal window against I/O.
+                state.gc_deleting.insert(guid);
+                self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
+            }
+            let mut removed = false;
+            if matches!(self.store.has_blob(guid), Ok(false)) {
+                self.invalidate_indexed_reads(guid);
+                if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+                    if Arc::strong_count(entry) > 1 {
+                        return false;
+                    }
+                    let mut state = self.mutation_shard(guid).lock().unwrap();
+                    if state.flushing.contains_key(&guid) || state.has_logical_delete_fence(&guid) {
+                        return false;
+                    }
+                    // Cache -> mutation is the normal eviction lock order.
+                    // Remove dirty intent before releasing the fence; no
+                    // checkpoint can claim bytes that are about to disappear.
+                    state.remove_unclaimed_dirty(&guid);
+                    let hints = state.remove_maintenance_candidates(&guid);
+                    self.decrement_candidate_totals(hints);
+                    true
+                }) {
+                    entry.clear_dirty_hint();
+                    self.route_resident.remove(guid);
+                    removed = true;
+                }
+            }
+            {
+                let mut state = self.mutation_shard(guid).lock().unwrap();
+                if state.gc_deleting.remove(&guid) {
+                    self.delete_fence_total.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            if removed {
+                freed += 1;
+                self.remove_read_index_token_if_unreachable(guid);
+            } else {
+                retry.push(guid);
+            }
+        }
+        self.restore_retired_orphans(retry);
+        freed
     }
 
     /// Discard an ephemeral snapshot root from process-local state.
@@ -977,22 +1157,35 @@ impl BufferManager {
     /// GC either omits an already-retired root or owns a strong pin for the
     /// full reachability walk.
     pub(crate) fn snapshot_roots_pinned(self: &Arc<Self>) -> Result<Vec<PinnedSnapshotRoot>> {
-        self.snapshots
-            .lock()
-            .expect("snapshot registry poisoned")
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        // First upgrade all pins without changing the registry so an error
+        // cannot leak a partial set of epoch holders.
+        let roots = snapshots
             .live
-            .values()
-            .map(|root| {
+            .iter()
+            .map(|(&epoch, root)| {
                 root.pin
                     .upgrade()
-                    .map(|pin| PinnedSnapshotRoot {
-                        store: Arc::clone(self),
-                        guid: root.guid,
-                        pin: Some(pin),
-                    })
+                    .map(|pin| (epoch, root.guid, pin))
                     .ok_or(Error::Internal("live snapshot registry lost its root pin"))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(roots
+            .into_iter()
+            .map(|(epoch, guid, pin)| {
+                snapshots
+                    .live
+                    .get_mut(&epoch)
+                    .expect("registered root")
+                    .holders += 1;
+                PinnedSnapshotRoot {
+                    store: Arc::clone(self),
+                    epoch,
+                    guid,
+                    pin: Some(pin),
+                }
+            })
+            .collect())
     }
 
     /// Free every persisted frame not in `reachable`, returning the count
@@ -1170,25 +1363,14 @@ impl BufferManager {
     #[must_use]
     pub(crate) fn gc_orphan_backlog_count(&self) -> usize {
         let snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
-        snapshots.cow_pending.values().map(Vec::len).sum::<usize>()
-            + snapshots.orphans.len()
-            + snapshots
-                .structural_pending
-                .values()
-                .map(HashSet::len)
-                .sum::<usize>()
-            + snapshots.structural_orphans.len()
+        snapshots.pending.values().map(Vec::len).sum::<usize>()
+            + snapshots.waiting.values().map(Vec::len).sum::<usize>()
             + snapshots.retired_orphans.len()
     }
 
     pub(crate) fn orphan_staging_count(&self) -> usize {
         let snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
-        snapshots.cow_pending.values().map(Vec::len).sum::<usize>()
-            + snapshots
-                .structural_pending
-                .values()
-                .map(HashSet::len)
-                .sum::<usize>()
+        snapshots.pending.values().map(Vec::len).sum::<usize>()
     }
 
     pub(crate) fn register_checkpoint_waker(&self, thread: std::thread::Thread) {
@@ -1283,8 +1465,11 @@ impl BufferManager {
             clock: AtomicU64::new(1),
             telemetry: Telemetry::default(),
             current_epoch: AtomicU64::new(1),
+            snapshot_epoch_root: Mutex::new(None),
+            staged_snapshot_epoch: AtomicU64::new(1),
             fork_barrier: AtomicU64::new(0),
             snapshots: Mutex::new(SnapshotState::default()),
+            cow_prune_capture: Mutex::new(()),
             gc_epoch: AtomicU64::new(0),
             physical_gc: Mutex::new(()),
             gc_reclaimed_count: AtomicU64::new(0),
@@ -2324,9 +2509,28 @@ impl BufferManager {
     }
 
     pub(crate) fn flush_write_deltas_for_tree(&self, tree_id: u64) -> Result<()> {
+        if !self.write_delta.has_any() {
+            return Ok(());
+        }
         let _flush = self.write_delta_flush.lock().unwrap();
         let ops = self.write_delta.begin_flush_tree(tree_id);
         self.apply_write_delta_ops(ops)
+    }
+
+    /// Flush a frozen set of named trees with one flush admission. The caller
+    /// holds their mutation gates, so an empty overlay is stable for them.
+    pub(crate) fn flush_write_deltas_for_trees(
+        &self,
+        trees: impl IntoIterator<Item = u64>,
+    ) -> Result<()> {
+        if !self.write_delta.has_any() {
+            return Ok(());
+        }
+        let _flush = self.write_delta_flush.lock().unwrap();
+        for tree in trees {
+            self.apply_write_delta_ops(self.write_delta.begin_flush_tree(tree))?;
+        }
+        Ok(())
     }
 
     fn apply_write_delta_ops(&self, ops: Vec<DeltaOp>) -> Result<()> {
@@ -2497,6 +2701,22 @@ impl BufferManager {
     /// tree-wide stable for WAL trimming.
     #[must_use]
     pub fn snapshot_dirty(&self) -> HashMap<BlobGuid, u64> {
+        let _capture = self.cow_prune_capture.lock().unwrap();
+        // Freeze the retirement decision for the entire capture. Looking it
+        // up independently per shard could capture an old parent, then omit
+        // its child when their final lease drops between the two shards.
+        // Earlier epochs can still own parent images that reference a
+        // currently retired child. Keep that child's dirty image available
+        // to their dependency planner until the complete pipeline is idle.
+        let retired = if self.flushing_count() == 0 {
+            self.snapshots
+                .lock()
+                .expect("snapshot registry poisoned")
+                .retired_orphan_set
+                .clone()
+        } else {
+            HashSet::new()
+        };
         let mut out = HashMap::new();
         for shard in &self.mutation {
             let (claimed, logically_deleted) = {
@@ -2505,7 +2725,7 @@ impl BufferManager {
                 let mut claimed = Vec::new();
                 let mut logically_deleted = Vec::new();
                 for (guid, seq) in snap {
-                    if state.has_logical_delete_fence(&guid) {
+                    if state.has_logical_delete_fence(&guid) || retired.contains(&guid) {
                         logically_deleted.push(guid);
                     } else if state.gc_deleting.contains(&guid) {
                         // Transient physical GC may still defer on a pin.
@@ -5367,6 +5587,223 @@ mod tests {
         bm.retire_snapshot(epoch);
         assert_eq!(bm.fork_barrier(), 0);
         assert_eq!(bm.current_epoch(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn later_snapshots_do_not_retain_detached_versions() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let root_guid = [0x71; 16];
+        let cow = [0x72; 16];
+        let structural = [0x73; 16];
+        for guid in [root_guid, cow, structural] {
+            inner.write_blob(guid, &make_buf(1)).unwrap();
+        }
+        let bm = BufferManager::new(inner, 8);
+        let root = bm.pin(root_guid).unwrap();
+        let first = bm.register_snapshot(root_guid, &root).unwrap();
+        bm.stage_cow_reclaim(root_guid, cow, first);
+        bm.stage_structural_reclaim(root_guid, structural);
+        // Register before dirty publication: the visibility upper bound must
+        // be captured at detachment, not at promotion or retirement.
+        let later = bm.register_snapshot(root_guid, &root).unwrap();
+        bm.mark_dirty_cached(root_guid, 7, &root);
+        bm.retire_snapshot(first);
+        let snapshots = bm.snapshots.lock().unwrap();
+        assert!(snapshots.waiting.is_empty());
+        assert!(snapshots.retired_orphan_set.contains(&cow));
+        assert!(snapshots.retired_orphan_set.contains(&structural));
+        drop(snapshots);
+        assert_eq!(bm.fork_barrier(), later);
+        bm.retire_snapshot(later);
+    }
+
+    #[test]
+    fn detached_version_waits_only_for_epochs_inside_visibility_interval() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let root_guid = [0x74; 16];
+        inner.write_blob(root_guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let root = bm.pin(root_guid).unwrap();
+        let older = bm.register_snapshot(root_guid, &root).unwrap();
+        let first = bm.register_snapshot(root_guid, &root).unwrap();
+        let last = bm.register_snapshot(root_guid, &root).unwrap();
+        let child = [0x75; 16];
+        bm.stage_cow_reclaim(root_guid, child, first);
+        bm.mark_dirty_cached(root_guid, 9, &root);
+        bm.retire_snapshot(last);
+        assert!(bm.snapshots.lock().unwrap().waiting.contains_key(&first));
+        assert!(!bm
+            .snapshots
+            .lock()
+            .unwrap()
+            .retired_orphan_set
+            .contains(&child));
+        bm.retire_snapshot(first);
+        assert!(bm
+            .snapshots
+            .lock()
+            .unwrap()
+            .retired_orphan_set
+            .contains(&child));
+        assert_eq!(bm.fork_barrier(), older);
+        bm.retire_snapshot(older);
+    }
+
+    #[test]
+    fn gc_root_pin_retains_epoch_after_public_lease_retires() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let root_guid = [0x76; 16];
+        inner.write_blob(root_guid, &make_buf(1)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner, 4));
+        let root = bm.pin(root_guid).unwrap();
+        let epoch = bm.register_snapshot(root_guid, &root).unwrap();
+        let gc_roots = bm.snapshot_roots_pinned().unwrap();
+        let child = [0x77; 16];
+        bm.stage_cow_reclaim(root_guid, child, 0);
+        bm.mark_dirty_cached(root_guid, 9, &root);
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.fork_barrier(), epoch);
+        assert_eq!(bm.take_retired_orphans_bounded(10).len(), 0);
+        drop(gc_roots);
+        assert_eq!(bm.fork_barrier(), 0);
+        assert_eq!(bm.take_retired_orphans_bounded(10), vec![child]);
+    }
+
+    #[test]
+    fn batch_snapshot_epoch_exhaustion_is_all_or_nothing() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x78; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let root = bm.pin(guid).unwrap();
+        bm.set_current_epoch(u64::MAX - 2);
+        let roots = [(guid, Arc::clone(&root)), ([0x79; 16], root)];
+        assert!(matches!(
+            bm.register_snapshots(&roots),
+            Err(Error::SnapshotEpochExhausted)
+        ));
+        assert_eq!(bm.current_epoch(), u64::MAX - 2);
+        assert_eq!(bm.fork_barrier(), 0);
+        assert!(bm.snapshots.lock().unwrap().live.is_empty());
+    }
+
+    #[test]
+    fn unpersisted_cow_pruning_preserves_successor_wal_debt_and_checkpoint_claims() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner.clone(), 4);
+        let source_guid = [0x7A; 16];
+        let successor_guid = [0x7B; 16];
+        let mut bytes = make_buf(1);
+        crate::layout::set_frame_blob_guid(bytes.as_mut_slice(), source_guid);
+        bm.install_new_blob(source_guid, bytes, 7);
+        let source = bm.pin(source_guid).unwrap();
+        let successor = bm
+            .fork_frame(source.read().as_slice(), successor_guid, STRUCTURAL_SEQ)
+            .unwrap();
+        bm.mark_dirty_cached(successor_guid, 11, &successor);
+        assert_eq!(
+            bm.mutation_shard(successor_guid).lock().unwrap().dirty[&successor_guid],
+            7
+        );
+        bm.restore_retired_orphans([source_guid]);
+        assert_eq!(
+            bm.prune_unpersisted_orphans(8),
+            0,
+            "pin must protect the image"
+        );
+        drop(source);
+        let captured = bm.snapshot_dirty();
+        assert_eq!(
+            bm.prune_unpersisted_orphans(8),
+            0,
+            "checkpoint owns captured bytes"
+        );
+        bm.restore_dirty(captured);
+        assert_eq!(bm.prune_unpersisted_orphans(8), 1);
+        assert!(bm
+            .get_cached_with_access(source_guid, PinAccess::Silent)
+            .is_none());
+        assert!(!inner.has_blob(source_guid).unwrap());
+        assert_eq!(
+            bm.mutation_shard(successor_guid).lock().unwrap().dirty[&successor_guid],
+            7
+        );
+
+        // An inner-store image must survive even if it is no longer pinned.
+        inner.write_blob(successor_guid, &successor.read()).unwrap();
+        drop(successor);
+        bm.restore_retired_orphans([successor_guid]);
+        assert_eq!(bm.prune_unpersisted_orphans(8), 0);
+        assert!(inner.has_blob(successor_guid).unwrap());
+    }
+
+    #[test]
+    fn checkpoint_omits_retired_parent_images_after_transient_child_pruning() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 8);
+        let parent = [0x7C; 16];
+        let child = [0x7D; 16];
+        let live = [0x7E; 16];
+        bm.install_new_blob(parent, make_buf(1), 5);
+        bm.install_new_blob(child, make_buf(2), 7);
+        bm.install_new_blob(live, make_buf(3), 5);
+        // The retired parent's cache image may still reference `child` even
+        // though neither image is reachable by a live tree or snapshot.
+        bm.restore_retired_orphans([child, parent]);
+        assert_eq!(bm.prune_unpersisted_orphans(1), 1);
+        let captured = bm.snapshot_dirty();
+        assert!(
+            !captured.contains_key(&parent),
+            "do not write a dead image with an elided dependency"
+        );
+        assert!(!captured.contains_key(&child));
+        assert_eq!(captured[&live], 5);
+        // An unrelated older checkpoint may own an ancestor image not named
+        // by a candidate. Pruning waits for the complete flushing frontier.
+        assert_eq!(bm.prune_unpersisted_orphans(8), 0);
+        bm.restore_dirty(captured);
+        assert_eq!(bm.prune_unpersisted_orphans(8), 1);
+    }
+
+    #[test]
+    fn structural_promotion_inherits_child_wal_debt_before_dirty_cancellation() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 4);
+        let parent_guid = [0x7F; 16];
+        let child_guid = [0x80; 16];
+        bm.install_new_blob(parent_guid, make_buf(1), STRUCTURAL_SEQ);
+        bm.install_new_blob(child_guid, make_buf(2), 7);
+        let parent = bm.pin(parent_guid).unwrap();
+        bm.stage_structural_reclaim(parent_guid, child_guid);
+        assert_eq!(bm.orphan_staging_count(), 1);
+        bm.mark_dirty_cached(parent_guid, STRUCTURAL_SEQ, &parent);
+        let captured = bm.snapshot_dirty();
+        assert_eq!(captured[&parent_guid], 7);
+        assert!(!captured.contains_key(&child_guid));
+        bm.restore_dirty(captured);
+    }
+
+    #[test]
+    fn later_checkpoint_keeps_retired_child_while_an_older_parent_epoch_is_live() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 4);
+        let parent = [0x81; 16];
+        let child = [0x82; 16];
+        bm.install_new_blob(parent, make_buf(1), 5);
+        let older = bm.snapshot_dirty();
+        bm.install_new_blob(child, make_buf(2), 7);
+        bm.restore_retired_orphans([child]);
+        let later = bm.snapshot_dirty();
+        assert_eq!(
+            later[&child], 7,
+            "older in-flight parents may still depend on this image"
+        );
+        assert_eq!(bm.prune_unpersisted_orphans(8), 0);
+        bm.restore_dirty(later);
+        bm.restore_dirty(older);
+        let idle = bm.snapshot_dirty();
+        assert!(!idle.contains_key(&child));
+        bm.restore_dirty(idle);
     }
 
     #[test]
