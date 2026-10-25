@@ -16,10 +16,13 @@ rocksdb = { version = "0.24", default-features = false, optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 sled = { version = "0.34", optional = true }
 heed = { version = "0.20", optional = true }
+redb = { version = "2", optional = true }
+postgres = { version = "0.19", optional = true }
 
 [features]
 default = ["comparators"]
-comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled", "dep:heed"]
+comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled", "dep:heed", "dep:redb"]
+pg = ["dep:postgres"]
 io-uring = ["holt/io-uring"]
 
 [[bench]]
@@ -36,6 +39,16 @@ path = "cow_snapshot.rs"
 name = "main"
 harness = false
 path = "main.rs"
+
+[[bench]]
+name = "ycsb"
+harness = false
+path = "ycsb.rs"
+
+[[bench]]
+name = "ai_meta"
+harness = false
+path = "ai_meta.rs"
 
 [[bench]]
 name = "stress"
