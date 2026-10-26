@@ -12,6 +12,8 @@
 //!   <data_dir>/
 //!     blobs.dat      — single packed file, blob N lives at byte
 //!                      offset N * PAGE_SIZE
+//!     integrity.dat  — slot-aligned per-page checksums for blobs.dat;
+//!                      synced before a new manifest mapping
 //!     manifest.bin   — small file mapping BlobGuid → slot number
 //!                      plus `next_slot`;
 //!                      rewritten only when the manifest delta log
@@ -80,13 +82,13 @@
 //! Switching between them is an internal performance toggle; no
 //! caller-visible behaviour changes.
 
+mod integrity;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod uring;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -100,7 +102,6 @@ use crate::api::errors::{Error, Result};
 use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::blob_frame::clear_unpersisted_tail;
-#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use crate::store::blob_frame::persisted_extent;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -112,6 +113,10 @@ use self::uring::UringContext;
 
 /// Filename of the packed blob data file inside `data_dir`.
 const DATA_FILENAME: &str = "blobs.dat";
+/// Authoritative per-page checksums, addressed by the same shadow slot.
+const INTEGRITY_FILENAME: &str = "integrity.dat";
+/// Distinguishes an interrupted v6 log-only migration from a lost v7 snapshot.
+const INTEGRITY_MIGRATING_FILENAME: &str = "integrity.migrating";
 /// Advisory lock file inside `data_dir`, flock'd for the lifetime of
 /// an open instance. Readers hold shared locks; writers hold exclusive locks.
 const LOCK_FILENAME: &str = "store.lock";
@@ -169,8 +174,11 @@ const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// an older read-accelerator design. v6 drops it: the current packed
 /// read index validates against the blob header stamp, so the
 /// manifest generation field was dead weight. Older manifests (incl.
-/// v5) are refused on load, not migrated.
-const MANIFEST_VERSION: u16 = 6;
+/// v5) are refused on load. v7 requires durable per-page checksum
+/// records before a manifest mapping can be trusted; writable v6
+/// stores are migrated once without rewriting blob images.
+const MANIFEST_VERSION: u16 = 7;
+const LEGACY_MANIFEST_VERSION: u16 = 6;
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
 const MANIFEST_LOG_TY_SET: u8 = 1;
@@ -309,6 +317,7 @@ pub struct FileBlobStore {
     flush_gap_hook: FlushGapHook,
     access: FileAccess,
     data_file: File,
+    integrity_file: File,
     read_index_file: File,
     value_segment_file: File,
     manifest: RwLock<Manifest>,
@@ -316,6 +325,8 @@ pub struct FileBlobStore {
     /// Every blob rewrite uses a fresh shadow slot, so both inserts and
     /// replacements leave manifest work until [`Self::flush_locked`].
     manifest_dirty: AtomicBool,
+    /// Checksum records must reach stable storage before a manifest delta.
+    integrity_dirty: AtomicBool,
     /// Monotonic counter bumped before each data-file write.
     /// `flush` syncs up to the observed epoch instead of clearing
     /// a single bool, so a racing writer cannot be hidden by a
@@ -353,6 +364,9 @@ pub struct FileBlobStore {
 
 #[derive(Debug)]
 struct Manifest {
+    /// Format read from disk; a writable v6 open performs a one-time
+    /// checksum migration before exposing the store.
+    version: u16,
     /// guid → packed-file slot.
     entries: HashMap<BlobGuid, ManifestEntry>,
     /// Next never-used slot to hand out when no reusable slot is
@@ -532,6 +546,86 @@ fn open_read_accelerator_file(
     }
 }
 
+/// Migrate v6 by checksumming each currently referenced frame without
+/// rewriting it. The v7 manifest snapshot is the final publication step:
+/// a crash before its rename leaves a v6 store that repeats this pass; a
+/// crash after it leaves every referenced slot with a durable checksum.
+fn open_integrity_file(
+    data_dir: &Path,
+    data_file: &File,
+    manifest: &mut Manifest,
+    access: FileAccess,
+) -> Result<File> {
+    if manifest.version != MANIFEST_VERSION && access.is_read_only() {
+        return Err(Error::BlobStoreIo(io::Error::other(
+            "legacy store requires a writable integrity migration",
+        )));
+    }
+    let path = data_dir.join(INTEGRITY_FILENAME);
+    let migrating = data_dir.join(INTEGRITY_MIGRATING_FILENAME);
+    if manifest.version == MANIFEST_VERSION && !path.exists() {
+        return Err(Error::node_corrupt(
+            "FileBlobStore::Integrity::missing file",
+        ));
+    }
+    if manifest.version == 0
+        && !manifest.entries.is_empty()
+        && path.metadata().is_ok_and(|metadata| metadata.len() != 0)
+        && !migrating.exists()
+    {
+        return Err(Error::node_corrupt(
+            "FileBlobStore::Integrity::missing protected manifest",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    if !access.is_read_only() {
+        options.write(true).create(true).mode(0o600);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::node_corrupt(
+            "FileBlobStore::Integrity::not a regular file",
+        ));
+    }
+    if manifest.version == MANIFEST_VERSION {
+        return Ok(file);
+    }
+
+    if manifest.version == 0 && !manifest.entries.is_empty() && !migrating.exists() {
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&migrating)?;
+        marker.write_all(b"HOLT-INTEGRITY-MIGRATION-V1\n")?;
+        marker.sync_all()?;
+        sync_dir(data_dir)?;
+    }
+    let mut frame = AlignedBlobBuf::zeroed();
+    for (guid, entry) in &manifest.entries {
+        let data_offset = entry
+            .slot
+            .checked_mul(u64::from(PAGE_SIZE))
+            .ok_or_else(|| Error::node_corrupt("FileBlobStore::Integrity::data offset"))?;
+        data_file.read_exact_at(frame.as_mut_slice(), data_offset)?;
+        let extent = persisted_extent(frame.as_slice());
+        let record = integrity::encode_prefix(*guid, entry.slot, frame.as_slice(), extent);
+        file.write_all_at(&record, integrity::record_offset(entry.slot)?)?;
+    }
+    file.sync_all()?;
+    manifest.persist_snapshot(data_dir)?;
+    manifest.truncate_log()?;
+    manifest.version = MANIFEST_VERSION;
+    if migrating.exists() {
+        std::fs::remove_file(migrating)?;
+        sync_dir(data_dir)?;
+    }
+    Ok(file)
+}
+
 impl FileBlobStore {
     /// Open or create a persistent store at `data_dir`.
     ///
@@ -626,8 +720,9 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest =
+        let mut manifest =
             Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
+        let integrity_file = open_integrity_file(&data_dir, &data_file, &mut manifest, access)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -651,10 +746,12 @@ impl FileBlobStore {
             flush_gap_hook: FlushGapHook::default(),
             access,
             data_file,
+            integrity_file,
             read_index_file,
             value_segment_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
+            integrity_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
             data_sync_epoch: AtomicU64::new(0),
             data_io_lock: Mutex::new(()),
@@ -709,8 +806,9 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest =
+        let mut manifest =
             Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
+        let integrity_file = open_integrity_file(&data_dir, &data_file, &mut manifest, access)?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -722,10 +820,12 @@ impl FileBlobStore {
             flush_gap_hook: FlushGapHook::default(),
             access,
             data_file,
+            integrity_file,
             read_index_file,
             value_segment_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
+            integrity_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
             data_sync_epoch: AtomicU64::new(0),
             data_io_lock: Mutex::new(()),
@@ -760,6 +860,7 @@ impl FileBlobStore {
         }
     }
 
+    #[cfg(test)]
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
         Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
     }
@@ -825,6 +926,37 @@ impl FileBlobStore {
                 format!("blob {:02x?} not in manifest", &guid[..4]),
             ))
         })
+    }
+
+    fn read_integrity_record(
+        &self,
+        guid: BlobGuid,
+        slot: u64,
+    ) -> Result<integrity::ValidatedRecord> {
+        let mut record = [0u8; integrity::RECORD_BYTES];
+        self.integrity_file
+            .read_exact_at(&mut record, integrity::record_offset(slot)?)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    Error::node_corrupt("FileBlobStore::Integrity::missing record")
+                        .with_blob_guid(guid)
+                } else {
+                    Error::BlobStoreIo(error)
+                }
+            })?;
+        integrity::ValidatedRecord::new(record, guid, slot)
+    }
+
+    fn write_integrity_records(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
+        self.integrity_dirty.store(true, Ordering::Release);
+        for write in writes {
+            let frame = write.src.as_slice();
+            let record =
+                integrity::encode_prefix(write.guid, write.slot, frame, persisted_extent(frame));
+            self.integrity_file
+                .write_all_at(&record, integrity::record_offset(write.slot)?)?;
+        }
+        Ok(())
     }
 
     fn reserve_write_entries(
@@ -928,15 +1060,15 @@ impl FileBlobStore {
     // `write_blob` clean of any conditional plumbing.
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
+    fn pread_at(&self, offset: u64, len: usize, dst: &mut AlignedBlobBuf) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
-        ring.pread_at(offset, dst)?;
+        ring.pread_at(offset, len, dst)?;
         Ok(())
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
-        let dst = dst.as_mut_slice();
+    fn pread_at(&self, offset: u64, len: usize, dst: &mut AlignedBlobBuf) -> Result<()> {
+        let dst = &mut dst.as_mut_slice()[..len];
         self.data_file.read_exact_at(dst, offset)?;
         Ok(())
     }
@@ -1153,6 +1285,10 @@ impl FileBlobStore {
             self.sync_data_file()?;
             self.mark_data_synced(epoch);
         }
+        if self.integrity_dirty.load(Ordering::Acquire) {
+            self.integrity_file.sync_data()?;
+            self.integrity_dirty.store(false, Ordering::Release);
+        }
 
         let mut publish_free_slots = false;
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
@@ -1188,6 +1324,10 @@ impl FileBlobStore {
         let len = slots.saturating_mul(u64::from(PAGE_SIZE));
         let mut bytes = 0;
         bytes += shrink_file_to_len(&self.data_file, len)?;
+        bytes += shrink_file_to_len(
+            &self.integrity_file,
+            slots.saturating_mul(integrity::RECORD_BYTES as u64),
+        )?;
         bytes += shrink_file_to_len(&self.read_index_file, len)?;
         bytes += shrink_file_to_len(&self.value_segment_file, len)?;
         self.preallocated_slots.store(slots, Ordering::Release);
@@ -1208,6 +1348,12 @@ impl FileBlobStore {
                 item.to_slot,
                 &mut data,
             )?);
+            let previous = self.read_integrity_record(item.guid, item.from_slot)?;
+            previous.verify_full(data.as_slice())?;
+            let record = previous.relocate_verified(item.to_slot);
+            self.integrity_file
+                .write_all_at(&record, integrity::record_offset(item.to_slot)?)?;
+            bytes = bytes.saturating_add(integrity::RECORD_BYTES as u64);
             bytes = bytes.saturating_add(copy_advisory_slot(
                 &self.read_index_file,
                 item.from_slot,
@@ -1223,6 +1369,7 @@ impl FileBlobStore {
         }
 
         self.data_file.sync_all()?;
+        self.integrity_file.sync_all()?;
         self.read_index_file.sync_all()?;
         self.value_segment_file.sync_all()?;
         Ok(bytes)
@@ -1501,8 +1648,13 @@ impl BlobStore for FileBlobStore {
 
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         let _slot = self.enter_slot_read();
-        let offset = self.offset_of(guid)?;
-        self.pread_at(offset, dst)?;
+        let entry = self.entry_of(guid)?;
+        let offset = entry.slot * u64::from(PAGE_SIZE);
+        let record = self.read_integrity_record(guid, entry.slot)?;
+        let covered = record.covered_bytes();
+        self.pread_at(offset, covered, dst)?;
+        dst.as_mut_slice()[covered..].fill(0);
+        record.verify_full(dst.as_slice())?;
         clear_unpersisted_tail(dst.as_mut_slice());
         Ok(())
     }
@@ -1516,15 +1668,21 @@ impl BlobStore for FileBlobStore {
     fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
         debug_assert_eq!(guids.len(), dsts.len());
         let _slot = self.enter_slot_read();
-        // Resolve offsets up front (lock-free manifest read). A guid
-        // that doesn't resolve is reported in its own slot and left
-        // out of the ring batch, so one bad guid can't sink the rest.
-        let offsets: Vec<Result<u64>> = guids.iter().map(|g| self.offset_of(*g)).collect();
+        // Resolve each slot and its durable covered extent before submitting
+        // data reads. Invalid records fail only their own guid.
+        let reads: Vec<Result<(u64, integrity::ValidatedRecord)>> = guids
+            .iter()
+            .map(|guid| {
+                let entry = self.entry_of(*guid)?;
+                let record = self.read_integrity_record(*guid, entry.slot)?;
+                Ok((entry.slot * u64::from(PAGE_SIZE), record))
+            })
+            .collect();
 
-        let mut batch: Vec<(u64, &mut AlignedBlobBuf)> = Vec::with_capacity(dsts.len());
-        for (off, dst) in offsets.iter().zip(dsts.iter_mut()) {
-            if let Ok(off) = off {
-                batch.push((*off, dst));
+        let mut batch: Vec<(u64, usize, &mut AlignedBlobBuf)> = Vec::with_capacity(dsts.len());
+        for (read, dst) in reads.iter().zip(dsts.iter_mut()) {
+            if let Ok((offset, record)) = read {
+                batch.push((*offset, record.covered_bytes(), dst));
             }
         }
 
@@ -1539,26 +1697,62 @@ impl BlobStore for FileBlobStore {
             ring.pread_many_at(&mut batch)
         };
         drop(batch);
-        if batch_result.is_ok() {
-            for (off, dst) in offsets.iter().zip(dsts.iter_mut()) {
-                if off.is_ok() {
-                    clear_unpersisted_tail(dst.as_mut_slice());
-                }
-            }
+        if let Err(error) = batch_result {
+            return reads
+                .into_iter()
+                .map(|read| match read {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(Error::BlobStoreIo(io::Error::other(format!(
+                        "batched uring read failed: {error}"
+                    )))),
+                })
+                .collect();
         }
 
-        offsets
-            .into_iter()
-            .map(|off| match off {
-                Err(e) => Err(e),
-                Ok(_) => match &batch_result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(Error::BlobStoreIo(io::Error::other(format!(
-                        "batched uring read failed: {e}"
-                    )))),
-                },
-            })
-            .collect()
+        fn verify_read(
+            read: Result<(u64, integrity::ValidatedRecord)>,
+            dst: &mut AlignedBlobBuf,
+        ) -> Result<()> {
+            let (_, record) = read?;
+            dst.as_mut_slice()[record.covered_bytes()..].fill(0);
+            record.verify_full(dst.as_slice())?;
+            clear_unpersisted_tail(dst.as_mut_slice());
+            Ok(())
+        }
+
+        // The ring completes data I/O before verification. For large batches,
+        // independent page checksums can use multiple cores without changing
+        // read ordering or sharing a destination buffer.
+        const VERIFY_FANOUT: usize = 8;
+        if reads.len() < 32 {
+            return reads
+                .into_iter()
+                .zip(dsts.iter_mut())
+                .map(|(read, dst)| verify_read(read, dst))
+                .collect();
+        }
+        let chunk_len = reads.len().div_ceil(VERIFY_FANOUT);
+        std::thread::scope(|scope| {
+            let mut items = reads.into_iter().zip(dsts.iter_mut());
+            let mut handles = Vec::with_capacity(VERIFY_FANOUT);
+            loop {
+                let chunk: Vec<_> = items.by_ref().take(chunk_len).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|(read, dst)| verify_read(read, dst))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut results = Vec::with_capacity(guids.len());
+            for handle in handles {
+                results.extend(handle.join().expect("blob checksum worker panicked"));
+            }
+            results
+        })
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -1617,20 +1811,38 @@ impl BlobStore for FileBlobStore {
             "ranged read length must be a 4 KB multiple"
         );
         let _slot = self.enter_slot_read();
-        let offset = self.offset_of(guid)? + byte_offset;
+        let entry = self.entry_of(guid)?;
+        let start = usize::try_from(byte_offset)
+            .map_err(|_| Error::node_corrupt("FileBlobStore::Integrity::range"))?;
+        if start % 4096 != 0
+            || dst.len() % 4096 != 0
+            || start
+                .checked_add(dst.len())
+                .is_none_or(|end| end > PAGE_SIZE as usize)
+        {
+            return Err(Error::node_corrupt("FileBlobStore::Integrity::range").with_blob_guid(guid));
+        }
+        let record = self.read_integrity_record(guid, entry.slot)?;
+        let covered = record.covered_bytes();
+        let read_len = covered.saturating_sub(start).min(dst.len());
+        let offset = entry.slot * u64::from(PAGE_SIZE) + byte_offset;
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
-            let mut ring = self.uring.lock().unwrap();
-            ring.pread_slice_at(offset, dst)?;
+            if read_len != 0 {
+                let mut ring = self.uring.lock().unwrap();
+                ring.pread_slice_at(offset, &mut dst[..read_len])?;
+            }
         }
 
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         {
-            use std::os::unix::fs::FileExt;
-            self.data_file.read_exact_at(dst, offset)?;
+            if read_len != 0 {
+                self.data_file.read_exact_at(&mut dst[..read_len], offset)?;
+            }
         }
-        Ok(())
+        dst[read_len..].fill(0);
+        record.verify_range(byte_offset, dst)
     }
 
     fn read_index_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<bool> {
@@ -1764,7 +1976,10 @@ impl BlobStore for FileBlobStore {
         let prepared = self.prepare_blob_writes(&writes)?;
         self.clear_reserved_read_accelerators(&prepared);
         self.mark_data_write_started();
-        if let Err(error) = self.pwrite_at(prepared[0].offset, src) {
+        if let Err(error) = self
+            .pwrite_at(prepared[0].offset, src)
+            .and_then(|()| self.write_integrity_records(&prepared))
+        {
             self.release_reserved_slots(prepared.iter().map(|write| write.slot));
             return Err(error);
         }
@@ -1781,7 +1996,10 @@ impl BlobStore for FileBlobStore {
         }
         self.clear_reserved_read_accelerators(&prepared);
         self.mark_data_write_started();
-        if let Err(error) = self.pwrite_many_at(&prepared) {
+        if let Err(error) = self
+            .pwrite_many_at(&prepared)
+            .and_then(|()| self.write_integrity_records(&prepared))
+        {
             self.release_reserved_slots(prepared.iter().map(|write| write.slot));
             return Err(error);
         }
@@ -1801,7 +2019,10 @@ impl BlobStore for FileBlobStore {
             let prepared = self.prepare_blob_writes(writes)?;
             self.clear_reserved_read_accelerators(&prepared);
             let epoch = self.mark_data_write_started();
-            if let Err(error) = self.pwrite_many_and_sync_at(&prepared) {
+            if let Err(error) = self
+                .pwrite_many_and_sync_at(&prepared)
+                .and_then(|()| self.write_integrity_records(&prepared))
+            {
                 self.release_reserved_slots(prepared.iter().map(|write| write.slot));
                 return Err(error);
             }
@@ -1815,7 +2036,10 @@ impl BlobStore for FileBlobStore {
             let prepared = self.prepare_blob_writes(writes)?;
             self.clear_reserved_read_accelerators(&prepared);
             self.mark_data_write_started();
-            if let Err(error) = self.pwrite_many_at(&prepared) {
+            if let Err(error) = self
+                .pwrite_many_at(&prepared)
+                .and_then(|()| self.write_integrity_records(&prepared))
+            {
                 self.release_reserved_slots(prepared.iter().map(|write| write.slot));
                 return Err(error);
             }
@@ -1871,7 +2095,14 @@ impl BlobStore for FileBlobStore {
         let tail_target = next_slot
             .saturating_sub(tail_reclaimable_slots)
             .saturating_mul(u64::from(PAGE_SIZE));
+        let integrity_tail_target = next_slot
+            .saturating_sub(tail_reclaimable_slots)
+            .saturating_mul(integrity::RECORD_BYTES as u64);
         let tail_reclaimable_bytes = reclaimable_tail_bytes(&self.data_file, tail_target)
+            .saturating_add(reclaimable_tail_bytes(
+                &self.integrity_file,
+                integrity_tail_target,
+            ))
             .saturating_add(reclaimable_tail_bytes(&self.read_index_file, tail_target))
             .saturating_add(reclaimable_tail_bytes(
                 &self.value_segment_file,
@@ -1907,7 +2138,9 @@ impl BlobStore for FileBlobStore {
 
     fn needs_flush(&self) -> bool {
         !self.access.is_read_only()
-            && (self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire))
+            && (self.data_needs_sync().is_some()
+                || self.integrity_dirty.load(Ordering::Acquire)
+                || self.manifest_dirty.load(Ordering::Acquire))
     }
 
     fn vacuum(&self) -> Result<VacuumStats> {
@@ -2029,9 +2262,9 @@ impl Manifest {
             None
         };
 
-        let (mut entries, mut next_slot) = match File::open(path) {
+        let (mut entries, mut next_slot, version) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0, 0),
             Err(e) => return Err(Error::BlobStoreIo(e)),
         };
 
@@ -2046,6 +2279,7 @@ impl Manifest {
         let reusable_slots = ReusableSlots::reconstruct(next_slot, &used_slots)?;
 
         Ok(Self {
+            version,
             entries,
             next_slot,
             reusable_slots,
@@ -2057,7 +2291,7 @@ impl Manifest {
         })
     }
 
-    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, ManifestEntry>, u64)> {
+    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, ManifestEntry>, u64, u16)> {
         // Header: magic 8 + version 2 + count 4 + reserved 2 + next_slot 8 = 24 B.
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
@@ -2065,7 +2299,7 @@ impl Manifest {
             return Err(Error::node_corrupt("FileBlobStore::Manifest::magic"));
         }
         let version = u16::from_le_bytes([hdr[8], hdr[9]]);
-        if version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION && version != LEGACY_MANIFEST_VERSION {
             return Err(Error::node_corrupt(
                 "FileBlobStore::Manifest::version (older manifests are not migrated)",
             ));
@@ -2090,7 +2324,7 @@ impl Manifest {
             used_slots.push(s);
         }
         ReusableSlots::reconstruct(next_slot, &used_slots)?;
-        Ok((entries, next_slot))
+        Ok((entries, next_slot, version))
     }
 
     fn publish_write_entry(&mut self, guid: BlobGuid, slot: u64) {
@@ -3212,13 +3446,24 @@ mod tests {
         }
         assert!(batch.iter().all(|frame| frame.as_slice() == dst.as_slice()));
 
-        // Only the extent was written: the slot still holds the old
-        // frame's bytes past it.
+        // Only the extent was written. A range read beyond it must not
+        // expose bytes left by the old frame in the reused slot.
         // A ranged read needs a 4 KB-aligned buffer for O_DIRECT.
         let mut tail = AlignedBlobBuf::zeroed();
         b.read_blob_range(new, extent as u64, &mut tail.as_mut_slice()[..4096])
             .unwrap();
-        assert!(tail.as_slice()[..4096].iter().all(|&byte| byte == 0xab));
+        assert!(tail.as_slice()[..4096].iter().all(|&byte| byte == 0));
+        b.read_blob_range(
+            new,
+            (extent - 4096) as u64,
+            &mut tail.as_mut_slice()[..8192],
+        )
+        .unwrap();
+        assert_eq!(
+            &tail.as_slice()[..4096],
+            &small.as_slice()[extent - 4096..extent]
+        );
+        assert!(tail.as_slice()[4096..8192].iter().all(|&byte| byte == 0));
     }
 
     #[test]
@@ -3601,11 +3846,17 @@ mod tests {
             let free = b.store_stats();
             assert_eq!(free.tail_reclaimable_slots, 2);
             assert_eq!(free.middle_reusable_slots, 0);
-            assert!(free.tail_reclaimable_bytes >= 2 * u64::from(PAGE_SIZE));
+            assert!(
+                free.tail_reclaimable_bytes
+                    >= 2 * (u64::from(PAGE_SIZE) + integrity::RECORD_BYTES as u64)
+            );
 
             let vacuum = b.vacuum().unwrap();
             assert_eq!(vacuum.slots_trimmed, 2);
-            assert!(vacuum.bytes_truncated >= 2 * u64::from(PAGE_SIZE));
+            assert!(
+                vacuum.bytes_truncated
+                    >= 2 * (u64::from(PAGE_SIZE) + integrity::RECORD_BYTES as u64)
+            );
 
             let after = b.store_stats();
             assert_eq!(after.next_slot, 1);
@@ -3905,7 +4156,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_delta_log_replays_without_snapshot() {
+    fn manifest_delta_log_replays_after_integrity_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let g: BlobGuid = [0xC1; 16];
         {
@@ -3915,7 +4166,7 @@ mod tests {
             b.write_blob(g, &buf_with(9)).unwrap();
             b.flush().unwrap();
             assert!(dir.path().join(MANIFEST_LOG_FILENAME).exists());
-            assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+            assert!(dir.path().join(MANIFEST_FILENAME).exists());
         }
 
         let Some(b) = try_open(dir.path()) else {
@@ -3924,6 +4175,181 @@ mod tests {
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 9);
+    }
+
+    #[test]
+    fn corrupted_active_value_is_rejected_by_full_and_page_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let guid: BlobGuid = [0xC7; 16];
+        let slot = {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            store.write_blob(guid, &buf_with(9)).unwrap();
+            store.flush().unwrap();
+            store.entry_of(guid).unwrap().slot
+        };
+        let data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(DATA_FILENAME))
+            .unwrap();
+        let offset = slot * u64::from(PAGE_SIZE) + 100;
+        let mut byte = [0u8; 1];
+        data.read_exact_at(&mut byte, offset).unwrap();
+        byte[0] ^= 1;
+        data.write_all_at(&byte, offset).unwrap();
+        data.sync_all().unwrap();
+
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let mut frame = AlignedBlobBuf::zeroed();
+        assert!(matches!(
+            store.read_blob(guid, &mut frame),
+            Err(Error::NodeCorrupt { .. })
+        ));
+        assert!(matches!(
+            store.read_blob_range(guid, 0, &mut frame.as_mut_slice()[..4096]),
+            Err(Error::NodeCorrupt { .. })
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[test]
+    fn large_batch_checks_each_blob_and_preserves_result_order() {
+        const COUNT: usize = 40;
+        const DAMAGED: usize = 17;
+        let dir = tempfile::tempdir().unwrap();
+        let mut guids = Vec::with_capacity(COUNT);
+        let slot = {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            for index in 0..COUNT {
+                let mut guid = [0u8; 16];
+                guid[0] = index as u8;
+                store
+                    .write_blob(guid, &frame_with_extent(PAGE_SIZE, index as u8))
+                    .unwrap();
+                guids.push(guid);
+            }
+            store.flush().unwrap();
+            store.entry_of(guids[DAMAGED]).unwrap().slot
+        };
+        let data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(DATA_FILENAME))
+            .unwrap();
+        let offset = slot * u64::from(PAGE_SIZE) + 8192;
+        let mut byte = [0u8; 1];
+        data.read_exact_at(&mut byte, offset).unwrap();
+        byte[0] ^= 1;
+        data.write_all_at(&byte, offset).unwrap();
+        data.sync_all().unwrap();
+
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let mut frames = (0..COUNT)
+            .map(|_| AlignedBlobBuf::zeroed())
+            .collect::<Vec<_>>();
+        let results = store.read_blobs(&guids, &mut frames);
+        assert_eq!(results.len(), COUNT);
+        for (index, (result, frame)) in results.into_iter().zip(frames).enumerate() {
+            if index == DAMAGED {
+                assert!(matches!(result, Err(Error::NodeCorrupt { .. })));
+            } else {
+                result.unwrap();
+                assert_eq!(frame.as_slice()[100], index as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_protected_manifest_cannot_rebaseline_blob_checksums() {
+        let dir = tempfile::tempdir().unwrap();
+        let guid: BlobGuid = [0xC8; 16];
+        {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            store.write_blob(guid, &buf_with(9)).unwrap();
+            store.flush().unwrap();
+        }
+        std::fs::remove_file(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        assert!(matches!(
+            FileBlobStore::open(dir.path()),
+            Err(Error::NodeCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn integrity_sidecar_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            store.write_blob([0xCB; 16], &buf_with(7)).unwrap();
+            store.flush().unwrap();
+        }
+        let sidecar = dir.path().join(INTEGRITY_FILENAME);
+        let saved = dir.path().join("saved-integrity.dat");
+        std::fs::rename(&sidecar, &saved).unwrap();
+        symlink(&saved, &sidecar).unwrap();
+        assert!(FileBlobStore::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_snapshot_requires_writable_migration_before_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let guid: BlobGuid = [0xC9; 16];
+        {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            store.write_blob(guid, &buf_with(9)).unwrap();
+            store.flush().unwrap();
+        }
+        let path = dir.path().join(MANIFEST_FILENAME);
+        let manifest = OpenOptions::new().write(true).open(path).unwrap();
+        manifest
+            .write_all_at(&LEGACY_MANIFEST_VERSION.to_le_bytes(), 8)
+            .unwrap();
+        manifest.sync_all().unwrap();
+        std::fs::remove_file(dir.path().join(INTEGRITY_FILENAME)).unwrap();
+
+        assert!(FileBlobStore::open_read_only(dir.path()).is_err());
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let mut frame = AlignedBlobBuf::zeroed();
+        store.read_blob(guid, &mut frame).unwrap();
+        assert_eq!(frame.as_slice()[100], 9);
+        drop(store);
+        assert!(dir.path().join(INTEGRITY_FILENAME).exists());
+        assert!(FileBlobStore::open_read_only(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn legacy_log_only_store_is_migrated_without_losing_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let guid: BlobGuid = [0xCA; 16];
+        {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            store.write_blob(guid, &buf_with(12)).unwrap();
+            store.flush().unwrap();
+        }
+        std::fs::remove_file(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        std::fs::remove_file(dir.path().join(INTEGRITY_FILENAME)).unwrap();
+
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let mut frame = AlignedBlobBuf::zeroed();
+        store.read_blob(guid, &mut frame).unwrap();
+        assert_eq!(frame.as_slice()[100], 12);
+        drop(store);
+        assert!(dir.path().join(MANIFEST_FILENAME).exists());
+        assert!(!dir.path().join(INTEGRITY_MIGRATING_FILENAME).exists());
     }
 
     #[test]
