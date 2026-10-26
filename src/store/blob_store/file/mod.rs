@@ -872,7 +872,7 @@ impl FileBlobStore {
         }
     }
 
-    #[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+    #[cfg(test)]
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
         Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
     }
@@ -944,7 +944,7 @@ impl FileBlobStore {
         &self,
         guid: BlobGuid,
         slot: u64,
-    ) -> Result<[u8; integrity::RECORD_BYTES]> {
+    ) -> Result<integrity::ValidatedRecord> {
         let mut record = [0u8; integrity::RECORD_BYTES];
         self.integrity_file
             .read_exact_at(&mut record, integrity::record_offset(slot)?)
@@ -956,7 +956,7 @@ impl FileBlobStore {
                     Error::BlobStoreIo(error)
                 }
             })?;
-        Ok(record)
+        integrity::ValidatedRecord::new(record, guid, slot)
     }
 
     fn write_integrity_records(&self, writes: &[PreparedBlobWrite<'_>]) -> Result<()> {
@@ -1070,15 +1070,15 @@ impl FileBlobStore {
     // `write_blob` clean of any conditional plumbing.
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
+    fn pread_at(&self, offset: u64, len: usize, dst: &mut AlignedBlobBuf) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
-        ring.pread_at(offset, dst)?;
+        ring.pread_at(offset, len, dst)?;
         Ok(())
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
-        let dst = dst.as_mut_slice();
+    fn pread_at(&self, offset: u64, len: usize, dst: &mut AlignedBlobBuf) -> Result<()> {
+        let dst = &mut dst.as_mut_slice()[..len];
         self.data_file.read_exact_at(dst, offset)?;
         Ok(())
     }
@@ -1354,8 +1354,8 @@ impl FileBlobStore {
                 &mut data,
             )?);
             let previous = self.read_integrity_record(item.guid, item.from_slot)?;
-            integrity::verify_full(&previous, item.guid, item.from_slot, data.as_slice())?;
-            let record = integrity::relocate_verified(&previous, item.to_slot);
+            previous.verify_full(data.as_slice())?;
+            let record = previous.relocate_verified(item.to_slot);
             self.integrity_file
                 .write_all_at(&record, integrity::record_offset(item.to_slot)?)?;
             bytes = bytes.saturating_add(integrity::RECORD_BYTES as u64);
@@ -1655,10 +1655,11 @@ impl BlobStore for FileBlobStore {
         let _slot = self.enter_slot_read();
         let entry = self.entry_of(guid)?;
         let offset = entry.slot * u64::from(PAGE_SIZE);
-        self.pread_at(offset, dst)?;
         let record = self.read_integrity_record(guid, entry.slot)?;
-        integrity::verify_full(&record, guid, entry.slot, dst.as_slice())?;
-        integrity::clear_uncovered_tail(&record, dst.as_mut_slice());
+        let covered = record.covered_bytes();
+        self.pread_at(offset, covered, dst)?;
+        dst.as_mut_slice()[covered..].fill(0);
+        record.verify_full(dst.as_slice())?;
         Ok(())
     }
 
@@ -1671,15 +1672,21 @@ impl BlobStore for FileBlobStore {
     fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
         debug_assert_eq!(guids.len(), dsts.len());
         let _slot = self.enter_slot_read();
-        // Resolve offsets up front (lock-free manifest read). A guid
-        // that doesn't resolve is reported in its own slot and left
-        // out of the ring batch, so one bad guid can't sink the rest.
-        let offsets: Vec<Result<u64>> = guids.iter().map(|g| self.offset_of(*g)).collect();
+        // Resolve each slot and its durable covered extent before submitting
+        // data reads. Invalid records fail only their own guid.
+        let reads: Vec<Result<(u64, integrity::ValidatedRecord)>> = guids
+            .iter()
+            .map(|guid| {
+                let entry = self.entry_of(*guid)?;
+                let record = self.read_integrity_record(*guid, entry.slot)?;
+                Ok((entry.slot * u64::from(PAGE_SIZE), record))
+            })
+            .collect();
 
-        let mut batch: Vec<(u64, &mut AlignedBlobBuf)> = Vec::with_capacity(dsts.len());
-        for (off, dst) in offsets.iter().zip(dsts.iter_mut()) {
-            if let Ok(off) = off {
-                batch.push((*off, dst));
+        let mut batch: Vec<(u64, usize, &mut AlignedBlobBuf)> = Vec::with_capacity(dsts.len());
+        for (read, dst) in reads.iter().zip(dsts.iter_mut()) {
+            if let Ok((offset, record)) = read {
+                batch.push((*offset, record.covered_bytes(), dst));
             }
         }
 
@@ -1694,27 +1701,61 @@ impl BlobStore for FileBlobStore {
             ring.pread_many_at(&mut batch)
         };
         drop(batch);
-
-        offsets
-            .into_iter()
-            .zip(guids)
-            .zip(dsts.iter_mut())
-            .map(|((off, guid), dst)| match off {
-                Err(e) => Err(e),
-                Ok(offset) => match &batch_result {
-                    Ok(()) => {
-                        let slot = offset / u64::from(PAGE_SIZE);
-                        let record = self.read_integrity_record(*guid, slot)?;
-                        integrity::verify_full(&record, *guid, slot, dst.as_slice())?;
-                        integrity::clear_uncovered_tail(&record, dst.as_mut_slice());
-                        Ok(())
-                    }
-                    Err(e) => Err(Error::BlobStoreIo(io::Error::other(format!(
-                        "batched uring read failed: {e}"
+        if let Err(error) = batch_result {
+            return reads
+                .into_iter()
+                .map(|read| match read {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(Error::BlobStoreIo(io::Error::other(format!(
+                        "batched uring read failed: {error}"
                     )))),
-                },
-            })
-            .collect()
+                })
+                .collect();
+        }
+
+        fn verify_read(
+            read: Result<(u64, integrity::ValidatedRecord)>,
+            dst: &mut AlignedBlobBuf,
+        ) -> Result<()> {
+            let (_, record) = read?;
+            dst.as_mut_slice()[record.covered_bytes()..].fill(0);
+            record.verify_full(dst.as_slice())?;
+            Ok(())
+        }
+
+        // The ring completes data I/O before verification. For large batches,
+        // independent page checksums can use multiple cores without changing
+        // read ordering or sharing a destination buffer.
+        const VERIFY_FANOUT: usize = 8;
+        if reads.len() < 32 {
+            return reads
+                .into_iter()
+                .zip(dsts.iter_mut())
+                .map(|(read, dst)| verify_read(read, dst))
+                .collect();
+        }
+        let chunk_len = reads.len().div_ceil(VERIFY_FANOUT);
+        std::thread::scope(|scope| {
+            let mut items = reads.into_iter().zip(dsts.iter_mut());
+            let mut handles = Vec::with_capacity(VERIFY_FANOUT);
+            loop {
+                let chunk: Vec<_> = items.by_ref().take(chunk_len).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|(read, dst)| verify_read(read, dst))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut results = Vec::with_capacity(guids.len());
+            for handle in handles {
+                results.extend(handle.join().expect("blob checksum worker panicked"));
+            }
+            results
+        })
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -1774,21 +1815,37 @@ impl BlobStore for FileBlobStore {
         );
         let _slot = self.enter_slot_read();
         let entry = self.entry_of(guid)?;
+        let start = usize::try_from(byte_offset)
+            .map_err(|_| Error::node_corrupt("FileBlobStore::Integrity::range"))?;
+        if start % 4096 != 0
+            || dst.len() % 4096 != 0
+            || start
+                .checked_add(dst.len())
+                .is_none_or(|end| end > PAGE_SIZE as usize)
+        {
+            return Err(Error::node_corrupt("FileBlobStore::Integrity::range").with_blob_guid(guid));
+        }
+        let record = self.read_integrity_record(guid, entry.slot)?;
+        let covered = record.covered_bytes();
+        let read_len = covered.saturating_sub(start).min(dst.len());
         let offset = entry.slot * u64::from(PAGE_SIZE) + byte_offset;
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
-            let mut ring = self.uring.lock().unwrap();
-            ring.pread_slice_at(offset, dst)?;
+            if read_len != 0 {
+                let mut ring = self.uring.lock().unwrap();
+                ring.pread_slice_at(offset, &mut dst[..read_len])?;
+            }
         }
 
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         {
-            use std::os::unix::fs::FileExt;
-            self.data_file.read_exact_at(dst, offset)?;
+            if read_len != 0 {
+                self.data_file.read_exact_at(&mut dst[..read_len], offset)?;
+            }
         }
-        let record = self.read_integrity_record(guid, entry.slot)?;
-        integrity::verify_range(&record, guid, entry.slot, byte_offset, dst)
+        dst[read_len..].fill(0);
+        record.verify_range(byte_offset, dst)
     }
 
     fn read_index_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<bool> {
@@ -3347,6 +3404,78 @@ mod tests {
         assert_eq!(dst.as_slice()[100], 7);
     }
 
+    /// A frame image whose data area ends at `space_used`, with every other
+    /// byte set to `fill` so persisted and cleared bytes are distinguishable.
+    fn frame_with_extent(space_used: u32, fill: u8) -> AlignedBlobBuf {
+        let mut frame = AlignedBlobBuf::zeroed();
+        frame.as_mut_slice().fill(fill);
+        crate::store::blob_frame::BlobFrame::wrap(frame.as_mut_slice())
+            .header_mut()
+            .space_used = space_used;
+        frame
+    }
+
+    #[test]
+    fn compact_record_hides_bytes_beyond_its_authenticated_extent() {
+        use crate::layout::DATA_AREA_START;
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let old: BlobGuid = [0x41; 16];
+        let new: BlobGuid = [0x42; 16];
+        // A full frame takes a slot, then moves to a shadow slot and
+        // releases the first one.
+        b.write_blob(old, &frame_with_extent(PAGE_SIZE, 0xab))
+            .unwrap();
+        let released = b.entry_of(old).unwrap().slot;
+        b.write_blob(old, &frame_with_extent(PAGE_SIZE, 0xab))
+            .unwrap();
+        b.flush().unwrap();
+
+        let small = frame_with_extent(DATA_AREA_START + 5_000, 0xcd);
+        b.write_blob(new, &small).unwrap();
+        let new_slot = b.entry_of(new).unwrap().slot;
+        assert_eq!(new_slot, released);
+        let extent = (DATA_AREA_START + 2 * 4096) as usize;
+        // A release/0.8 store can carry a compact integrity record. Leave
+        // non-authoritative bytes physically present after its extent.
+        let record = integrity::encode_prefix(new, new_slot, small.as_slice(), extent);
+        b.integrity_file
+            .write_all_at(&record, integrity::record_offset(new_slot).unwrap())
+            .unwrap();
+
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(new, &mut dst).unwrap();
+        assert_eq!(&dst.as_slice()[..extent], &small.as_slice()[..extent]);
+        assert!(dst.as_slice()[extent..].iter().all(|&byte| byte == 0));
+        let mut batch = [AlignedBlobBuf::zeroed(), AlignedBlobBuf::zeroed()];
+        for result in b.read_blobs(&[new, new], &mut batch) {
+            result.unwrap();
+        }
+        assert!(batch.iter().all(|frame| frame.as_slice() == dst.as_slice()));
+
+        // A range read beyond the authenticated extent must not expose
+        // non-authoritative bytes in the slot.
+        // A ranged read needs a 4 KB-aligned buffer for O_DIRECT.
+        let mut tail = AlignedBlobBuf::zeroed();
+        b.read_blob_range(new, extent as u64, &mut tail.as_mut_slice()[..4096])
+            .unwrap();
+        assert!(tail.as_slice()[..4096].iter().all(|&byte| byte == 0));
+        b.read_blob_range(
+            new,
+            (extent - 4096) as u64,
+            &mut tail.as_mut_slice()[..8192],
+        )
+        .unwrap();
+        assert_eq!(
+            &tail.as_slice()[..4096],
+            &small.as_slice()[extent - 4096..extent]
+        );
+        assert!(tail.as_slice()[4096..8192].iter().all(|&byte| byte == 0));
+    }
+
     #[test]
     fn write_replaces_existing_through_shadow_slot() {
         let dir = tempfile::tempdir().unwrap();
@@ -4092,6 +4221,56 @@ mod tests {
             store.read_blob_range(guid, 0, &mut frame.as_mut_slice()[..4096]),
             Err(Error::NodeCorrupt { .. })
         ));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[test]
+    fn large_batch_checks_each_blob_and_preserves_result_order() {
+        const COUNT: usize = 40;
+        const DAMAGED: usize = 17;
+        let dir = tempfile::tempdir().unwrap();
+        let mut guids = Vec::with_capacity(COUNT);
+        let slot = {
+            let Some(store) = try_open(dir.path()) else {
+                return;
+            };
+            for index in 0..COUNT {
+                let mut guid = [0u8; 16];
+                guid[0] = index as u8;
+                store
+                    .write_blob(guid, &frame_with_extent(PAGE_SIZE, index as u8))
+                    .unwrap();
+                guids.push(guid);
+            }
+            store.flush().unwrap();
+            store.entry_of(guids[DAMAGED]).unwrap().slot
+        };
+        let data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(DATA_FILENAME))
+            .unwrap();
+        let offset = slot * u64::from(PAGE_SIZE) + 8192;
+        let mut byte = [0u8; 1];
+        data.read_exact_at(&mut byte, offset).unwrap();
+        byte[0] ^= 1;
+        data.write_all_at(&byte, offset).unwrap();
+        data.sync_all().unwrap();
+
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let mut frames = (0..COUNT)
+            .map(|_| AlignedBlobBuf::zeroed())
+            .collect::<Vec<_>>();
+        let results = store.read_blobs(&guids, &mut frames);
+        assert_eq!(results.len(), COUNT);
+        for (index, (result, frame)) in results.into_iter().zip(frames).enumerate() {
+            if index == DAMAGED {
+                assert!(matches!(result, Err(Error::NodeCorrupt { .. })));
+            } else {
+                result.unwrap();
+                assert_eq!(frame.as_slice()[100], index as u8);
+            }
+        }
     }
 
     #[test]
