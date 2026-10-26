@@ -139,7 +139,7 @@ pub struct VacuumStats {
     /// Bytes copied while relocating live blob slots.
     pub bytes_relocated: u64,
     /// Bytes removed from store files. Counts `blobs.dat`,
-    /// `read.idx`, and `value.seg` truncation.
+    /// `integrity.dat`, `read.idx`, and `value.seg` truncation.
     pub bytes_truncated: u64,
     /// Reusable middle slots submitted to filesystem hole punching.
     ///

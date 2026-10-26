@@ -2041,7 +2041,14 @@ impl BlobStore for FileBlobStore {
         let tail_target = next_slot
             .saturating_sub(tail_reclaimable_slots)
             .saturating_mul(u64::from(PAGE_SIZE));
+        let integrity_tail_target = next_slot
+            .saturating_sub(tail_reclaimable_slots)
+            .saturating_mul(integrity::RECORD_BYTES as u64);
         let tail_reclaimable_bytes = reclaimable_tail_bytes(&self.data_file, tail_target)
+            .saturating_add(reclaimable_tail_bytes(
+                &self.integrity_file,
+                integrity_tail_target,
+            ))
             .saturating_add(reclaimable_tail_bytes(&self.read_index_file, tail_target))
             .saturating_add(reclaimable_tail_bytes(
                 &self.value_segment_file,
@@ -3720,11 +3727,17 @@ mod tests {
             let free = b.store_stats();
             assert_eq!(free.tail_reclaimable_slots, 2);
             assert_eq!(free.middle_reusable_slots, 0);
-            assert!(free.tail_reclaimable_bytes >= 2 * u64::from(PAGE_SIZE));
+            assert!(
+                free.tail_reclaimable_bytes
+                    >= 2 * (u64::from(PAGE_SIZE) + integrity::RECORD_BYTES as u64)
+            );
 
             let vacuum = b.vacuum().unwrap();
             assert_eq!(vacuum.slots_trimmed, 2);
-            assert!(vacuum.bytes_truncated >= 2 * u64::from(PAGE_SIZE));
+            assert!(
+                vacuum.bytes_truncated
+                    >= 2 * (u64::from(PAGE_SIZE) + integrity::RECORD_BYTES as u64)
+            );
 
             let after = b.store_stats();
             assert_eq!(after.next_slot, 1);
