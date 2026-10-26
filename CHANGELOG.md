@@ -9,6 +9,18 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-10-26
+
+### Fixed
+
+- File-backed blob reads now verify per-page checksums for the persisted part
+  of each blob before returning bytes. Damaged active blobs fail with
+  `NodeCorrupt` instead of silently returning altered values. The checksum
+  sidecar is synced before the manifest commits a new slot, and existing
+  version 6 stores migrate on their first writable open. A read-only open
+  requires migration to have completed first. This detects damage that occurs
+  after migration; existing damage cannot be reconstructed or authenticated.
+
 ## [0.8.7] — 2026-10-16
 
 ### Changed

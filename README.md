@@ -175,6 +175,13 @@ checkpointing:
 
 - WAL records make acknowledged mutations replayable.
 - Checkpoints flush dirty blob frames and compact the manifest.
+- Cold blob reads verify per-page checksums from a separate, durably ordered
+  integrity file. A checksum failure is reported as corruption rather than
+  returning bytes. Hot cached reads do not add a checksum lookup.
+- The first writable open of an existing v6 store creates the integrity file
+  and a v7 manifest snapshot. Back up the store before this one-way upgrade;
+  older Holt binaries cannot reopen v7. The migration establishes checksums
+  for existing bytes and cannot identify corruption that predates it.
 - Indexed point reads are served page-granularly from the in-blob routing
   region (built at compaction); it is an accelerator, never the source
   of truth.
