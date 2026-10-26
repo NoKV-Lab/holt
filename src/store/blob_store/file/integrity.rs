@@ -72,17 +72,76 @@ fn validate_record(record: &[u8; RECORD_BYTES], guid: BlobGuid, slot: u64) -> Re
     Ok(())
 }
 
+/// The record's extent is trusted only after its binding and checksum pass.
+pub(super) struct ValidatedRecord {
+    bytes: [u8; RECORD_BYTES],
+    guid: BlobGuid,
+    covered_pages: usize,
+}
+
+impl ValidatedRecord {
+    pub(super) fn new(bytes: [u8; RECORD_BYTES], guid: BlobGuid, slot: u64) -> Result<Self> {
+        validate_record(&bytes, guid, slot)?;
+        let covered_pages = u32::from_le_bytes(
+            bytes[COVERED_PAGES_OFFSET..COVERED_PAGES_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        Ok(Self {
+            bytes,
+            guid,
+            covered_pages,
+        })
+    }
+
+    pub(super) fn covered_bytes(&self) -> usize {
+        self.covered_pages * PAGE_BYTES
+    }
+
+    pub(super) fn verify_full(&self, frame: &[u8]) -> Result<()> {
+        debug_assert_eq!(frame.len(), PAGE_SIZE as usize);
+        verify_pages(&self.bytes, self.guid, self.covered_pages, 0, frame)
+    }
+
+    pub(super) fn verify_range(&self, byte_offset: u64, bytes: &[u8]) -> Result<()> {
+        let start = usize::try_from(byte_offset).map_err(|_| {
+            Error::node_corrupt("FileBlobStore::Integrity::range").with_blob_guid(self.guid)
+        })?;
+        if start % PAGE_BYTES != 0
+            || bytes.len() % PAGE_BYTES != 0
+            || start
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > PAGE_SIZE as usize)
+        {
+            return Err(
+                Error::node_corrupt("FileBlobStore::Integrity::range").with_blob_guid(self.guid)
+            );
+        }
+        verify_pages(
+            &self.bytes,
+            self.guid,
+            self.covered_pages,
+            start / PAGE_BYTES,
+            bytes,
+        )
+    }
+
+    pub(super) fn relocate_verified(&self, new_slot: u64) -> [u8; RECORD_BYTES] {
+        relocate_verified(&self.bytes, new_slot)
+    }
+}
+
+#[cfg(test)]
 pub(super) fn verify_full(
     record: &[u8; RECORD_BYTES],
     guid: BlobGuid,
     slot: u64,
     frame: &[u8],
 ) -> Result<()> {
-    validate_record(record, guid, slot)?;
-    debug_assert_eq!(frame.len(), PAGE_SIZE as usize);
-    verify_pages(record, guid, 0, frame)
+    ValidatedRecord::new(*record, guid, slot)?.verify_full(frame)
 }
 
+#[cfg(test)]
 pub(super) fn verify_range(
     record: &[u8; RECORD_BYTES],
     guid: BlobGuid,
@@ -90,31 +149,16 @@ pub(super) fn verify_range(
     byte_offset: u64,
     bytes: &[u8],
 ) -> Result<()> {
-    validate_record(record, guid, slot)?;
-    let start = usize::try_from(byte_offset)
-        .map_err(|_| Error::node_corrupt("FileBlobStore::Integrity::range"))?;
-    if start % PAGE_BYTES != 0
-        || bytes.len() % PAGE_BYTES != 0
-        || start
-            .checked_add(bytes.len())
-            .is_none_or(|end| end > PAGE_SIZE as usize)
-    {
-        return Err(Error::node_corrupt("FileBlobStore::Integrity::range").with_blob_guid(guid));
-    }
-    verify_pages(record, guid, start / PAGE_BYTES, bytes)
+    ValidatedRecord::new(*record, guid, slot)?.verify_range(byte_offset, bytes)
 }
 
 fn verify_pages(
     record: &[u8; RECORD_BYTES],
     guid: BlobGuid,
+    covered_pages: usize,
     first_page: usize,
     bytes: &[u8],
 ) -> Result<()> {
-    let covered_pages = u32::from_le_bytes(
-        record[COVERED_PAGES_OFFSET..COVERED_PAGES_OFFSET + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
     for (index, page) in bytes.chunks_exact(PAGE_BYTES).enumerate() {
         if first_page + index >= covered_pages {
             continue;
