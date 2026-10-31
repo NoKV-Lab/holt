@@ -283,6 +283,8 @@ impl DB {
         self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        // Re-check under the gate: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
         if self.catalog_entry(name_bytes)?.is_some() {
             return Err(Error::TreeExists {
                 name: name.to_owned(),
@@ -399,6 +401,8 @@ impl DB {
         self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        // Re-check under the gate: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
         let entry = match self.catalog_entry(name_bytes)? {
             Some(entry) if entry.state == CatalogState::Live => entry,
             Some(_) | None => {
@@ -969,6 +973,8 @@ impl DB {
 
     fn finalize_dropped_trees(&self) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        // Re-check under the gate: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
         {
             let _commit = self.commit_gate.enter_writer();
             self.store.flush_write_deltas_for_tree(DB_CATALOG_TREE_ID)?;
@@ -1142,10 +1148,16 @@ impl DB {
             .collect::<Vec<_>>();
         gates.sort_by_key(|(tree_id, _)| *tree_id);
         gates.dedup_by_key(|(tree_id, _)| *tree_id);
+        #[cfg(test)]
+        super::tree::pause_before_serialized_write_gates();
         let _tree_guards = gates
             .iter()
             .map(|(_, gate)| gate.enter_batch())
             .collect::<Vec<_>>();
+        // Re-check under the gates: a batch queued ahead may have failed part-way.
+        self.store
+            .ensure_not_failed_closed()
+            .map_err(atomic_definitely_not_applied)?;
         {
             let _commit = self.commit_gate.enter_writer();
             for group in &groups {
@@ -2216,6 +2228,140 @@ mod tests {
                 .as_deref(),
             Some(&value[..])
         );
+    }
+
+    /// A WAL-backed DB over `store` whose spilled `objects` tree has cold
+    /// children that fail to read. Returns it with a key of `objects` whose
+    /// insert reads one of them, so a batch touching that key fails after
+    /// the ops before it applied.
+    fn open_with_failing_objects_children(
+        cfg: &TreeConfig,
+        store: &Arc<FailIoStore>,
+    ) -> (DB, Vec<u8>) {
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let db = DB::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+        db.create_tree("first").unwrap();
+        let objects = db.create_tree("objects").unwrap();
+        let keys = (0..1200u32)
+            .map(|i| format!("deferred/{i:08}").into_bytes())
+            .collect::<Vec<_>>();
+        for chunk in keys.chunks(100) {
+            assert!(db
+                .atomic(|batch| {
+                    for key in chunk {
+                        batch.put("objects", key, &[0x3A; 1024]);
+                    }
+                })
+                .unwrap());
+        }
+        db.checkpoint().unwrap();
+        let tree_id = db
+            .catalog_lookup_live(b"objects")
+            .unwrap()
+            .expect("objects tree id");
+        let child_guids =
+            crate::engine::collect_blob_topology_silent(&db.store, root_guid_for_tree_id(tree_id))
+                .unwrap()
+                .into_iter()
+                .filter_map(|entry| (entry.depth > 0).then_some(entry.guid))
+                .collect::<Vec<_>>();
+        assert!(!child_guids.is_empty(), "test requires a spilled tree");
+        for &guid in &child_guids {
+            assert!(
+                db.store.evict_from_cache_for_test(guid),
+                "test child remained pinned"
+            );
+        }
+        store.arm_read_failures(child_guids.iter().copied());
+        let target = keys
+            .iter()
+            .find_map(|key| match objects.get(key) {
+                Err(Error::BlobStoreIo(_)) => Some(key.clone()),
+                Ok(Some(_)) => None,
+                other => panic!("unexpected target probe result: {other:?}"),
+            })
+            .expect("no key traversed a cold child");
+        (db, target)
+    }
+
+    /// A DB batch and a tree write that passed their entry checks and then
+    /// queued behind a batch failing part-way must see its latch once they
+    /// hold their gates. Otherwise they apply on top of the partial batch
+    /// and commit WAL records that survive a reopen.
+    #[test]
+    fn writes_queued_behind_a_failing_batch_are_refused() {
+        use crate::api::tree::{
+            set_serialized_write_barrier_for_current_thread, OrdinaryWriteGateBarrier,
+        };
+
+        let dir = tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.buffer_pool_size = 32;
+        cfg.checkpoint.enabled = false;
+        cfg.durability = crate::Durability::Wal { sync: true };
+        let store = Arc::new(FailIoStore::new());
+        let (db, target) = open_with_failing_objects_children(&cfg, &store);
+        let first = db.open_tree("first").unwrap();
+
+        // Both writes stop after their entry checks, where they would queue
+        // behind the failing batch's gates on `first`.
+        let batch_barrier = Arc::new(OrdinaryWriteGateBarrier::new());
+        let queued_batch = {
+            let db = db.clone();
+            let barrier = Arc::clone(&batch_barrier);
+            thread::spawn(move || {
+                set_serialized_write_barrier_for_current_thread(barrier);
+                db.atomic(|batch| batch.put("first", b"queued-batch", b"value"))
+            })
+        };
+        let put_barrier = Arc::new(OrdinaryWriteGateBarrier::new());
+        let queued_put = {
+            let first = first.clone();
+            let barrier = Arc::clone(&put_barrier);
+            thread::spawn(move || {
+                set_serialized_write_barrier_for_current_thread(barrier);
+                first.put_if_absent(b"queued-put", b"value")
+            })
+        };
+        batch_barrier.entered.wait();
+        put_barrier.entered.wait();
+
+        let error = db
+            .atomic(|batch| {
+                batch.put("first", b"partial", b"half-applied");
+                batch.put("objects", &target, b"never-applied");
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::OutcomeUnknown,
+                ..
+            }
+        ));
+        batch_barrier.release.wait();
+        put_barrier.release.wait();
+        let queued_batch = queued_batch.join().unwrap();
+        let queued_put = queued_put.join().unwrap();
+        store.clear_read_failures();
+        drop(first);
+        drop(db);
+
+        // Neither queued write left a WAL record behind.
+        let store_dyn: Arc<dyn BlobStore> = store;
+        let db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
+        let first = db.open_tree("first").unwrap();
+        assert!(first.get(b"queued-batch").unwrap().is_none());
+        assert!(first.get(b"queued-put").unwrap().is_none());
+        assert!(first.get(b"partial").unwrap().is_none());
+        assert!(matches!(
+            queued_batch,
+            Err(Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            }) if matches!(source.as_ref(), Error::FailedClosed)
+        ));
+        assert!(matches!(queued_put, Err(Error::FailedClosed)));
     }
 
     #[test]
