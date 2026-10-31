@@ -759,6 +759,7 @@ mod tests {
             io_tx,
             checkpoint_stop: AtomicBool::new(false),
             eviction_stop: AtomicBool::new(false),
+            failed_closed_reported: AtomicBool::new(false),
             rounds_attempted: AtomicU64::new(0),
             rounds_succeeded: AtomicU64::new(0),
             rounds_failed: AtomicU64::new(0),

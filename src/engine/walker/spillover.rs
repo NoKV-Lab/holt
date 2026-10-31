@@ -38,6 +38,14 @@ std::thread_local! {
     static FAIL_PREPARED_PARENT_COMPACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Arm the prepared-parent compaction failpoint for this thread's next
+/// spillover, so a test can fail an insert after earlier ops of the same
+/// batch already changed cached frames.
+#[cfg(test)]
+pub(crate) fn fail_next_prepared_parent_compaction() {
+    FAIL_PREPARED_PARENT_COMPACT.with(|armed| armed.set(true));
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SubtreeFootprint {
     nodes: u32,
