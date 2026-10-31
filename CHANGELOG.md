@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-10-31
+
 ### Fixed
 
 - A write that failed after it had already changed cached frames (an atomic
