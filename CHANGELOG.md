@@ -9,6 +9,21 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Fixed
+
+- A write that failed after it had already changed cached frames (an atomic
+  batch, with or without an attached journal envelope, whose apply or WAL
+  submit failed part-way, a tree batch, or a single put, delete or rename
+  whose WAL submit failed) left that partial change in memory with no WAL
+  record, and the next checkpoint persisted it: after a reopen, one tree of a
+  cross-tree atomic batch could hold its half of the batch without the other.
+  Such a failure now latches the database closed. Every later write,
+  `DB::checkpoint`, background checkpoint round and the final checkpoint on
+  drop fails with the new `Error::FailedClosed`, so nothing of the failed
+  write becomes durable; reopening recovers the last durable state. The failed
+  call itself still reports `AtomicErrorKind::OutcomeUnknown`, and a failed
+  attached batch never appends its envelope.
+
 ## [0.9.2] — 2026-08-18
 
 ### Added

@@ -76,6 +76,8 @@ pub use range::{
 };
 pub(crate) use scan::collect_blob_children_from_frame;
 pub use scan::{collect_blob_guids, collect_blob_topology_silent};
+#[cfg(test)]
+pub(crate) use spillover::fail_next_prepared_parent_compaction;
 pub(crate) use spillover::fresh_blob_guid;
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 

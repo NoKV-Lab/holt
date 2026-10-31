@@ -769,10 +769,23 @@ impl Tree {
     fn ensure_writable(&self) -> Result<()> {
         self.ensure_live()?;
         if self.cfg.is_read_only() {
-            Err(Error::ReadOnly)
-        } else {
-            Ok(())
+            return Err(Error::ReadOnly);
         }
+        self.store.ensure_not_failed_closed()
+    }
+
+    /// Submit the WAL record of a mutation that already changed cached
+    /// frames. A failed submit leaves that change in memory with no record,
+    /// so the store fails closed while the caller still holds the commit
+    /// gate, before any checkpoint could capture the change.
+    fn submit_applied(
+        &self,
+        journal: &Journal,
+        record: Vec<u8>,
+    ) -> Result<Option<crate::journal::JournalAck>> {
+        journal
+            .submit(record, self.cfg.durability.wal_sync())
+            .inspect_err(|_| self.store.fail_closed())
     }
 
     fn preflight_ordinary_record(&self, record_len: usize) -> Result<()> {
@@ -1075,7 +1088,7 @@ impl Tree {
                     let mut record =
                         journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
                     encode_insert_record(&mut record, seq, self.tree_id, key, value);
-                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+                    let ack = self.submit_applied(journal, record)?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -1229,7 +1242,7 @@ impl Tree {
                     }
                     let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
                     encode_erase_record(&mut record, seq, self.tree_id, key);
-                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+                    let ack = self.submit_applied(journal, record)?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -1344,7 +1357,8 @@ impl Tree {
                     dst_search,
                     &value,
                     seq,
-                )?;
+                )
+                .inspect_err(|_| self.store.fail_closed())?;
                 if erase_out.root_dirty || insert_out.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
@@ -1352,7 +1366,7 @@ impl Tree {
                 let mut record =
                     journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
                 encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
-                journal.submit(record, self.cfg.durability.wal_sync())?
+                self.submit_applied(journal, record)?
             } else {
                 let commit =
                     (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
@@ -1370,7 +1384,8 @@ impl Tree {
                     dst_search,
                     &value,
                     seq,
-                )?;
+                )
+                .inspect_err(|_| self.store.fail_closed())?;
                 if erase_out.root_dirty || insert_out.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
@@ -1483,16 +1498,18 @@ impl Tree {
                 let _commit = self.commit_gate.enter_writer();
                 let mut record = journal.record_buffer(encoded_batch_record_len(pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
-                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
+                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))
+                    .inspect_err(|_| self.store.fail_closed())?;
                 let _n = enc.finish();
-                journal.submit(record, self.cfg.durability.wal_sync())?
+                self.submit_applied(journal, record)?
             };
             if let Some(ack) = ack {
                 ack.wait()?;
             }
         } else {
             let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
-            self.apply_batch_walker_inline(pending, base_seq, None)?;
+            self.apply_batch_walker_inline(pending, base_seq, None)
+                .inspect_err(|_| self.store.fail_closed())?;
             drop(commit);
             if self.cfg.memory_flush_on_write {
                 self.flush_inline()?;
@@ -2276,6 +2293,7 @@ impl Tree {
     }
 
     fn flush_dirty_inline_locked(&self) -> Result<()> {
+        self.store.ensure_not_failed_closed()?;
         loop {
             let snap = self.store.snapshot_dirty();
             if snap.is_empty() {
@@ -2581,6 +2599,9 @@ impl Tree {
     )> {
         if let Some(journal) = journal {
             let _commit = commit_gate.enter_checkpoint();
+            // Writers latch the store closed under the commit gate, so a
+            // capture that holds it sees every partial change's latch.
+            store.ensure_not_failed_closed()?;
             store.stage_snapshot_epoch()?;
             store.flush_write_deltas()?;
             let wal_up_to = journal.queued_work();
@@ -2598,6 +2619,10 @@ impl Tree {
             }
         } else {
             let _commit = commit_gate.enter_checkpoint();
+            // A no-WAL writer holds the commit gate only while a snapshot is
+            // live; otherwise it latches before it returns. Either way a
+            // latch set before this capture is seen here.
+            store.ensure_not_failed_closed()?;
             store.stage_snapshot_epoch()?;
             store.flush_write_deltas()?;
             let snap_dirty = store.snapshot_dirty();
