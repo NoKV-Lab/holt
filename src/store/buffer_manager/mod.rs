@@ -540,6 +540,11 @@ pub struct BufferManager {
     /// gone.
     gc_last_full_sweep_deferred_count: AtomicUsize,
     checkpoint_waker: Mutex<Option<std::thread::Thread>>,
+    /// Set when a write failed after it may have changed cached frames
+    /// without a matching WAL record. Every later write and every path that
+    /// persists dirty state checks it, so the partial change stays in memory
+    /// until the process reopens the store from its last durable state.
+    failed_closed: std::sync::atomic::AtomicBool,
 }
 
 struct GcEpochGuard<'a> {
@@ -1293,6 +1298,7 @@ impl BufferManager {
             gc_reclaimed_count: AtomicU64::new(0),
             gc_last_full_sweep_deferred_count: AtomicUsize::new(0),
             checkpoint_waker: Mutex::new(None),
+            failed_closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2438,6 +2444,30 @@ impl BufferManager {
         let cached = self.get_cached_with_access(guid, PinAccess::Silent);
         if self.mark_dirty_with_hint(guid, seq, cached.as_deref()) {
             self.publish_parent_orphans(guid);
+        }
+    }
+
+    /// Latch the store closed after a write that may have changed cached
+    /// frames without a matching WAL record. Call it before releasing the
+    /// commit gate the write held, so no checkpoint can capture the partial
+    /// change between the failure and the latch.
+    pub(crate) fn fail_closed(&self) {
+        self.failed_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `Err(Error::FailedClosed)` once [`Self::fail_closed`] has run: no
+    /// further write may start and no dirty state may be persisted.
+    ///
+    /// Writes check it on entry and again once they hold the gates that
+    /// serialize them. A writer that fails part-way latches before it
+    /// releases those gates, so a write queued behind it is refused before
+    /// it evaluates a condition or changes a frame.
+    pub(crate) fn ensure_not_failed_closed(&self) -> Result<()> {
+        if self.failed_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(Error::FailedClosed)
+        } else {
+            Ok(())
         }
     }
 
