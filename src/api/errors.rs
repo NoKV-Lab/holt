@@ -155,6 +155,11 @@ pub enum Error {
     /// durable value. Existing data remains valid, but no new snapshot can
     /// be registered without wrapping the counter.
     SnapshotEpochExhausted,
+    /// A write failed after it may already have changed the in-memory tree
+    /// (a batch whose apply or WAL submit failed part-way). The database
+    /// refuses every later write and checkpoint, so the partial change can
+    /// never become durable; reopen it to recover the last durable state.
+    FailedClosed,
 }
 
 impl Error {
@@ -254,6 +259,10 @@ impl std::fmt::Display for Error {
             Self::InvalidTreeName { reason } => write!(f, "invalid DB tree name: {reason}"),
             Self::TreeDropped => write!(f, "DB tree has been dropped"),
             Self::ReadOnly => write!(f, "tree is read-only"),
+            Self::FailedClosed => write!(
+                f,
+                "database failed closed after a write that may have applied in part; reopen it to recover the last durable state"
+            ),
             Self::OutsideViewScope {
                 requested_len,
                 scope_len,
