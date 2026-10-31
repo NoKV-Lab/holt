@@ -211,11 +211,15 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
 
     pipeline.reap_ready(shared)?;
     pipeline.wait_for_room(shared)?;
-    // A store latched closed holds a partial write in memory; persisting any
-    // dirty state now could make it durable.
-    shared.bm.ensure_not_failed_closed()?;
 
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
+    // A store latched closed holds a partial write in memory; persisting any
+    // dirty state now could make it durable. The refusal counts as a failed
+    // round so the checkpointer stats show it.
+    if let Err(e) = shared.bm.ensure_not_failed_closed() {
+        shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+        return Err(e);
+    }
     let round_start = Instant::now();
 
     // 0. Optional candidate-driven merge pass.
