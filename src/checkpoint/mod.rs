@@ -71,6 +71,10 @@
 //!    BM/journal `Arc`s drop.
 //! 3. Send `IoTask::Stop`; join the I/O thread.
 //! 4. Set `eviction_stop`; unpark + join the eviction thread.
+//!
+//! A store that failed closed refuses every round until it is reopened.
+//! The planner stops scheduling rounds once it sees the latch, and the
+//! refusal is logged once across the planner and the final round.
 
 mod eviction;
 mod io;
@@ -83,6 +87,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::api::errors::Error;
 use crate::api::journal::VolatileJournal;
 use crate::concurrency::{CommitGate, Gate};
 use crate::journal::Journal;
@@ -216,6 +221,9 @@ pub(super) struct Shared {
     // in the right order without racing the queue).
     pub(super) checkpoint_stop: AtomicBool,
     pub(super) eviction_stop: AtomicBool,
+    /// Set once the planner or the final round has logged that the store
+    /// failed closed, so the refusal is reported a single time.
+    pub(super) failed_closed_reported: AtomicBool,
 
     // Telemetry — written by the threads, read by `Checkpointer`
     // accessors.
@@ -229,6 +237,16 @@ pub(super) struct Shared {
     pub(super) last_dirty_count: AtomicUsize,
     pub(super) last_pending_delete_count: AtomicUsize,
     pub(super) last_round_micros: AtomicU64,
+}
+
+impl Shared {
+    /// Log, once, that checkpoints stopped because the store failed closed.
+    /// Every later round would be refused the same way until a reopen.
+    fn report_failed_closed(&self, error: &Error) {
+        if !self.failed_closed_reported.swap(true, Ordering::AcqRel) {
+            eprintln!("holt: checkpoints stopped: {error}");
+        }
+    }
 }
 
 // ---------- handle ----------
@@ -282,6 +300,7 @@ impl Checkpointer {
             io_tx,
             checkpoint_stop: AtomicBool::new(false),
             eviction_stop: AtomicBool::new(false),
+            failed_closed_reported: AtomicBool::new(false),
             rounds_attempted: AtomicU64::new(0),
             rounds_succeeded: AtomicU64::new(0),
             rounds_failed: AtomicU64::new(0),
@@ -415,7 +434,11 @@ impl Drop for Checkpointer {
         //    clone is dropping). I/O thread is still alive
         //    serving the round's submissions.
         if let Err(e) = round::run_round_sync(&self.shared) {
-            eprintln!("holt: final checkpoint round during shutdown failed: {e}");
+            if matches!(e, Error::FailedClosed) {
+                self.shared.report_failed_closed(&e);
+            } else {
+                eprintln!("holt: final checkpoint round during shutdown failed: {e}");
+            }
         }
 
         // 3. Stop the I/O thread.
@@ -442,6 +465,12 @@ fn checkpoint_main(shared: &Arc<Shared>) {
         if shared.checkpoint_stop.load(Ordering::Acquire) {
             break;
         }
+        // A store that failed closed refuses every round until it is
+        // reopened; stop scheduling them instead of retrying in a loop.
+        if let Err(e) = shared.bm.ensure_not_failed_closed() {
+            shared.report_failed_closed(&e);
+            break;
+        }
         if let Err(e) = pipeline.reap_ready(shared) {
             eprintln!("holt: checkpoint epoch failed: {e}");
         }
@@ -465,7 +494,10 @@ fn checkpoint_main(shared: &Arc<Shared>) {
             if let Err(e) = round::run_round(shared, &mut pipeline) {
                 // Round failed; restored dirty entries (where
                 // applicable) are still in the map for the next try.
-                eprintln!("holt: checkpoint round failed: {e}");
+                // A failed-closed refusal is reported by the outer loop.
+                if !matches!(e, Error::FailedClosed) {
+                    eprintln!("holt: checkpoint round failed: {e}");
+                }
                 break;
             }
             if !pipeline.has_room()
@@ -837,6 +869,48 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A latched store refuses every round, so the planner must stop
+    /// scheduling them: under write pressure it used to retry in a hot loop
+    /// that logged every refusal.
+    #[test]
+    fn failed_closed_store_stops_the_planner() {
+        let bm = make_bm();
+        let mut cfg = no_merge_cfg();
+        cfg.idle_interval = Duration::from_millis(1);
+        cfg.dirty_blob_threshold = 1;
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            maintenance_gate(),
+            commit_gate(),
+            cfg,
+        )
+        .expect("spawn");
+
+        // Latch first, then dirty a cached blob: write pressure stays on
+        // because no round may persist it.
+        let guid = [0x61; 16];
+        bm.write_blob(guid, &test_blob(guid)).unwrap();
+        let _pin = bm.pin(guid).unwrap();
+        bm.fail_closed();
+        let attempted = ck.rounds_attempted();
+        let failed = ck.rounds_failed();
+        bm.mark_dirty(guid, 1);
+        ck.wake();
+        thread::sleep(Duration::from_millis(100));
+
+        let attempted = ck.rounds_attempted() - attempted;
+        let failed = ck.rounds_failed() - failed;
+        assert!(
+            attempted <= 1 && failed <= 1,
+            "failed-closed planner kept running rounds: {attempted} attempted, {failed} failed"
+        );
+        assert_eq!(bm.dirty_count(), 1);
+        // Shutdown still joins the planner and refuses the final round.
+        drop(ck);
+        assert_eq!(bm.dirty_count(), 1);
     }
 
     #[test]
