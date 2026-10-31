@@ -9,8 +9,6 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
-## [0.8.8] — 2026-10-26
-
 ### Fixed
 
 - File-backed blob reads now verify per-page checksums for the persisted part
@@ -20,6 +18,11 @@ fine-grained per-commit history is in `git log`.
   version 6 stores migrate on their first writable open. A read-only open
   requires migration to have completed first. This detects damage that occurs
   after migration; existing damage cannot be reconstructed or authenticated.
+
+## [0.8.8] — 2026-10-31
+
+### Fixed
+
 - A write that failed after it had already changed cached frames (an atomic
   batch whose apply or WAL submit failed part-way, a tree batch, or a single
   put, delete or rename whose WAL submit failed) left that partial change in
