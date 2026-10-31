@@ -2155,9 +2155,13 @@ mod tests {
     #[test]
     fn a_partial_batch_on_a_wal_store_is_absent_after_reopen() {
         let dir = tempdir().unwrap();
+        // Synced acks make every earlier batch durable before the failure;
+        // with the checkpointer off, async records may still sit in the WAL
+        // writer's buffer when the DB drops.
         let cfg = || {
             let mut cfg = TreeConfig::new(dir.path());
             cfg.checkpoint.enabled = false;
+            cfg.durability = crate::Durability::Wal { sync: true };
             cfg
         };
         let db = DB::open(cfg()).unwrap();
