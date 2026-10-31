@@ -9,8 +9,6 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
-## [0.8.8] — 2026-10-26
-
 ### Fixed
 
 - File-backed blob reads now verify per-page checksums for the persisted part
@@ -20,6 +18,22 @@ fine-grained per-commit history is in `git log`.
   version 6 stores migrate on their first writable open. A read-only open
   requires migration to have completed first. This detects damage that occurs
   after migration; existing damage cannot be reconstructed or authenticated.
+
+## [0.8.8] — 2026-10-31
+
+### Fixed
+
+- A write that failed after it had already changed cached frames (an atomic
+  batch whose apply or WAL submit failed part-way, a tree batch, or a single
+  put, delete or rename whose WAL submit failed) left that partial change in
+  memory with no WAL record, and the next checkpoint persisted it: after a
+  reopen, one tree of a cross-tree atomic batch could hold its half of the
+  batch without the other. Such a failure now latches the database closed.
+  Every later write, `DB::checkpoint`, background checkpoint round and the
+  final checkpoint on drop fails with the new `Error::FailedClosed`, so
+  nothing of the failed write becomes durable; reopening recovers the last
+  durable state. The failed call itself still reports
+  `AtomicErrorKind::OutcomeUnknown`.
 
 ## [0.8.7] — 2026-10-16
 

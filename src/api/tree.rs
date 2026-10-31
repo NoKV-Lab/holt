@@ -55,6 +55,46 @@ const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 const WRITE_DELTA_FLUSH_THRESHOLD: usize = 262_144;
 
 #[cfg(test)]
+pub(crate) struct OrdinaryWriteGateBarrier {
+    pub(crate) entered: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl OrdinaryWriteGateBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SERIALIZED_WRITE_BARRIER: std::cell::RefCell<Option<Arc<OrdinaryWriteGateBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hold this thread's next write after its entry checks, right before it
+/// queues on the gates that serialize it behind other writers.
+#[cfg(test)]
+pub(crate) fn set_serialized_write_barrier_for_current_thread(
+    barrier: Arc<OrdinaryWriteGateBarrier>,
+) {
+    SERIALIZED_WRITE_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+pub(crate) fn pause_before_serialized_write_gates() {
+    let barrier = SERIALIZED_WRITE_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
+#[cfg(test)]
 struct FullGcSnapshotCaptureBarrier {
     entered: std::sync::Barrier,
     release: std::sync::Barrier,
@@ -724,10 +764,23 @@ impl Tree {
     fn ensure_writable(&self) -> Result<()> {
         self.ensure_live()?;
         if self.cfg.is_read_only() {
-            Err(Error::ReadOnly)
-        } else {
-            Ok(())
+            return Err(Error::ReadOnly);
         }
+        self.store.ensure_not_failed_closed()
+    }
+
+    /// Submit the WAL record of a mutation that already changed cached
+    /// frames. A failed submit leaves that change in memory with no record,
+    /// so the store fails closed while the caller still holds the commit
+    /// gate, before any checkpoint could capture the change.
+    fn submit_applied(
+        &self,
+        journal: &Journal,
+        record: Vec<u8>,
+    ) -> Result<Option<crate::journal::group_commit::JournalAck>> {
+        journal
+            .submit(record, self.cfg.durability.wal_sync())
+            .inspect_err(|_| self.store.fail_closed())
     }
 
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
@@ -850,6 +903,8 @@ impl Tree {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _mutation = self.mutation_gate.enter_exclusive();
+        // Re-check under the gates: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
 
         // Preflight existence (under the mutation gate, so it stays
         // consistent with the apply): present in the tree OR seen earlier
@@ -922,6 +977,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let creates_key = self.get_version(key)?.is_none();
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             let journal = self
@@ -961,8 +1018,12 @@ impl Tree {
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            #[cfg(test)]
+            pause_before_serialized_write_gates();
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
@@ -984,7 +1045,7 @@ impl Tree {
                     let mut record =
                         journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
                     encode_insert_record(&mut record, seq, self.tree_id, key, value);
-                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+                    let ack = self.submit_applied(journal, record)?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -1065,6 +1126,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             if self.get_version(key)?.is_none() {
                 return Ok(false);
             }
@@ -1114,6 +1177,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
@@ -1136,7 +1201,7 @@ impl Tree {
                     }
                     let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
                     encode_erase_record(&mut record, seq, self.tree_id, key);
-                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
+                    let ack = self.submit_applied(journal, record)?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -1197,6 +1262,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             // Probe src across all blobs — zero-copy via BM pin.
@@ -1250,7 +1317,8 @@ impl Tree {
                     dst_search,
                     &value,
                     seq,
-                )?;
+                )
+                .inspect_err(|_| self.store.fail_closed())?;
                 if erase_out.root_dirty || insert_out.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
@@ -1258,7 +1326,7 @@ impl Tree {
                 let mut record =
                     journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
                 encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
-                journal.submit(record, self.cfg.durability.wal_sync())?
+                self.submit_applied(journal, record)?
             } else {
                 let commit =
                     (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
@@ -1276,7 +1344,8 @@ impl Tree {
                     dst_search,
                     &value,
                     seq,
-                )?;
+                )
+                .inspect_err(|_| self.store.fail_closed())?;
                 if erase_out.root_dirty || insert_out.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
@@ -1361,6 +1430,8 @@ impl Tree {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
+        // Re-check under the gates: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
         // storing per-inner seqs in the body. Non-mutating prefix
@@ -1390,16 +1461,18 @@ impl Tree {
                 let _commit = self.commit_gate.enter_writer();
                 let mut record = journal.record_buffer(encoded_batch_record_len(pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
-                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
+                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))
+                    .inspect_err(|_| self.store.fail_closed())?;
                 let _n = enc.finish();
-                journal.submit(record, self.cfg.durability.wal_sync())?
+                self.submit_applied(journal, record)?
             };
             if let Some(ack) = ack {
                 ack.wait()?;
             }
         } else {
             let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
-            self.apply_batch_walker_inline(pending, base_seq, None)?;
+            self.apply_batch_walker_inline(pending, base_seq, None)
+                .inspect_err(|_| self.store.fail_closed())?;
             drop(commit);
             if self.cfg.memory_flush_on_write {
                 self.flush_inline()?;
@@ -2165,6 +2238,7 @@ impl Tree {
     }
 
     fn flush_dirty_inline_locked(&self) -> Result<()> {
+        self.store.ensure_not_failed_closed()?;
         loop {
             let snap = self.store.snapshot_dirty();
             if snap.is_empty() {
@@ -2459,6 +2533,9 @@ impl Tree {
     )> {
         if let Some(journal) = journal {
             let _commit = commit_gate.enter_checkpoint();
+            // Writers latch the store closed under the commit gate, so a
+            // capture that holds it sees every partial change's latch.
+            store.ensure_not_failed_closed()?;
             store.flush_write_deltas()?;
             let wal_up_to = journal.queued_work();
             let snap_dirty = store.snapshot_dirty();
