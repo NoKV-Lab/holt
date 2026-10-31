@@ -2458,6 +2458,11 @@ impl BufferManager {
 
     /// `Err(Error::FailedClosed)` once [`Self::fail_closed`] has run: no
     /// further write may start and no dirty state may be persisted.
+    ///
+    /// Writes check it on entry and again once they hold the gates that
+    /// serialize them. A writer that fails part-way latches before it
+    /// releases those gates, so a write queued behind it is refused before
+    /// it evaluates a condition or changes a frame.
     pub(crate) fn ensure_not_failed_closed(&self) -> Result<()> {
         if self.failed_closed.load(std::sync::atomic::Ordering::SeqCst) {
             Err(Error::FailedClosed)

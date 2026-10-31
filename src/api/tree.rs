@@ -55,6 +55,46 @@ const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 const WRITE_DELTA_FLUSH_THRESHOLD: usize = 262_144;
 
 #[cfg(test)]
+pub(crate) struct OrdinaryWriteGateBarrier {
+    pub(crate) entered: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl OrdinaryWriteGateBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SERIALIZED_WRITE_BARRIER: std::cell::RefCell<Option<Arc<OrdinaryWriteGateBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hold this thread's next write after its entry checks, right before it
+/// queues on the gates that serialize it behind other writers.
+#[cfg(test)]
+pub(crate) fn set_serialized_write_barrier_for_current_thread(
+    barrier: Arc<OrdinaryWriteGateBarrier>,
+) {
+    SERIALIZED_WRITE_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+pub(crate) fn pause_before_serialized_write_gates() {
+    let barrier = SERIALIZED_WRITE_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
+#[cfg(test)]
 struct FullGcSnapshotCaptureBarrier {
     entered: std::sync::Barrier,
     release: std::sync::Barrier,
@@ -863,6 +903,8 @@ impl Tree {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _mutation = self.mutation_gate.enter_exclusive();
+        // Re-check under the gates: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
 
         // Preflight existence (under the mutation gate, so it stays
         // consistent with the apply): present in the tree OR seen earlier
@@ -935,6 +977,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let creates_key = self.get_version(key)?.is_none();
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             let journal = self
@@ -974,8 +1018,12 @@ impl Tree {
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_writable()?;
+            #[cfg(test)]
+            pause_before_serialized_write_gates();
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
@@ -1078,6 +1126,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             if self.get_version(key)?.is_none() {
                 return Ok(false);
             }
@@ -1127,6 +1177,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             if let Some(journal) = &self.journal {
@@ -1210,6 +1262,8 @@ impl Tree {
             self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
+            // Re-check under the gates: a writer queued ahead may have failed part-way.
+            self.store.ensure_not_failed_closed()?;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
             // Probe src across all blobs — zero-copy via BM pin.
@@ -1376,6 +1430,8 @@ impl Tree {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         let _tree_mutation = self.mutation_gate.enter_batch();
+        // Re-check under the gates: a writer queued ahead may have failed part-way.
+        self.store.ensure_not_failed_closed()?;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
         // storing per-inner seqs in the body. Non-mutating prefix
