@@ -27,6 +27,8 @@ mod walker;
 // Walker-internal types stay hidden behind `mod walker;`.
 pub(crate) use route_cache::{RouteCache, RouteHit};
 pub(crate) use simd::prefetch_read_data;
+#[cfg(test)]
+pub(crate) use walker::fail_next_prepared_parent_compaction;
 pub use walker::{
     blob_needs_compaction, blob_would_route, collect_blob_guids, collect_blob_topology_silent,
     compact_blob, erase_multi, erase_multi_conditional, insert_multi, insert_multi_conditional,

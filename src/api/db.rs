@@ -269,10 +269,9 @@ impl DB {
 
     fn ensure_writable(&self) -> Result<()> {
         if self.cfg.is_read_only() {
-            Err(Error::ReadOnly)
-        } else {
-            Ok(())
+            return Err(Error::ReadOnly);
         }
+        self.store.ensure_not_failed_closed()
     }
 
     /// Create a named tree inside this DB.
@@ -1239,14 +1238,20 @@ impl DB {
             let mut record = journal.record_buffer(encoded_db_batch_record_len(groups));
             let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
             let mut group_base = base_seq;
-            for group in groups {
+            let applied = groups.iter().try_for_each(|group| {
                 group
                     .tree
                     .apply_batch_walker_inline(&group.ops, group_base, Some(&mut enc))?;
                 group_base += count_group_wal_ops(group);
-            }
+                Ok(())
+            });
             let _n = enc.finish();
-            journal.submit(record, self.cfg.durability.wal_sync())?
+            let submitted =
+                applied.and_then(|()| journal.submit(record, self.cfg.durability.wal_sync()));
+            // A batch that failed after its first op touched cached frames
+            // has no WAL record; latch the store closed before the commit
+            // gate is released so no checkpoint can persist the partial batch.
+            submitted.inspect_err(|_| self.store.fail_closed())?
         };
         Ok(ack)
     }
@@ -1257,7 +1262,8 @@ impl DB {
         for group in groups {
             group
                 .tree
-                .apply_batch_walker_inline(&group.ops, group_base, None)?;
+                .apply_batch_walker_inline(&group.ops, group_base, None)
+                .inspect_err(|_| self.store.fail_closed())?;
             group_base += count_group_wal_ops(group);
         }
         drop(commit);
@@ -2037,6 +2043,174 @@ mod tests {
         assert_eq!(
             tree.get(b"atomic-current").unwrap().as_deref(),
             Some(&b"current-value"[..])
+        );
+    }
+
+    /// A batch whose second tree fails after its first tree's op changed
+    /// cached frames leaves a partial batch in memory with no WAL record. The
+    /// store must refuse every later write and checkpoint, so that reopening
+    /// it recovers the state before the batch instead of persisting half of it.
+    #[test]
+    fn a_batch_that_fails_part_way_fails_the_store_closed_and_is_never_persisted() {
+        let store = Arc::new(FailIoStore::new());
+        let mut cfg = TreeConfig::memory();
+        cfg.buffer_pool_size = 32;
+        cfg.checkpoint.enabled = false;
+        cfg.memory_flush_on_write = false;
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let db = DB::open_with_blob_store(cfg.clone(), store_dyn.clone()).unwrap();
+        let first = db.create_tree("first").unwrap();
+        let objects = db.create_tree("objects").unwrap();
+        first.put(b"before", b"durable").unwrap();
+        let old = vec![0x3A; 1024];
+        let keys = (0..1200u32)
+            .map(|i| format!("deferred/{i:08}").into_bytes())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            objects.put(key, &old).unwrap();
+        }
+        db.checkpoint().unwrap();
+
+        // Make the second tree's insert read a cold child that fails.
+        let tree_id = db
+            .catalog_lookup_live(b"objects")
+            .unwrap()
+            .expect("objects tree id");
+        let root_guid = root_guid_for_tree_id(tree_id);
+        let child_guids = crate::engine::collect_blob_topology_silent(&db.store, root_guid)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| (entry.depth > 0).then_some(entry.guid))
+            .collect::<Vec<_>>();
+        assert!(!child_guids.is_empty(), "test requires a spilled tree");
+        for &guid in &child_guids {
+            assert!(
+                db.store.evict_from_cache_for_test(guid),
+                "test child remained pinned"
+            );
+        }
+        store.arm_read_failures(child_guids.iter().copied());
+        let target = keys
+            .iter()
+            .find_map(|key| match objects.get(key) {
+                Err(Error::BlobStoreIo(_)) => Some(key.clone()),
+                Ok(Some(_)) => None,
+                other => panic!("unexpected target probe result: {other:?}"),
+            })
+            .expect("no key traversed a cold child");
+
+        let error = db
+            .atomic(|batch| {
+                batch.put("first", b"partial", b"half-applied");
+                batch.put("objects", &target, b"never-applied");
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Atomic {
+                kind: AtomicErrorKind::OutcomeUnknown,
+                source,
+            } if matches!(source.as_ref(), Error::BlobStoreIo(_))
+        ));
+        store.clear_read_failures();
+
+        // Every later write and every checkpoint is refused.
+        let refused = db
+            .atomic(|batch| batch.put("first", b"later", b"value"))
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            Error::Atomic {
+                kind: AtomicErrorKind::DefinitelyNotApplied,
+                source,
+            } if matches!(source.as_ref(), Error::FailedClosed)
+        ));
+        assert!(matches!(
+            first.put(b"later", b"value"),
+            Err(Error::FailedClosed)
+        ));
+        assert!(matches!(db.checkpoint(), Err(Error::FailedClosed)));
+        drop(first);
+        drop(objects);
+        drop(db);
+
+        // Reopening recovers the last durable state: no half of the batch.
+        let db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
+        let first = db.open_tree("first").unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        assert_eq!(
+            first.get(b"before").unwrap().as_deref(),
+            Some(&b"durable"[..])
+        );
+        assert!(first.get(b"partial").unwrap().is_none());
+        assert_eq!(objects.get(&target).unwrap().as_deref(), Some(&old[..]));
+        assert!(db
+            .atomic(|batch| batch.put("first", b"after-reopen", b"ok"))
+            .unwrap());
+    }
+
+    /// The same partial batch on a file store with a WAL: the failed batch
+    /// has no WAL record, and neither an explicit checkpoint nor the final
+    /// checkpoint on drop may persist the half that applied.
+    #[test]
+    fn a_partial_batch_on_a_wal_store_is_absent_after_reopen() {
+        let dir = tempdir().unwrap();
+        let cfg = || {
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            cfg
+        };
+        let db = DB::open(cfg()).unwrap();
+        db.create_tree("first").unwrap();
+        db.create_tree("objects").unwrap();
+        let value = vec![0x5C; 4000];
+        // Fill `objects` until one batch's insert needs a spillover; that
+        // spillover fails after the batch's `first` op already applied.
+        let mut partial = None;
+        for i in 0..20_000u32 {
+            crate::engine::fail_next_prepared_parent_compaction();
+            let key = format!("big/{i:08}").into_bytes();
+            let marker = format!("marker/{i:08}").into_bytes();
+            match db.atomic(|batch| {
+                batch.put("first", &marker, b"applied-with-its-batch");
+                batch.put("objects", &key, &value);
+            }) {
+                Ok(true) => {}
+                Ok(false) => panic!("unguarded batch rejected"),
+                Err(Error::Atomic {
+                    kind: AtomicErrorKind::OutcomeUnknown,
+                    ..
+                }) => {
+                    partial = Some(i);
+                    break;
+                }
+                Err(other) => panic!("unexpected error {other:?}"),
+            }
+        }
+        let partial = partial.expect("no batch needed a spillover");
+        assert!(partial > 0, "the first batch already spilled");
+        assert!(matches!(db.checkpoint(), Err(Error::FailedClosed)));
+        drop(db);
+
+        let db = DB::open(cfg()).unwrap();
+        let first = db.open_tree("first").unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        let marker = |i: u32| format!("marker/{i:08}").into_bytes();
+        assert_eq!(
+            first.get(&marker(partial - 1)).unwrap().as_deref(),
+            Some(&b"applied-with-its-batch"[..])
+        );
+        assert!(first.get(&marker(partial)).unwrap().is_none());
+        assert!(objects
+            .get(format!("big/{partial:08}").as_bytes())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            objects
+                .get(format!("big/{:08}", partial - 1).as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(&value[..])
         );
     }
 

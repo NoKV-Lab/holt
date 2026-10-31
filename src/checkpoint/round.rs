@@ -211,6 +211,9 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
 
     pipeline.reap_ready(shared)?;
     pipeline.wait_for_room(shared)?;
+    // A store latched closed holds a partial write in memory; persisting any
+    // dirty state now could make it durable.
+    shared.bm.ensure_not_failed_closed()?;
 
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
     let round_start = Instant::now();
@@ -265,6 +268,12 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     {
         let _maintenance = shared.maintenance_gate.enter_shared();
         let _commit = shared.commit_gate.enter_checkpoint();
+        // Writers latch the store closed under the commit gate, so this
+        // check, made while holding it, cannot miss a partial write.
+        if let Err(e) = shared.bm.ensure_not_failed_closed() {
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
         if let Err(e) = shared.bm.flush_write_deltas() {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
@@ -291,6 +300,12 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     } else {
         let _maintenance = shared.maintenance_gate.enter_shared();
         let _commit = shared.commit_gate.enter_checkpoint();
+        // Writers latch the store closed under the commit gate, so this
+        // check, made while holding it, cannot miss a partial write.
+        if let Err(e) = shared.bm.ensure_not_failed_closed() {
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
         if let Err(e) = shared.bm.flush_write_deltas() {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
